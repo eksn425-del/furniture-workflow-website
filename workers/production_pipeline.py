@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import zipfile
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -55,6 +56,7 @@ from packages.workflow_core.source_identity import normalize_identity_fields
 from packages.workflow_core.source_policy import resolve_source_policy
 from packages.workflow_core.statuses import ItemState
 from workers.modeling_provider import Lux3DClient, is_capacity_rejection
+from workers.blender_adapter import BlenderAdapterError, resolve_blender_adapter, validate_glb
 from workers.scrape.http_client import NetworkPolicyError, SafeHttpClient
 
 
@@ -161,6 +163,8 @@ class WebsiteStageAdapter:
         workspace: Path,
         brain: WebsiteBrainProvider,
         provider_client: Lux3DClient | None,
+        blender_adapter: Any | None,
+        media_client_factory: Callable[..., Any] | None,
         emit: Emit,
     ) -> None:
         self.contract = contract
@@ -170,6 +174,8 @@ class WebsiteStageAdapter:
         self.workspace = Path(workspace).resolve()
         self.brain = brain
         self.provider_client = provider_client
+        self.blender_adapter = blender_adapter
+        self.media_client_factory = media_client_factory or SafeHttpClient
         self.emit = emit
         self.source_policy = resolve_source_policy(
             str(contract.get("source_url") or contract.get("site_key") or "")
@@ -248,7 +254,7 @@ class WebsiteStageAdapter:
         if not url:
             return StageOutcome(StageDecision.REJECTED, "MEDIA_URL_MISSING")
         try:
-            result = SafeHttpClient(source_url=url, request_budget=8, timeout=30, request_delay=0).get_media(url)
+            result = self.media_client_factory(source_url=url, request_budget=8, timeout=30, request_delay=0).get_media(url)
         except Exception as error:
             return StageOutcome(StageDecision.REJECTED, f"MEDIA_FETCH_FAILED:{type(error).__name__}")
         raw = result.content
@@ -706,18 +712,54 @@ class WebsiteStageAdapter:
                 ledger.error_code = "DOWNLOAD_FAILED"
                 session.commit()
                 return StageOutcome(StageDecision.REJECTED, "RAW_GLB_DOWNLOAD_FAILED")
-            raw = target.read_bytes()
-            valid = len(raw) >= 20 and raw[:4] == b"glTF" and int.from_bytes(raw[8:12], "little") == len(raw)
-            digest = hashlib.sha256(raw).hexdigest()
-            ledger.status = ledger.checkpoint_state = "DELIVERED" if valid else "RAW_GLB_INVALID"
+            valid, validation_reason = validate_glb(target)
+            digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if not valid:
+                ledger.status = ledger.checkpoint_state = "RAW_GLB_INVALID"
+                ledger.error_code = "RAW_GLB_INVALID"
+                ledger.error_message = validation_reason
+                ledger.finished_at = utc_now()
+                session.commit()
+                return StageOutcome(
+                    StageDecision.REJECTED,
+                    f"RAW_GLB_INVALID:{validation_reason}",
+                    raw_glb_path=str(target),
+                    raw_glb_sha256=digest,
+                    raw_glb_valid=False,
+                )
+            if self.blender_adapter is None:
+                ledger.status = ledger.checkpoint_state = "BLENDER_NOT_CONFIGURED"
+                ledger.error_code = "BLENDER_NOT_CONFIGURED"
+                ledger.error_message = "A configured Blender normalization/QA adapter is required before delivery"
+                session.commit()
+                return StageOutcome(StageDecision.HARD_STOP, "BLENDER_NOT_CONFIGURED")
+            normalized_target = self.model_root / "normalized" / target.name
+            try:
+                qa = self.blender_adapter.normalize_and_qa(target, normalized_target)
+            except BlenderAdapterError as error:
+                ledger.status = ledger.checkpoint_state = "BLENDER_QA_FAILED"
+                ledger.error_code = "BLENDER_QA_FAILED"
+                ledger.error_message = str(error)[:1000]
+                ledger.finished_at = utc_now()
+                session.commit()
+                return StageOutcome(StageDecision.REJECTED, f"BLENDER_QA_FAILED:{error}")
+            ledger.status = ledger.checkpoint_state = "DELIVERED"
+            ledger.error_code = ledger.error_message = None
             ledger.finished_at = utc_now()
             session.commit()
+            qa_payload = qa.as_dict() if hasattr(qa, "as_dict") else dict(qa)
             return StageOutcome(
-                StageDecision.ACCEPTED if valid else StageDecision.REJECTED,
-                "RAW_GLB_VALIDATED" if valid else "RAW_GLB_INVALID",
+                StageDecision.ACCEPTED,
+                "RAW_GLB_AND_BLENDER_QA_VALIDATED",
+                {
+                    "blender_qa": qa_payload,
+                    "blender_qa_status": str(qa_payload.get("status") or "UNKNOWN"),
+                    "normalized_glb_path": str(qa_payload.get("normalized_path") or normalized_target),
+                    "normalized_glb_sha256": str(qa_payload.get("sha256") or ""),
+                },
                 raw_glb_path=str(target),
                 raw_glb_sha256=digest,
-                raw_glb_valid=valid,
+                raw_glb_valid=True,
             )
         finally:
             session.close()
@@ -733,6 +775,8 @@ class ProductionPipeline:
         acquisition_factory=ProductAcquisitionEngine,
         brain: WebsiteBrainProvider | None = None,
         provider_client: Lux3DClient | None = None,
+        blender_adapter: Any | None = None,
+        media_client_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.contract = contract
         self.workspace = Path(workspace).resolve()
@@ -743,6 +787,8 @@ class ProductionPipeline:
         )
         self.database = Database(Path(str(contract["database_path"])))
         self.database.create_schema()
+        self.blender_adapter = blender_adapter if blender_adapter is not None else resolve_blender_adapter(contract)
+        self.media_client_factory = media_client_factory
         browser = contract.get("browser_session") or {}
         self.acquisition = acquisition_factory(
             source_url=str(contract["source_url"]),
@@ -862,6 +908,14 @@ class ProductionPipeline:
             allowed_product_scope=str(self.contract.get("scope") or "NEW_ONLY"),
         )
         gates = tuple(sorted(set(value for value in (1, 3, target) if value <= target)))
+        try:
+            requested_slots = int(
+                self.contract.get("provider_concurrency")
+                or os.getenv("WEBSITE_PROVIDER_CONCURRENCY", "1")
+            )
+        except (TypeError, ValueError):
+            requested_slots = 1
+        provider_slots = max(1, min(5, requested_slots))
         policy = RuntimePolicy(
             order_id=str(self.contract["job_id"]),
             job_id=str(self.contract["job_id"]),
@@ -869,7 +923,7 @@ class ProductionPipeline:
             progressive_gates=gates,
             provider=str(self.contract.get("provider") or "OFF"),
             order_policy=policy_lock,
-            max_provider_slots=1,
+            max_provider_slots=provider_slots,
             max_steps_per_tick=20,
             max_refill_rounds=100,
         )
@@ -881,6 +935,8 @@ class ProductionPipeline:
             workspace=self.workspace,
             brain=self.brain,
             provider_client=self.provider_client,
+            blender_adapter=self.blender_adapter,
+            media_client_factory=self.media_client_factory,
             emit=self.emit,
         )
         pool_payload = self.pool.read()
@@ -1025,18 +1081,145 @@ class ProductionPipeline:
             return 2
         delivery = self.workspace / "05_delivery"
         delivery.mkdir(parents=True, exist_ok=True)
-        manifest_items = []
+        batch_root = delivery / "batches"
+        batch_root.mkdir(parents=True, exist_ok=True)
+        manifest_items: list[dict[str, Any]] = []
         for item in completed:
-            source = Path(str(item.raw_glb_path))
-            target_path = delivery / source.name
-            shutil.copy2(source, target_path)
-            manifest_items.append({"record_id": item.record_id, "product_name": item.product_name, "filename": target_path.name, "sha256": item.raw_glb_sha256})
+            raw_source = Path(str(item.raw_glb_path))
+            normalized_source = Path(str(item.lineage.get("normalized_glb_path") or raw_source))
+            if not normalized_source.is_file():
+                self.emit(
+                    "JOB_BLOCKED",
+                    "DELIVERY_QA",
+                    "Blender 归一化 GLB 不存在，交付已阻断",
+                    len(manifest_items),
+                    target,
+                    {"blocker": "NORMALIZED_GLB_MISSING", "record_id": item.record_id, "provider_calls": provider_posts},
+                )
+                return 2
+            normalized_digest = str(item.lineage.get("normalized_glb_sha256") or hashlib.sha256(normalized_source.read_bytes()).hexdigest())
+            manifest_items.append({
+                "record_id": item.record_id,
+                "product_name": item.product_name,
+                "filename": normalized_source.name,
+                "sha256": normalized_digest,
+                "raw_glb_path": str(raw_source),
+                "raw_glb_sha256": item.raw_glb_sha256,
+                "normalized_glb_path": str(normalized_source),
+                "blender_qa": item.lineage.get("blender_qa") or {},
+            })
         requested = requested_target or target
         target_mode = str(self.contract.get("target_mode") or "EXACT_N")
-        manifest = {"schema_version": "website-delivery-manifest.v2", "job_id": self.contract["job_id"], "target_mode": target_mode, "requested_target": requested, "target": target, "delivered": len(manifest_items), "items": manifest_items}
-        (delivery / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        batch_size = 20
+        batches: list[dict[str, Any]] = []
+        for offset in range(0, len(manifest_items), batch_size):
+            batch_number = offset // batch_size + 1
+            batch_name = f"batch_{batch_number:03d}"
+            batch_dir = batch_root / batch_name
+            batch_dir.mkdir(parents=True, exist_ok=True)
+            batch_items = manifest_items[offset : offset + batch_size]
+            for manifest_item in batch_items:
+                source = Path(str(manifest_item["normalized_glb_path"]))
+                target_path = batch_dir / str(manifest_item["filename"])
+                shutil.copy2(source, target_path)
+                manifest_item["batch"] = batch_name
+                manifest_item["delivery_filename"] = f"{batch_name}/{target_path.name}"
+            batch_manifest = {
+                "schema_version": "website-delivery-batch.v1",
+                "job_id": self.contract["job_id"],
+                "batch": batch_name,
+                "target_mode": target_mode,
+                "requested_target": requested,
+                "item_count": len(batch_items),
+                "items": batch_items,
+            }
+            (batch_dir / "manifest.json").write_text(json.dumps(batch_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            zip_path = delivery / f"{batch_name}.zip"
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for file_path in sorted(batch_dir.rglob("*")):
+                    if file_path.is_file():
+                        archive.write(file_path, arcname=file_path.relative_to(batch_dir).as_posix())
+            batches.append({
+                "name": zip_path.name,
+                "batch": batch_name,
+                "item_count": len(batch_items),
+                "relative_path": f"05_delivery/{zip_path.name}",
+                "sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+                "size_bytes": zip_path.stat().st_size,
+                "manifest_schema": "website-delivery-batch.v1",
+            })
+        manifest = {
+            "schema_version": "website-delivery-manifest.v3",
+            "job_id": self.contract["job_id"],
+            "target_mode": target_mode,
+            "requested_target": requested,
+            "target": target,
+            "delivered": len(manifest_items),
+            "batch_size": batch_size,
+            "batches": batches,
+            "blender_adapter": str((manifest_items[0].get("blender_qa") or {}).get("adapter") or "UNKNOWN") if manifest_items else "UNKNOWN",
+            "blender_qa_status": "PASS" if all((item.get("blender_qa") or {}).get("status") == "PASS" for item in manifest_items) else "UNKNOWN",
+            "items": manifest_items,
+        }
+        manifest_path = delivery / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         label = f"Up-To {requested}" if target_mode == "UP_TO_N" else f"Exact {target}"
-        self.emit("DELIVERY_COMPLETED", "DELIVERY", f"{label}：{target} 个 GLB 已完成校验并交付", target, requested, {"artifact_type": "DELIVERY_FOLDER", "relative_path": "05_delivery", "item_count": target, "manifest_schema": "website-delivery-manifest.v2", "manifest": manifest, "delivered": target, "requested_target": requested, "target_mode": target_mode, "provider_calls": provider_posts})
+        for batch in batches:
+            self.emit(
+                "ARTIFACT_READY",
+                "DELIVERY",
+                f"{batch['batch']}：{batch['item_count']} 个归一化 GLB 已打包",
+                int(batch["item_count"]),
+                requested,
+                {
+                    "artifact_type": "DELIVERY_BATCH_ZIP",
+                    "relative_path": batch["relative_path"],
+                    "item_count": batch["item_count"],
+                    "manifest_schema": batch["manifest_schema"],
+                    "sha256": batch["sha256"],
+                    "size_bytes": batch["size_bytes"],
+                    "batch": batch["batch"],
+                    "provider_calls": provider_posts,
+                },
+            )
+            self.emit(
+                "DELIVERY_COMPLETED",
+                "DELIVERY",
+                f"{batch['batch']}：交付文件已完成哈希校验",
+                int(batch["item_count"]),
+                requested,
+                {
+                    "artifact_type": "DELIVERY_BATCH_ZIP",
+                    "relative_path": batch["relative_path"],
+                    "item_count": batch["item_count"],
+                    "manifest_schema": batch["manifest_schema"],
+                    "sha256": batch["sha256"],
+                    "size_bytes": batch["size_bytes"],
+                    "batch": batch["batch"],
+                    "provider_calls": provider_posts,
+                },
+            )
+        self.emit(
+            "DELIVERY_COMPLETED",
+            "DELIVERY",
+            f"{label}：{target} 个 GLB 已完成 Blender QA 并按 20 个/批交付",
+            target,
+            requested,
+            {
+                "artifact_type": "MANIFEST_JSON",
+                "relative_path": "05_delivery/manifest.json",
+                "item_count": target,
+                "manifest_schema": "website-delivery-manifest.v3",
+                "sha256": manifest_sha256,
+                "manifest": manifest,
+                "delivered": target,
+                "requested_target": requested,
+                "target_mode": target_mode,
+                "batch_count": len(batches),
+                "provider_calls": provider_posts,
+            },
+        )
         self.emit("JOB_COMPLETED", "COMPLETED", f"生产完成：{target}/{requested}", target, requested, {"delivered": target, "requested_target": requested, "target_mode": target_mode, "provider_calls": provider_posts})
         return 0
 

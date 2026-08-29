@@ -41,6 +41,17 @@ python launch_website.py
 
 The launcher starts the API on `http://127.0.0.1:8000` and the Web UI on `http://127.0.0.1:3000`. It reads only non-secret routing values from `.env.local`; provider credentials are read by the API process when explicitly configured.
 
+### Deterministic end-to-end check
+
+The public repository includes an opt-in, network-free workflow check. It exercises Add Site, taxonomy snapshot binding, category scope, candidate review, provider ledger, Blender QA, and 20-per-batch delivery with local deterministic adapters:
+
+```powershell
+$env:PYTHONPATH = "$(Get-Location);$(Get-Location)\services\api;$(Get-Location)\packages\workflow-engine\src"
+python -m pytest -q services/api/tests/test_website_e2e.py
+```
+
+The test itself sets `FURNITURE_WORKFLOW_LOCAL_E2E=1` and uses `test_profile=LOCAL_E2E`. These switches are required together and are never enabled by ordinary jobs. The test does not contact a real AI or Lux3D service.
+
 For development, run the API and Web app separately:
 
 ```powershell
@@ -61,6 +72,7 @@ npm run dev
 
 - Website Brain uses the `WEBSITE_BRAIN_*` namespace.
 - Lux3D uses `LUX3D_*` and remains disabled until qualification, an idempotency ledger, an explicit cost ceiling, and the production gate all pass.
+- Blender post-processing uses `BLENDER_WORKER_ENABLED=true` plus a resolvable `BLENDER_EXECUTABLE`; if it is not configured, model delivery stops with an explicit QA/configuration state.
 - A failed or unknown provider submission is quarantined; the runtime must not blindly resubmit it.
 - No provider is contacted during the default local setup.
 
@@ -77,6 +89,8 @@ npm run build
 ```
 
 When changing taxonomy, count semantics, identity binding, queue recovery, provider safety, or delivery behavior, add a focused regression test. Exact counts must be backed by direct evidence; an inaccessible or ambiguous count stays `UNKNOWN` or `ESTIMATED`.
+
+See [docs/WEBSITE_E2E_REPAIR_REPORT.md](docs/WEBSITE_E2E_REPAIR_REPORT.md) for the repair rationale, test scope, safety review, and known live-environment boundaries.
 
 ## Safe acquisition principles
 

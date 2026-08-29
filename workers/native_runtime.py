@@ -70,6 +70,11 @@ def _fixture_enabled(contract: dict[str, Any]) -> bool:
     return flag and isinstance(contract.get("fixture"), dict)
 
 
+def _local_e2e_enabled(contract: dict[str, Any]) -> bool:
+    flag = os.getenv("FURNITURE_WORKFLOW_LOCAL_E2E", "").strip().lower() in {"1", "true", "yes", "on"}
+    return flag and str(contract.get("test_profile") or "").strip().upper() == "LOCAL_E2E"
+
+
 def _env_dotlocal() -> dict[str, str]:
     dotlocal = Path(__file__).resolve().parent.parent / ".env.local"
     values: dict[str, str] = {}
@@ -107,10 +112,11 @@ def run_job(contract_path: Path, events_path: Path, workspace: Path, *, resume: 
         message="Website Production Engine 恢复同一 Job/checkpoint" if resume else "Website Production Engine 已启动",
         payload={"engine": "ProductionWorkflowEngine", "interface": "WebsiteWorkflowInterface"},
     )
-    if _fixture_enabled(contract):
+    local_e2e = _local_e2e_enabled(contract)
+    if _fixture_enabled(contract) and not local_e2e:
         _emit(events_path, contract, "JOB_BLOCKED", status="BLOCKED", stage="FIXTURE_GATE", message="测试 fixture 不能进入真实交付", payload={"blocker": "FIXTURE_ONLY", "provider_calls": 0})
         return 2
-    local_review = os.getenv("LOCAL_REVIEW_MODE", "").strip().casefold() == "agent"
+    local_review = local_e2e or os.getenv("LOCAL_REVIEW_MODE", "").strip().casefold() == "agent"
     model_mode = os.getenv("WEBSITE_MODEL_MODE", "").strip() or os.getenv("LUNAMAX_MODEL_MODE", "").strip() or ("LOCAL_AGENT" if local_review else "TEXT_BRAIN_PLUS_VISION")
     _emit(
         events_path,
@@ -141,8 +147,13 @@ def run_job(contract_path: Path, events_path: Path, workspace: Path, *, resume: 
             payload=payload,
         )
 
+    pipeline_kwargs: dict[str, Any] = {}
+    if local_e2e:
+        from workers.local_e2e import build_local_e2e_components
+
+        pipeline_kwargs = build_local_e2e_components(contract, workspace)
     try:
-        return ProductionPipeline(contract=contract, workspace=workspace, emit=emit).run()
+        return ProductionPipeline(contract=contract, workspace=workspace, emit=emit, **pipeline_kwargs).run()
     except Exception as error:
         _emit(
             events_path,

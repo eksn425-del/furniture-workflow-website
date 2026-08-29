@@ -223,13 +223,119 @@ def _category_dict(category: SiteCategory) -> dict:
     }
 
 
+def _taxonomy_summary_rows(categories: list[SiteCategory]) -> list[SiteCategory]:
+    """Use top-level rows for site totals so parent/child counts are not double-counted."""
+
+    roots = [
+        category for category in categories
+        if int(category.level or (2 if len([part for part in category.path.split("/") if part]) >= 2 else 1)) == 1
+    ]
+    return roots or categories
+
+
+def _job_categories(session, job: ProductionJob, *, latest_scan: SiteScanRun | None = None) -> list[SiteCategory]:
+    """Read the taxonomy snapshot bound to a Job before falling back to current site data."""
+
+    policy = _policy(job)
+    snapshot_id = str(policy.get("category_snapshot_id") or "").strip()
+    requested_ids = [str(value) for value in policy.get("category_ids") or [] if value]
+    if snapshot_id:
+        query = select(SiteCategory).where(SiteCategory.snapshot_id == snapshot_id)
+        if requested_ids:
+            query = query.where(SiteCategory.category_id.in_(requested_ids))
+        rows = list(session.scalars(query.order_by(SiteCategory.path)))
+        # A Job bound to a snapshot must never silently switch to a newer
+        # taxonomy if the bound rows are missing.  Returning an empty set lets
+        # the caller surface the broken binding and request a new selection.
+        return rows
+    current = _current_site_categories(session, job.site_key, latest_scan=latest_scan)
+    if requested_ids:
+        by_id = {row.category_id: row for row in current}
+        selected = [by_id[value] for value in requested_ids if value in by_id]
+        if selected:
+            return selected
+    return current
+
+
 _BLOCKED_TAXONOMY_STATUSES = frozenset({
     "HUMAN_REQUIRED",
     "BROWSER_REQUIRED",
     "BROWSER_RUNTIME_NOT_INSTALLED",
+    "TEMPORARY_FAILURE",
+    "ACCESS_CHANGE_REQUIRED",
+    "SESSION_CONTINUITY_BROKEN",
     "FAILED",
     "BRAIN_NOT_CONFIGURED",
 })
+
+_ACTIVE_TAXONOMY_STATUSES = frozenset({"QUEUED", "ANALYZING", "L2_BROWSER"})
+
+
+def _latest_taxonomy_snapshot(session, site_key: str) -> SiteTaxonomySnapshot | None:
+    return session.scalar(
+        select(SiteTaxonomySnapshot)
+        .where(SiteTaxonomySnapshot.site_key == site_key)
+        .order_by(SiteTaxonomySnapshot.captured_at.desc())
+    )
+
+
+def _taxonomy_read_model(session, site_key: str, *, latest_scan: SiteScanRun | None = None) -> dict[str, object]:
+    """Build a truthful current-taxonomy read model.
+
+    A blocked or active scan is not an empty successful taxonomy.  The
+    previous usable snapshot remains historical evidence, but it must not be
+    presented as the current result while a new scan is running or waiting for
+    human access.  Keeping this distinction in the API prevents every client
+    from independently guessing whether ``[]`` means zero or unknown.
+    """
+
+    snapshot = _latest_taxonomy_snapshot(session, site_key)
+    scan_status = str(latest_scan.status or "") if latest_scan is not None else ""
+    if scan_status in _ACTIVE_TAXONOMY_STATUSES:
+        return {
+            "categories": [],
+            "taxonomy_state": "SCANNING",
+            "taxonomy_available": False,
+            "count_state": "UNKNOWN",
+            "current_snapshot_id": None,
+        }
+
+    snapshot_status = str(snapshot.status or "") if snapshot is not None else ""
+    blocked_status = scan_status if scan_status in _BLOCKED_TAXONOMY_STATUSES else snapshot_status if snapshot_status in _BLOCKED_TAXONOMY_STATUSES else ""
+    if blocked_status:
+        return {
+            "categories": [],
+            "taxonomy_state": blocked_status,
+            "taxonomy_available": False,
+            "count_state": "UNKNOWN",
+            "current_snapshot_id": None,
+        }
+
+    query = select(SiteCategory).where(SiteCategory.site_key == site_key)
+    if snapshot is not None:
+        query = query.where(SiteCategory.snapshot_id == snapshot.snapshot_id)
+    categories = list(session.scalars(query.order_by(SiteCategory.path)))
+    # Rows without a snapshot are legacy/imported evidence.  They remain
+    # readable for compatibility, but are labelled as such instead of being
+    # mistaken for a freshly verified scan.
+    taxonomy_state = snapshot_status or ("LEGACY" if categories else "NOT_SCANNED")
+    if taxonomy_state not in {"READY", "PARTIAL", "LEGACY"}:
+        taxonomy_state = "UNKNOWN"
+    if not categories:
+        count_state = "UNKNOWN"
+    elif any(category.count_kind == "UNKNOWN" for category in categories):
+        count_state = "UNKNOWN"
+    elif any(category.count_kind == "ESTIMATED" for category in categories):
+        count_state = "ESTIMATED"
+    else:
+        count_state = "EXACT"
+    return {
+        "categories": categories,
+        "taxonomy_state": taxonomy_state,
+        "taxonomy_available": bool(categories),
+        "count_state": count_state,
+        "current_snapshot_id": snapshot.snapshot_id if snapshot is not None else None,
+    }
 
 
 def _current_site_categories(session, site_key: str, *, latest_scan: SiteScanRun | None = None) -> list[SiteCategory]:
@@ -242,20 +348,7 @@ def _current_site_categories(session, site_key: str, *, latest_scan: SiteScanRun
     verified data after the latest scan ended HUMAN_REQUIRED.
     """
 
-    latest_snapshot = session.scalar(
-        select(SiteTaxonomySnapshot)
-        .where(SiteTaxonomySnapshot.site_key == site_key)
-        .order_by(SiteTaxonomySnapshot.captured_at.desc())
-    )
-    if latest_snapshot and latest_snapshot.status in _BLOCKED_TAXONOMY_STATUSES:
-        return []
-    if latest_scan and latest_scan.finished_at and latest_scan.status in _BLOCKED_TAXONOMY_STATUSES:
-        return []
-
-    query = select(SiteCategory).where(SiteCategory.site_key == site_key)
-    if latest_snapshot:
-        query = query.where(SiteCategory.snapshot_id == latest_snapshot.snapshot_id)
-    return list(session.scalars(query.order_by(SiteCategory.path)))
+    return list(_taxonomy_read_model(session, site_key, latest_scan=latest_scan)["categories"])
 
 
 def _artifact_dict(artifact: ProductionArtifact) -> dict:
@@ -417,11 +510,11 @@ def get_control_job(job_id: str, request: Request) -> dict:
         job = session.get(ProductionJob, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="production job not found")
-        categories = list(session.scalars(select(SiteCategory).where(SiteCategory.site_key == job.site_key).order_by(SiteCategory.path)))
+        latest_scan = session.scalar(select(SiteScanRun).where(SiteScanRun.job_id == job.job_id).order_by(SiteScanRun.started_at.desc()))
+        categories = _job_categories(session, job, latest_scan=latest_scan)
         events = list(session.scalars(select(ProductionJobEvent).where(ProductionJobEvent.job_id == job.job_id).order_by(ProductionJobEvent.sequence)))
         artifacts = list(session.scalars(select(ProductionArtifact).where(ProductionArtifact.job_id == job.job_id).order_by(ProductionArtifact.created_at)))
         provider_tasks = list(session.scalars(select(ProductionProviderTask).where(ProductionProviderTask.job_id == job.job_id).order_by(ProductionProviderTask.created_at)))
-        latest_scan = session.scalar(select(SiteScanRun).where(SiteScanRun.job_id == job.job_id).order_by(SiteScanRun.started_at.desc()))
         candidate_pool: dict = {}
         if job.candidate_pool_path:
             pool_path = Path(job.candidate_pool_path)
@@ -450,6 +543,7 @@ def get_control_job(job_id: str, request: Request) -> dict:
                             "production_gate_reasons": lineage.get("production_gate_reasons") or [],
                             "review_provider": lineage.get("review_provider"),
                             "media_binding_status": lineage.get("media_binding_status"),
+                            "blender_qa_status": lineage.get("blender_qa_status"),
                             "identity_conflicts": lineage.get("identity_conflicts") or [],
                         })
                     candidate_pool = {"path": str(pool_path), "job_status": raw_pool.get("job_status"), "target_count": raw_pool.get("target_count"), "state_counts": states, "items": summaries, "updated_at": raw_pool.get("updated_at")}
@@ -529,14 +623,23 @@ def update_target(job_id: str, payload: ControlJobTargetPatch, request: Request)
             job.current_stage = "PRODUCTION_PLAN"
             job.last_reason = payload.reason or "用户确认按当前合格数量继续"
         elif payload.action == "ADD_CATEGORY":
-            rows = list(session.scalars(select(SiteCategory).where(
-                SiteCategory.site_key == job.site_key,
-                SiteCategory.category_id.in_(payload.category_ids),
-            ))) if payload.category_ids else []
+            latest_scan = session.scalar(
+                select(SiteScanRun)
+                .where(SiteScanRun.site_key == job.site_key)
+                .order_by(SiteScanRun.started_at.desc())
+            )
+            taxonomy = _taxonomy_read_model(session, job.site_key, latest_scan=latest_scan)
+            current_categories = list(taxonomy["categories"])
+            rows = [
+                row for row in current_categories
+                if row.category_id in set(payload.category_ids)
+            ] if payload.category_ids else []
             by_id = {row.category_id: row for row in rows}
             invalid = [value for value in payload.category_ids if value not in by_id]
             if invalid:
-                raise HTTPException(status_code=422, detail=f"类目不属于当前站点：{', '.join(invalid[:5])}")
+                if not taxonomy["taxonomy_available"]:
+                    raise HTTPException(status_code=409, detail=f"当前类目快照不可用（{taxonomy['taxonomy_state']}），请先完成或恢复最新扫描")
+                raise HTTPException(status_code=422, detail=f"类目不属于当前类目快照：{', '.join(invalid[:5])}")
             selected_set = set(payload.category_ids)
             compacted = [
                 category_id for category_id in payload.category_ids
@@ -544,10 +647,12 @@ def update_target(job_id: str, payload: ControlJobTargetPatch, request: Request)
             ]
             if not compacted:
                 raise HTTPException(status_code=422, detail="至少选择一个有效类目/范围")
-            for row in session.scalars(select(SiteCategory).where(SiteCategory.site_key == job.site_key)):
+            for row in current_categories:
                 row.selected = row.category_id in compacted
             policy = _policy(job)
             policy["category_ids"] = list(dict.fromkeys(compacted))
+            if taxonomy["current_snapshot_id"]:
+                policy["category_snapshot_id"] = taxonomy["current_snapshot_id"]
             policy["selection_compacted"] = len(compacted) != len(payload.category_ids)
             job.policy_json = json.dumps(policy, ensure_ascii=False)
             job.status = "POLICY_READY"
@@ -586,17 +691,20 @@ def approve_job(job_id: str, payload: ControlJobApproval, request: Request) -> d
             if payload.approved_cost_ceiling_minor <= 0:
                 raise HTTPException(status_code=400, detail="Provider 非 OFF 时，审批必须填写大于 0 的成本上限（approved_cost_ceiling_minor）")
             provider = job.provider.casefold()
-            configured = provider == "lux3d" and bool(os.getenv("LUX3D_API_KEY", "").strip())
+            credential_configured = bool(os.getenv("LUX3D_API_KEY", "").strip())
+            endpoint_configured = bool(os.getenv("LUX3D_BASE_URL", "").strip())
             qualification = {
                 "schema_version": "provider-qualification.v1",
                 "provider": provider,
                 "checks": {
                     "provider_supported": provider == "lux3d",
-                    "credential_configured": configured,
+                    "credential_configured": credential_configured,
+                    "endpoint_configured": endpoint_configured,
                     "durable_idempotency_ledger": True,
                     "submission_unknown_quarantine": True,
                     "resume_by_known_task_id": True,
-                    "provider_concurrency_one": True,
+                    "provider_concurrency_bounded": True,
+                    "provider_concurrency_max": 5,
                     "explicit_cost_authorization": True,
                 },
                 "provider_posts": 0,
@@ -622,7 +730,7 @@ def approve_job(job_id: str, payload: ControlJobApproval, request: Request) -> d
                 reason=(
                     f"Provider {job.provider} qualification 与显式成本审批均通过"
                     if ready else
-                    f"Provider {job.provider} qualification 未通过：请配置 LUX3D_API_KEY 或选择受支持 Provider"
+                    f"Provider {job.provider} qualification 未通过：请配置 LUX3D_API_KEY 与 LUX3D_BASE_URL，或选择受支持 Provider"
                 ),
                 qualification_receipt_json=json.dumps(qualification, ensure_ascii=False),
                 authorization_hash=authorization_hash,
@@ -748,7 +856,11 @@ def list_control_sites(request: Request) -> dict:
                 .where(SiteScanRun.site_key == site.site_key)
                 .order_by(SiteScanRun.started_at.desc())
             )
-            categories = _current_site_categories(session, site.site_key, latest_scan=latest_scan)
+            taxonomy = _taxonomy_read_model(session, site.site_key, latest_scan=latest_scan)
+            categories = taxonomy["categories"]
+            summary_rows = _taxonomy_summary_rows(categories)
+            known_reported_total = sum(c.count_value for c in summary_rows if c.count_value is not None)
+            reported_total = known_reported_total if taxonomy["count_state"] != "UNKNOWN" else None
             running = sum(job.status in {"RUNNING", "DISCOVERING", "MODELING", "QA", "PROVIDER_RUNNING"} for job in jobs)
             pending_review = sum(job.status in {"WAITING_REVIEW", "HUMAN_REQUIRED", "TARGET_SHORTAGE"} for job in jobs)
             items.append({
@@ -758,10 +870,15 @@ def list_control_sites(request: Request) -> dict:
                 "source_kind": site.source_kind,
                 "status": site.status,
                 "profile_version": site.profile_version,
-                "category_count": len(categories),
-                "reported_total": sum(c.count_value or 0 for c in categories if c.count_kind != "UNKNOWN"),
-                "unknown_count_categories": sum(c.count_kind == "UNKNOWN" for c in categories),
-                "eligible_total": sum(c.eligible_count for c in categories),
+                "category_count": len(categories) if taxonomy["taxonomy_available"] else None,
+                "reported_total": reported_total,
+                "known_reported_total": known_reported_total,
+                "unknown_count_categories": sum(c.count_kind == "UNKNOWN" for c in summary_rows) if categories else None,
+                "taxonomy_state": taxonomy["taxonomy_state"],
+                "taxonomy_available": taxonomy["taxonomy_available"],
+                "count_state": taxonomy["count_state"],
+                "current_snapshot_id": taxonomy["current_snapshot_id"],
+                "eligible_total": sum(c.eligible_count for c in summary_rows),
                 "job_count": len(jobs),
                 "source_url": jobs[0].source_url if jobs else f"https://{site.domain}",
                 "running_jobs": running,
@@ -798,24 +915,31 @@ def list_deliveries(request: Request) -> dict:
             grouped.setdefault(artifact.job_id, []).append(artifact)
         items = []
         for job_id, rows in grouped.items():
+            batch_rows = [row for row in rows if row.artifact_type == "DELIVERY_BATCH_ZIP"]
+            if not batch_rows:
+                # Keep older v2 folder receipts readable while preferring the
+                # explicit 20-per-batch artifacts emitted by the repaired
+                # runtime.
+                batch_rows = [row for row in rows if row.artifact_type == "DELIVERY_FOLDER"]
+            display_rows = sorted(batch_rows, key=lambda item: item.relative_path) if batch_rows else rows
             items.append({
                 "delivery_id": job_id,
                 "job_id": job_id,
                 "relative_path": "runtime-receipt",
-                "batch_count": len(rows),
-                "model_count": sum(item.item_count for item in rows),
+                "batch_count": len(batch_rows) if batch_rows else 0,
+                "model_count": sum(item.item_count for item in batch_rows) if batch_rows else max((item.item_count for item in rows), default=0),
                 "modified_at": max(item.updated_at for item in rows).isoformat(),
                 "batches": [
                     {
                         "artifact_id": item.artifact_id,
-                        "name": item.artifact_type,
+                        "name": Path(item.relative_path).name or item.artifact_type,
                         "file_count": item.item_count,
                         "download_path": item.artifact_id,
                         "sha256": item.sha256,
                         "size_bytes": item.size_bytes,
                         "manifest_schema": item.manifest_schema,
                     }
-                    for item in rows
+                    for item in display_rows
                 ],
             })
         items.sort(key=lambda item: item["modified_at"], reverse=True)
@@ -860,7 +984,9 @@ def get_control_site(site_key: str, request: Request) -> dict:
         snapshots = list(session.scalars(select(SiteTaxonomySnapshot).where(SiteTaxonomySnapshot.site_key == site_key).order_by(SiteTaxonomySnapshot.captured_at.desc()).limit(20)))
         scans = list(session.scalars(select(SiteScanRun).where(SiteScanRun.site_key == site_key).order_by(SiteScanRun.started_at.desc()).limit(50)))
         latest_scan = scans[0] if scans else None
-        categories = _current_site_categories(session, site_key, latest_scan=latest_scan)
+        taxonomy = _taxonomy_read_model(session, site_key, latest_scan=latest_scan)
+        categories = taxonomy["categories"]
+        summary_rows = _taxonomy_summary_rows(categories)
         jobs = list(session.scalars(select(ProductionJob).where(ProductionJob.site_key == site_key).order_by(ProductionJob.updated_at.desc())))
         profile = session.get(SiteProfile, site_key)
         return {
@@ -869,6 +995,13 @@ def get_control_site(site_key: str, request: Request) -> dict:
             "profile": json.loads(profile.profile_json) if profile and profile.profile_json else None,
             "entry_urls": [{"url": item.url, "first_seen_at": item.first_seen_at.isoformat(), "last_seen_at": item.last_seen_at.isoformat(), "last_status": item.last_status, "last_taxonomy_snapshot_id": item.last_taxonomy_snapshot_id} for item in entries],
             "categories": [_category_dict(item) for item in categories],
+            "taxonomy_state": taxonomy["taxonomy_state"],
+            "taxonomy_available": taxonomy["taxonomy_available"],
+            "count_state": taxonomy["count_state"],
+            "current_snapshot_id": taxonomy["current_snapshot_id"],
+            "known_reported_total": sum(item.count_value for item in summary_rows if item.count_value is not None),
+            "reported_total": sum(item.count_value for item in summary_rows if item.count_value is not None) if taxonomy["count_state"] != "UNKNOWN" else None,
+            "unknown_count_categories": sum(item.count_kind == "UNKNOWN" for item in summary_rows) if categories else None,
             "snapshots": [{"snapshot_id": item.snapshot_id, "source_url": item.source_url, "status": item.status, "captured_at": item.captured_at.isoformat(), "evidence": json.loads(item.evidence_json) if item.evidence_json else {}} for item in snapshots],
             "scans": [{"scan_id": item.scan_id, "source_url": item.source_url, "status": item.status, "live": item.live, "taxonomy_level": item.taxonomy_level, "brain_status": item.brain_status, "provider_posts": item.provider_posts, "receipt_path": item.receipt_path, "error_code": item.error_code, "error_message": item.error_message, "started_at": item.started_at.isoformat(), "finished_at": item.finished_at.isoformat() if item.finished_at else None} for item in scans],
             "jobs": [_job_dict(item) for item in jobs],
@@ -968,7 +1101,7 @@ def download_delivery_artifact(artifact_id: str, request: Request) -> Response:
         path, _ = resolved
         if path.is_file():
             payload = path.read_bytes()
-            media_type = "application/json" if artifact.artifact_type == "MANIFEST_JSON" else "text/csv" if artifact.artifact_type == "MANIFEST_CSV" else "application/octet-stream"
+            media_type = "application/zip" if path.suffix.casefold() == ".zip" else "application/json" if artifact.artifact_type == "MANIFEST_JSON" else "text/csv" if artifact.artifact_type == "MANIFEST_CSV" else "application/octet-stream"
             filename = path.name
         elif path.is_dir() and artifact.artifact_type == "DELIVERY_FOLDER":
             buffer = io.BytesIO()

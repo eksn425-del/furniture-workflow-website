@@ -588,6 +588,7 @@ class CandidatePoolStore:
         raw_glb_sha256: str,
         valid: bool,
         model_input_hash: str | None = None,
+        lineage: dict[str, Any] | None = None,
     ) -> CandidateRecord:
         with self._mutating() as payload:
             record = self._update_record(payload, candidate_id)
@@ -617,6 +618,8 @@ class CandidatePoolStore:
                     record.failure_disposition = FailureDisposition.NONE
                     if model_input_hash:
                         record.lineage["model_input_hash"] = model_input_hash
+                    if lineage:
+                        record.lineage.update(lineage)
                     self._event("raw_glb_ready", candidate_id=candidate_id, payload={"sha256": raw_glb_sha256, "path": raw_glb_path})
             record.updated_at = utc_now()
             payload["items"][candidate_id] = record.to_dict()

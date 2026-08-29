@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from app.services.brain_provider import BrainSettings, WebsiteBrainProvider
+from app.services.native_contracts import TaxonomyCategoryContract
 from app.services.native_site_analysis import NativeSiteAnalyzer
 from app.services.product_acquisition import NativeBrowserCollector
 from workers.scrape.http_client import AccessControlDetected, HttpStatusError, SafeHttpClient
@@ -74,6 +75,40 @@ def test_site_root_does_not_turn_missing_count_into_zero(tmp_path: Path) -> None
     category = next(item for item in receipt["categories"] if item["path"] == "/bath")
     assert category["count_value"] is None
     assert category["count_kind"] == "UNKNOWN"
+
+
+def test_coarsen_does_not_sum_known_children_over_unknown_member() -> None:
+    categories = [
+        TaxonomyCategoryContract(
+            category_id="chairs-a",
+            native_name="Dining Chairs",
+            canonical_name="Dining Chairs",
+            path="/living/dining-chairs",
+            source_url="https://example.test/living/dining-chairs",
+            count_value=4,
+            count_kind="EXACT",
+            level=2,
+            parent_path="/living",
+        ),
+        TaxonomyCategoryContract(
+            category_id="chairs-b",
+            native_name="Lounge Chairs",
+            canonical_name="Lounge Chairs",
+            path="/living/lounge-chairs",
+            source_url="https://example.test/living/lounge-chairs",
+            count_value=None,
+            count_kind="UNKNOWN",
+            level=2,
+            parent_path="/living",
+        ),
+    ]
+
+    merged = NativeSiteAnalyzer._coarsen(categories)
+
+    assert len(merged) == 1
+    assert merged[0].canonical_name == "Chairs"
+    assert merged[0].count_value is None
+    assert merged[0].count_kind == "UNKNOWN"
 
 
 def test_retryable_server_status_escalates_to_browser_path(tmp_path: Path) -> None:

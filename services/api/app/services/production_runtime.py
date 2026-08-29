@@ -155,12 +155,14 @@ class ProductionRuntimeService:
         events_path = workspace / "runtime_events.jsonl"
         policy = _payload(job.policy_json)
         requested_ids = [str(value) for value in policy.get("category_ids") or [] if value]
-        category_rows = list(session.scalars(
-            select(SiteCategory).where(
-                SiteCategory.site_key == job.site_key,
-                SiteCategory.category_id.in_(requested_ids),
-            )
-        )) if requested_ids else []
+        category_query = select(SiteCategory).where(
+            SiteCategory.site_key == job.site_key,
+            SiteCategory.category_id.in_(requested_ids),
+        ) if requested_ids else select(SiteCategory).where(SiteCategory.site_key == job.site_key).where(False)
+        snapshot_id = str(policy.get("category_snapshot_id") or "").strip()
+        if snapshot_id:
+            category_query = category_query.where(SiteCategory.snapshot_id == snapshot_id)
+        category_rows = list(session.scalars(category_query))
         category_by_id = {row.category_id: row for row in category_rows}
         categories = []
         for category_id in requested_ids:
@@ -220,6 +222,8 @@ class ProductionRuntimeService:
                 "approve_paid_generation": job.provider.upper() != "OFF" and job.provider_safety == "PRODUCTION_READY",
             },
             "fixture": policy.get("fixture"),
+            "test_profile": policy.get("test_profile"),
+            "provider_concurrency": policy.get("provider_concurrency"),
             "browser_session": {
                 "browser_session_id": browser_session.browser_session_id,
                 "user_data_dir": browser_session.user_data_dir,

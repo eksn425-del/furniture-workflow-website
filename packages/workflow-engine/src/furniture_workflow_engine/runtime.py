@@ -508,6 +508,7 @@ class ProductionWorkflowEngine:
                 raw_glb_path=outcome.raw_glb_path,
                 raw_glb_sha256=outcome.raw_glb_sha256,
                 valid=outcome.raw_glb_valid,
+                lineage=dict(outcome.evidence),
             )
             if record.state is ItemState.COMPLETED:
                 if self.completion_recorder is not None:

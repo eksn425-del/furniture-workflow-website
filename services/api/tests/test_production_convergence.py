@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
-from app.api.routes.control_plane import approve_job, get_control_site, list_control_sites
+from app.api.routes.control_plane import _job_categories, approve_job, get_control_site, list_control_sites
 from app.database import Database
 from app.models import (
     ProductionJob,
@@ -32,6 +32,7 @@ from app.services.product_acquisition import (
 from app.services.production_runtime import ProductionRuntimeService
 from app.services.site_scan_runtime import SiteScanRuntimeService
 from packages.workflow_core.statuses import ItemState
+from workers.blender_adapter import validate_glb
 from workers.production_pipeline import ProductionPipeline
 
 
@@ -91,8 +92,19 @@ class FakeProvider:
         assert result.get("status") == "completed"
         assert provider_task_id.startswith("provider-task-")
         self.download_calls += 1
-        unique_tail = provider_task_id[-8:].encode("ascii")[:8].ljust(8, b"0")
-        raw = b"glTF" + (2).to_bytes(4, "little") + (20).to_bytes(4, "little") + unique_tail
+        payload = json.dumps(
+            {"asset": {"version": "2.0"}, "extras": {"task": provider_task_id}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload += b" " * ((4 - len(payload) % 4) % 4)
+        raw = (
+            b"glTF"
+            + (2).to_bytes(4, "little")
+            + (12 + 8 + len(payload)).to_bytes(4, "little")
+            + len(payload).to_bytes(4, "little")
+            + b"JSON"
+            + payload
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(raw)
         return True
@@ -557,15 +569,79 @@ def test_blocked_latest_snapshot_does_not_expose_retained_categories(tmp_path: P
     try:
         result = list_control_sites(request)
         item = result["items"][0]
-        assert item["category_count"] == 0
-        assert item["unknown_count_categories"] == 0
+        assert item["category_count"] is None
+        assert item["unknown_count_categories"] is None
+        assert item["taxonomy_available"] is False
+        assert item["taxonomy_state"] == "HUMAN_REQUIRED"
+        assert item["count_state"] == "UNKNOWN"
         assert item["latest_scan_status"] == "HUMAN_REQUIRED"
 
         detail = get_control_site("example.test", request)
         assert detail["categories"] == []
+        assert detail["taxonomy_available"] is False
+        assert detail["taxonomy_state"] == "HUMAN_REQUIRED"
+        assert detail["count_state"] == "UNKNOWN"
         assert detail["snapshots"][0]["status"] == "HUMAN_REQUIRED"
     finally:
         database.dispose()
+
+
+def test_job_snapshot_binding_never_falls_back_to_newer_taxonomy(tmp_path: Path) -> None:
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(SiteRegistryRecord(site_key="example.test", domain="example.test", display_name="Acme"))
+        session.add_all([
+            SiteCategory(
+                category_id="old-chairs",
+                site_key="example.test",
+                snapshot_id="old-snapshot",
+                path="/chairs",
+                native_name="Chairs",
+                canonical_name="Chairs",
+                source_url="https://example.test/chairs",
+            ),
+            SiteCategory(
+                category_id="new-tables",
+                site_key="example.test",
+                snapshot_id="new-snapshot",
+                path="/tables",
+                native_name="Tables",
+                canonical_name="Tables",
+                source_url="https://example.test/tables",
+            ),
+        ])
+        job = _job("job-snapshot-bound", policy={
+            "category_ids": ["old-chairs"],
+            "category_snapshot_id": "missing-snapshot",
+        })
+        session.add(job)
+        session.commit()
+
+        assert _job_categories(session, job) == []
+    finally:
+        session.close()
+        database.dispose()
+
+
+def test_glb_qa_rejects_truncated_chunk(tmp_path: Path) -> None:
+    path = tmp_path / "truncated.glb"
+    payload = b'{"asset":{"version":"2.0"}}' + b" " * 2
+    declared = 12 + 8 + len(payload)
+    path.write_bytes(
+        b"glTF"
+        + (2).to_bytes(4, "little")
+        + declared.to_bytes(4, "little")
+        + (len(payload) + 4).to_bytes(4, "little")
+        + b"JSON"
+        + payload
+    )
+
+    valid, reason = validate_glb(path)
+
+    assert valid is False
+    assert reason == "invalid_chunk_length"
 
 
 def test_site_list_exposes_active_scan_for_frontend_resume(tmp_path: Path) -> None:
@@ -588,7 +664,10 @@ def test_site_list_exposes_active_scan_for_frontend_resume(tmp_path: Path) -> No
     try:
         result = list_control_sites(request)
         item = result["items"][0]
-        assert item["category_count"] == 0
+        assert item["category_count"] is None
+        assert item["taxonomy_available"] is False
+        assert item["taxonomy_state"] == "SCANNING"
+        assert item["count_state"] == "UNKNOWN"
         assert item["latest_scan_id"] == "scan-active"
         assert item["latest_scan_status"] == "ANALYZING"
         assert item["latest_scan_finished_at"] is None
@@ -598,6 +677,7 @@ def test_site_list_exposes_active_scan_for_frontend_resume(tmp_path: Path) -> No
 
 def test_provider_ready_has_real_qualification_path_without_post(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("LUX3D_API_KEY", "fixture-key-never-sent")
+    monkeypatch.setenv("LUX3D_BASE_URL", "http://provider.test")
     database = Database(tmp_path / "system" / "control.sqlite3")
     database.create_schema()
     session = database.session_factory()

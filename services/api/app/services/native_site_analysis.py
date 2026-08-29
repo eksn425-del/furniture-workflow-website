@@ -953,10 +953,18 @@ class NativeSiteAnalyzer:
             # the broader coarse group ("Bath").
             if any(any(str(item.get("role") or "") == "source_scope" for item in member.evidence) for member in members):
                 coarse.canonical_name = rep.canonical_name
-            coarse.count_value = total if any(m.count_value is not None for m in members) else None
-            coarse.count_kind = ("EXACT" if all(m.count_kind == "EXACT" for m in members)
-                                 else "ESTIMATED" if any(m.count_kind != "UNKNOWN" for m in members)
-                                 else "UNKNOWN")
+            # A merged child total is authoritative only when every member is
+            # counted.  Summing known children while silently omitting an
+            # UNKNOWN child turns a partial total into a false exact/estimate.
+            if all(m.count_kind == "EXACT" and m.count_value is not None for m in members):
+                coarse.count_value = total
+                coarse.count_kind = "EXACT"
+            elif all(m.count_kind != "UNKNOWN" and m.count_value is not None for m in members):
+                coarse.count_value = total
+                coarse.count_kind = "ESTIMATED"
+            else:
+                coarse.count_value = None
+                coarse.count_kind = "UNKNOWN"
             coarse.level = 2
             coarse.parent_path = parent
             coarse.evidence = evidence
