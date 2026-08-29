@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": "source-policy.v1",
+  "max_final_name_chars": 50,
+  "model_modes": [
+    "LOCAL_AGENT",
+    "MULTIMODAL_SINGLE_MODEL",
+    "TEXT_BRAIN_PLUS_VISION"
+  ],
+  "review_providers": [
+    "LOCAL_AGENT",
+    "QWEN_VISION",
+    "MULTIMODAL_BRAIN",
+    "TEXT_BRAIN_PLUS_VISION"
+  ],
+  "media_binding_status": [
+    "EXACT",
+    "COMPATIBLE",
+    "UNKNOWN",
+    "MISMATCH"
+  ],
+  "source_profiles": {
+    "cgtrader.com": {
+      "source_kind": "MARKETPLACE",
+      "title_authority": "LOW",
+      "type_authority": "VISION_PRIMARY",
+      "category_authority": "DISCOVERY_ONLY",
+      "vision_policy": "VISUAL_GOVERNED",
+      "identity_policy": "LISTING_BOUND",
+      "media_policy": "LISTING_BOUND",
+      "brand_prefix_policy": "NONE",
+      "naming_contract_version": "naming-contract.v3-marketplace"
+    },
+    "roomandboard.com": {
+      "source_kind": "DIRECT_BRAND",
+      "title_authority": "HIGH",
+      "type_authority": "OFFICIAL_WITH_VISION_VERIFY",
+      "category_authority": "HIGH",
+      "vision_policy": "VERIFICATION",
+      "identity_policy": "BRAND_OFFICIAL_VERIFIED",
+      "media_policy": "STRICT_MAIN_PRODUCT",
+      "brand_display_name": "Room & Board",
+      "brand_prefix_policy": "REQUIRED",
+      "naming_contract_version": "naming-contract.v2-brand-direct"
+    },
+    "anthropologie.com": {
+      "source_kind": "MULTI_CATEGORY_RETAILER",
+      "title_authority": "HIGH",
+      "type_authority": "OFFICIAL_WITH_VISION_VERIFY",
+      "category_authority": "DISCOVERY_ONLY",
+      "vision_policy": "VISUAL_GOVERNED",
+      "identity_policy": "SOURCE_BOUND",
+      "media_policy": "STRICT_MAIN_PRODUCT",
+      "brand_display_name": "Anthropologie",
+      "brand_prefix_policy": "OPTIONAL",
+      "naming_contract_version": "naming-contract.v1"
+    },
+    "francfranc.com": {
+      "source_kind": "DIRECT_BRAND",
+      "title_authority": "HIGH",
+      "type_authority": "OFFICIAL_WITH_VISION_VERIFY",
+      "category_authority": "HIGH",
+      "vision_policy": "VERIFICATION",
+      "identity_policy": "BRAND_OFFICIAL_VERIFIED",
+      "media_policy": "STRICT_MAIN_PRODUCT",
+      "brand_display_name": "Francfranc",
+      "brand_prefix_policy": "REQUIRED",
+      "naming_contract_version": "naming-contract.v2-brand-direct"
+    },
+    "*": {
+      "source_kind": "UNKNOWN",
+      "title_authority": "LOW",
+      "type_authority": "VISION_REQUIRED",
+      "category_authority": "DISCOVERY_ONLY",
+      "vision_policy": "VISUAL_GOVERNED",
+      "identity_policy": "SOURCE_BOUND",
+      "media_policy": "SOURCE_BOUND",
+      "brand_prefix_policy": "NONE",
+      "naming_contract_version": "naming-contract.v1"
+    }
+  },
+  "production_gate": {
+    "required": [
+      "identity",
+      "dedup",
+      "claim",
+      "media_binding",
+      "decodable_image",
+      "visual_review",
+      "source_image_vision_consistency",
+      "scope",
+      "final_name",
+      "final_name_limit",
+      "dimensions",
+      "provider_idempotency"
+    ],
+    "pass_status": "READY_FOR_MODELING",
+    "unknown_status": "REVIEW_REQUIRED",
+    "mismatch_status": "MEDIA_IDENTITY_MISMATCH"
+  }
+}

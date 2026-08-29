@@ -1,0 +1,42 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# Runtime state and potentially sensitive evidence
+output/
+data/
+*.sqlite3
+*.db
+*.log
+*.glb
+*.zip
+browser_sessions/
+candidate_pool.json
+candidate_pool_events.jsonl
+runtime_events.jsonl
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

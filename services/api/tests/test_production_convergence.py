@@ -1,0 +1,808 @@
+from __future__ import annotations
+
+import json
+import inspect
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import select
+
+from app.api.routes.control_plane import approve_job, get_control_site, list_control_sites
+from app.database import Database
+from app.models import (
+    ProductionJob,
+    ProductionProviderTask,
+    SiteCategory,
+    SiteEntryURL,
+    SiteRegistryRecord,
+    SiteScanRun,
+    SiteTaxonomySnapshot,
+    utc_now,
+)
+from app.schemas import ControlJobApproval, ControlJobStart
+from app.services.product_acquisition import (
+    AcquiredProduct,
+    ProductAcquisitionEngine,
+    ProductAcquisitionError,
+    ProductSupplyExhausted,
+    classify_source_type,
+)
+from app.services.production_runtime import ProductionRuntimeService
+from app.services.site_scan_runtime import SiteScanRuntimeService
+from packages.workflow_core.statuses import ItemState
+from workers.production_pipeline import ProductionPipeline
+
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + (b"production-fixture" * 128)
+
+
+class FakeMediaResponse:
+    content = PNG_BYTES
+    content_type = "image/png"
+
+
+class FakeMediaClient:
+    def __init__(self, **_: object) -> None:
+        pass
+
+    def get_media(self, _: str) -> FakeMediaResponse:
+        return FakeMediaResponse()
+
+
+class FakeAcquisition:
+    def __init__(self, products: list[AcquiredProduct]) -> None:
+        self.products = list(products)
+        self.cursor = 0
+
+    def discover(self, needed: int) -> list[AcquiredProduct]:
+        result = self.products[self.cursor : self.cursor + needed]
+        self.cursor += len(result)
+        if not result:
+            raise ProductSupplyExhausted("fixture scopes exhausted")
+        return result
+
+
+class FakeProvider:
+    def __init__(self, *, poll_timeout: bool = False, capacity_rejection: bool = False) -> None:
+        self.create_calls = 0
+        self.poll_calls = 0
+        self.download_calls = 0
+        self.poll_timeout = poll_timeout
+        self.capacity_rejection = capacity_rejection
+
+    def create_task(self, image_path: Path, *, idempotency_key: str | None = None):
+        assert image_path.is_file()
+        assert idempotency_key
+        self.create_calls += 1
+        if self.capacity_rejection:
+            return None, "Provider capacity is full (429)"
+        return f"provider-task-{idempotency_key[:12]}", None
+
+    def poll_task(self, provider_task_id: str):
+        assert provider_task_id.startswith("provider-task-")
+        self.poll_calls += 1
+        if self.poll_timeout:
+            return None, "timeout while Provider task is still active"
+        return {"status": "completed", "model_url": "fixture://model.glb"}, None
+
+    def download_glb(self, result: dict, provider_task_id: str, target: Path) -> bool:
+        assert result.get("status") == "completed"
+        assert provider_task_id.startswith("provider-task-")
+        self.download_calls += 1
+        unique_tail = provider_task_id[-8:].encode("ascii")[:8].ljust(8, b"0")
+        raw = b"glTF" + (2).to_bytes(4, "little") + (20).to_bytes(4, "little") + unique_tail
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        return True
+
+
+def _product(index: int, *, name: str | None = None, brand: str = "Maker") -> AcquiredProduct:
+    qualification = {
+        "eligible": True,
+        "single_product": True,
+        "background_ok": True,
+        "image_to_3d_suitable": True,
+        "category_group": "Chairs",
+        "style": "Modern",
+        "color": "Walnut",
+        "material": "Wood",
+        "product_type": "Chair",
+        "width": 24,
+        "depth": 26,
+        "height": 31,
+        "confidence": 0.99,
+        "reason_codes": ["TEST_FIXTURE_ACCEPTED"],
+    }
+    return AcquiredProduct(
+        source_product_id=f"sku-{index}",
+        canonical_url=f"https://example.test/products/chair-{index}",
+        source_name=name or f"Lounge Chair {index}",
+        source_brand=brand,
+        category_id="cat_chairs",
+        category_group="Chairs",
+        image_url=f"https://example.test/media/chair-{index}.png",
+        dimensions={"width": 24.0, "depth": 26.0, "height": 31.0},
+        dimension_unit="in",
+        source_type="DIRECT_BRAND",
+        capture_sha256=f"{index + 1:064x}",
+        acquisition="TEST_FIXTURE",
+        evidence={"qualification": qualification},
+    )
+
+
+def _contract(tmp_path: Path, *, job_id: str, target: int, provider: str = "OFF", source_type: str = "DIRECT_BRAND") -> dict:
+    return {
+        "schema_version": "job-contract.v3",
+        "job_id": job_id,
+        "source_url": "https://example.test/collections/chairs",
+        "site_key": "example.test",
+        "site_display_name": "Acme",
+        "title": "Production convergence fixture",
+        "goal": "Exact-N validated furniture models",
+        "target_mode": "EXACT_N",
+        "target_value": target,
+        "category_ids": ["cat_chairs"],
+        "categories": [{
+            "category_id": "cat_chairs",
+            "canonical_name": "Chairs",
+            "native_name": "Chairs",
+            "path": "Chairs",
+            "source_url": "https://example.test/collections/chairs",
+            "parent_category_id": None,
+            "level": 1,
+            "scope_kind": "CATEGORY",
+            "selected": True,
+        }],
+        "scope": "NEW_ONLY",
+        "category_allocation": "TOTAL_ACROSS_SELECTED",
+        "allocation_strategy": "SEQUENTIAL",
+        "spillover": "STOP",
+        "source_type": source_type,
+        "provider": provider,
+        "authorization": {"approve_paid_generation": provider.casefold() != "off"},
+        "browser_session": {"user_data_dir": str(tmp_path / "browser-session")},
+        "workspace": str(tmp_path / job_id),
+        "database_path": str(tmp_path / "system" / "control.sqlite3"),
+        "approved_plan": {"approved_cost_ceiling_minor": 1000 if provider.casefold() != "off" else 0},
+    }
+
+
+def _run_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    contract: dict,
+    products: list[AcquiredProduct],
+    provider: FakeProvider | None = None,
+):
+    monkeypatch.setenv("FURNITURE_WORKFLOW_TEST_FIXTURES", "true")
+    monkeypatch.setattr("workers.production_pipeline.SafeHttpClient", FakeMediaClient)
+    acquisition = FakeAcquisition(products)
+    events: list[dict] = []
+
+    def emit(event_type, stage, message, done, total, payload):
+        events.append({
+            "type": event_type,
+            "stage": stage,
+            "message": message,
+            "done": done,
+            "total": total,
+            "payload": payload or {},
+        })
+
+    pipeline = ProductionPipeline(
+        contract=contract,
+        workspace=Path(contract["workspace"]),
+        emit=emit,
+        acquisition_factory=lambda **_: acquisition,
+        provider_client=provider,
+    )
+    return pipeline, events
+
+
+def _job(job_id: str, *, provider: str = "OFF", policy: dict | None = None) -> ProductionJob:
+    return ProductionJob(
+        job_id=job_id,
+        source_url="https://example.test/collections/chairs",
+        site_key="example.test",
+        title="Fixture Job",
+        goal="Exact-N production",
+        target_mode="EXACT_N",
+        target_value=1,
+        requested_count=1,
+        provider=provider,
+        policy_json=json.dumps(policy or {"category_ids": ["cat_chairs"]}),
+    )
+
+
+def test_selected_category_drives_acquisition(tmp_path: Path) -> None:
+    category_html = '<a href="/products/chair-one">Chair</a>'
+    product_html = """
+    <script type="application/ld+json">
+    {"@type":"Product","name":"Chair One","sku":"one","image":"/media/one.png","url":"/products/chair-one","brand":{"name":"Acme"}}
+    </script><p>24 W x 26 D x 31 H in</p>
+    """
+
+    class Client:
+        calls: list[str] = []
+
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_html(self, url: str) -> str:
+            self.calls.append(url)
+            return product_html if "/products/" in url else category_html
+
+    engine = ProductAcquisitionEngine(
+        source_url="https://example.test/",
+        site_key="example.test",
+        source_type="DIRECT_BRAND",
+        categories=[{
+            "category_id": "cat_chairs",
+            "canonical_name": "Chairs",
+            "source_url": "https://example.test/collections/chairs",
+            "selected": True,
+        }],
+        workspace=tmp_path / "acquisition",
+        browser_session_dir=tmp_path / "browser",
+        client_factory=Client,
+    )
+    products = engine.discover(1)
+    assert [item.category_id for item in products] == ["cat_chairs"]
+    assert Client.calls[0].endswith("/collections/chairs")
+    assert all("tables" not in url for url in Client.calls)
+
+
+def test_product_acquisition_selects_page_bound_jsonld_and_accepts_layered_scene7(tmp_path: Path) -> None:
+    detail_html = """
+    <h1>Wyatt Bed</h1><p>Item Number: 575954</p>
+    <script type="application/ld+json">
+    [{"@type":"Product","name":"Related Chair","sku":"126154","image":"/media/chair.png"},
+     {"@type":"Product","name":"Wyatt Bed","sku":"575954","url":"/catalog/575954",
+      "image":"https://scene7.example/126154.jpg?layer=bed-queen","brand":{"name":"Room & Board"}}]
+    </script><p>Overall: 80"w 84"d 45"h</p>
+    """
+
+    class Client:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_html(self, _: str) -> str:
+            return detail_html
+
+    engine = ProductAcquisitionEngine(
+        source_url="https://www.roomandboard.com/",
+        site_key="roomandboard.com",
+        source_type="DIRECT_BRAND",
+        categories=[{
+            "category_id": "cat_beds",
+            "canonical_name": "Beds",
+            "path": "Bedroom / Beds",
+            "source_url": "https://www.roomandboard.com/catalog/575954",
+            "selected": True,
+        }],
+        workspace=tmp_path / "r-and-b",
+        browser_session_dir=tmp_path / "browser",
+        client_factory=Client,
+    )
+    products = engine.discover(1)
+    assert len(products) == 1
+    product = products[0]
+    assert product.source_name == "Wyatt Bed"
+    assert product.source_product_id == "575954"
+    assert product.identity_fields["url_tail_id"] == "575954"
+    assert product.identity_fields["jsonld_sku"] == "575954"
+    assert product.evidence["layered_scene7"] is True
+    assert product.media_binding_status == "COMPATIBLE"
+    assert product.media_binding_confidence == 0.9
+
+
+def test_marketplace_requires_scope_before_network(tmp_path: Path) -> None:
+    class NoNetwork:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_html(self, _: str) -> str:
+            raise AssertionError("marketplace without a selected scope must not fetch")
+
+    engine = ProductAcquisitionEngine(
+        source_url="https://market.example/",
+        site_key="market.example",
+        source_type="MARKETPLACE",
+        categories=[],
+        workspace=tmp_path / "market",
+        browser_session_dir=tmp_path / "browser",
+        client_factory=NoNetwork,
+    )
+    with pytest.raises(ProductAcquisitionError, match="MARKETPLACE_SCOPE_REQUIRED"):
+        engine.discover(1)
+
+
+def test_parent_child_category_dedup(tmp_path: Path) -> None:
+    engine = ProductAcquisitionEngine(
+        source_url="https://example.test/",
+        site_key="example.test",
+        source_type="MULTI_BRAND_RETAILER",
+        categories=[
+            {"category_id": "parent", "source_url": "https://example.test/chairs", "selected": True},
+            {"category_id": "child", "parent_category_id": "parent", "source_url": "https://example.test/chairs/dining", "selected": True},
+        ],
+        workspace=tmp_path / "compact",
+        browser_session_dir=tmp_path / "browser",
+        client_factory=lambda **_: SimpleNamespace(),
+    )
+    assert [item["category_id"] for item in engine.categories] == ["parent"]
+
+
+def test_no_browser_evidence_dir_required_and_selected_scope_contract(tmp_path: Path) -> None:
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(SiteRegistryRecord(site_key="example.test", domain="example.test", display_name="Acme", source_kind="DIRECT_BRAND"))
+        session.add_all([
+            SiteCategory(category_id="cat_chairs", site_key="example.test", path="Chairs", native_name="Chairs", canonical_name="Chairs", source_url="https://example.test/chairs"),
+            SiteCategory(category_id="cat_tables", site_key="example.test", path="Tables", native_name="Tables", canonical_name="Tables", source_url="https://example.test/tables"),
+        ])
+        job = _job("job-contract")
+        session.add(job)
+        session.commit()
+        runtime = ProductionRuntimeService(database, tmp_path / "output")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(parents=True)
+        _, _, contract = runtime._contract(session, job, workspace)
+        assert contract["category_ids"] == ["cat_chairs"]
+        assert [item["category_id"] for item in contract["categories"]] == ["cat_chairs"]
+        def keys(value: object):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    yield str(key)
+                    yield from keys(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from keys(child)
+
+        assert "browser_evidence_dir" not in set(keys(contract))
+        assert "browser_evidence_dir" not in ControlJobStart.model_fields
+    finally:
+        session.close()
+        database.dispose()
+
+
+def test_site_scan_persists_across_navigation_and_service_restart(tmp_path: Path) -> None:
+    class Analyzer:
+        @staticmethod
+        def analyze(source_url: str, *, live: bool, output_dir: Path) -> dict:
+            assert live is True
+            output_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "status": "READY",
+                "verified": True,
+                "taxonomy_level": "L1",
+                "profile_version": "fixture-v1",
+                "source_type": "DIRECT_BRAND",
+                "source_scope": "CATEGORY",
+                "brain": {"status": "NOT_NEEDED", "provider_posts": 0},
+                "categories": [{
+                    "category_id": "cat_chairs",
+                    "path": "Furniture / Chairs",
+                    "native_name": "Chairs",
+                    "canonical_name": "Chairs",
+                    "source_url": source_url,
+                    "count_value": 12,
+                    "count_kind": "EXACT",
+                    "confidence": 1.0,
+                    "level": 1,
+                    "evidence": ["fixture"],
+                }],
+            }
+
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(SiteRegistryRecord(site_key="example.test", domain="example.test", display_name="Acme"))
+        session.commit()
+        session.add(SiteEntryURL(entry_url_id="entry-1", site_key="example.test", url="https://example.test/"))
+        session.commit()
+    finally:
+        session.close()
+    first = SiteScanRuntimeService(database, tmp_path / "output", Analyzer())
+    started = first.start(site_key="example.test", source_url="https://example.test/", job_id=None, live=True)
+    deadline = time.monotonic() + 3
+    current = started
+    while current["status"] in {"QUEUED", "ANALYZING", "L2_BROWSER"} and time.monotonic() < deadline:
+        time.sleep(0.01)
+        current = first.status(started["scan_id"]) or current
+    assert current["status"] == "READY"
+    first.shutdown()
+    second = SiteScanRuntimeService(database, tmp_path / "output", Analyzer())
+    try:
+        restored = second.status(started["scan_id"])
+        assert restored and restored["status"] == "READY"
+        session = database.session_factory()
+        try:
+            category = session.scalar(select(SiteCategory).where(SiteCategory.category_id == "cat_chairs"))
+            assert category and category.count_value == 12
+        finally:
+            session.close()
+    finally:
+        second.shutdown()
+        database.dispose()
+
+
+def test_partial_unknown_scan_escalates_to_browser_l2(tmp_path: Path) -> None:
+    class Analyzer:
+        def __init__(self) -> None:
+            self.browser_calls = 0
+
+        @staticmethod
+        def analyze(source_url: str, *, live: bool, output_dir: Path) -> dict:
+            assert live is True
+            output_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "status": "PARTIAL",
+                "verified": False,
+                "taxonomy_level": "L1",
+                "profile_version": "fixture-partial-v1",
+                "source_type": "DIRECT_BRAND",
+                "source_scope": "SITE",
+                "brain": {"status": "NOT_NEEDED", "provider_posts": 0},
+                "categories": [{
+                    "category_id": "cat_chairs",
+                    "path": "/chairs",
+                    "native_name": "Chairs",
+                    "canonical_name": "Chairs",
+                    "source_url": source_url,
+                    "count_value": None,
+                    "count_kind": "UNKNOWN",
+                    "confidence": 0.62,
+                    "level": 1,
+                    "evidence": [{"role": "sitemap"}],
+                }],
+            }
+
+        def analyze_browser(self, source_url: str, *, output_dir: Path, session_dir: Path) -> dict:
+            self.browser_calls += 1
+            return {
+                "status": "READY",
+                "verified": True,
+                "taxonomy_level": "L1",
+                "profile_version": "fixture-l2-v1",
+                "source_type": "DIRECT_BRAND",
+                "source_scope": "SITE",
+                "brain": {"status": "NOT_NEEDED", "provider_posts": 0},
+                "categories": [{
+                    "category_id": "cat_chairs",
+                    "path": "/chairs",
+                    "native_name": "Chairs",
+                    "canonical_name": "Chairs",
+                    "source_url": source_url,
+                    "count_value": 9,
+                    "count_kind": "EXACT",
+                    "confidence": 0.95,
+                    "level": 1,
+                    "evidence": [{"role": "visible_count", "value": 9}],
+                }],
+            }
+
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(SiteRegistryRecord(site_key="example.test", domain="example.test", display_name="Acme"))
+        session.commit()
+    finally:
+        session.close()
+
+    analyzer = Analyzer()
+    runtime = SiteScanRuntimeService(database, tmp_path / "output", analyzer)
+    started = runtime.start(site_key="example.test", source_url="https://example.test/", job_id=None, live=True)
+    deadline = time.monotonic() + 3
+    current = started
+    while current["status"] in {"QUEUED", "ANALYZING", "L2_BROWSER"} and time.monotonic() < deadline:
+        time.sleep(0.01)
+        current = runtime.status(started["scan_id"]) or current
+    try:
+        assert current["status"] == "READY"
+        assert analyzer.browser_calls == 1
+        session = database.session_factory()
+        try:
+            category = session.scalar(select(SiteCategory).where(SiteCategory.category_id == "cat_chairs"))
+            assert category and category.count_value == 9 and category.count_kind == "EXACT"
+        finally:
+            session.close()
+    finally:
+        runtime.shutdown()
+        database.dispose()
+
+
+def test_blocked_latest_snapshot_does_not_expose_retained_categories(tmp_path: Path) -> None:
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(SiteRegistryRecord(site_key="example.test", domain="example.test", display_name="Acme"))
+        session.add(SiteCategory(
+            category_id="cat-old",
+            site_key="example.test",
+            snapshot_id="old-snapshot",
+            path="/chairs",
+            native_name="Chairs",
+            canonical_name="Chairs",
+            source_url="https://example.test/chairs",
+            count_kind="UNKNOWN",
+        ))
+        session.add(SiteTaxonomySnapshot(
+            snapshot_id="blocked-snapshot",
+            site_key="example.test",
+            source_url="https://example.test/",
+            status="HUMAN_REQUIRED",
+        ))
+        session.add(SiteScanRun(
+            scan_id="scan-blocked",
+            site_key="example.test",
+            source_url="https://example.test/",
+            status="HUMAN_REQUIRED",
+            live=True,
+            finished_at=utc_now(),
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(database=database)))
+    try:
+        result = list_control_sites(request)
+        item = result["items"][0]
+        assert item["category_count"] == 0
+        assert item["unknown_count_categories"] == 0
+        assert item["latest_scan_status"] == "HUMAN_REQUIRED"
+
+        detail = get_control_site("example.test", request)
+        assert detail["categories"] == []
+        assert detail["snapshots"][0]["status"] == "HUMAN_REQUIRED"
+    finally:
+        database.dispose()
+
+
+def test_site_list_exposes_active_scan_for_frontend_resume(tmp_path: Path) -> None:
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(SiteRegistryRecord(site_key="example.test", domain="example.test", display_name="Acme"))
+        session.add(SiteScanRun(
+            scan_id="scan-active",
+            site_key="example.test",
+            source_url="https://example.test/",
+            status="ANALYZING",
+            live=True,
+        ))
+        session.commit()
+    finally:
+        session.close()
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(database=database)))
+    try:
+        result = list_control_sites(request)
+        item = result["items"][0]
+        assert item["category_count"] == 0
+        assert item["latest_scan_id"] == "scan-active"
+        assert item["latest_scan_status"] == "ANALYZING"
+        assert item["latest_scan_finished_at"] is None
+    finally:
+        database.dispose()
+
+
+def test_provider_ready_has_real_qualification_path_without_post(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("LUX3D_API_KEY", "fixture-key-never-sent")
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(_job("job-provider-ready", provider="lux3d"))
+        session.commit()
+    finally:
+        session.close()
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(database=database)))
+    result = approve_job(
+        "job-provider-ready",
+        ControlJobApproval(confirm=True, approved_cost_ceiling_minor=2500, actor="test-operator"),
+        request,
+    )
+    assert result["status"] == "PRODUCTION_READY"
+    assert result["provider_calls"] == 0
+    database.dispose()
+
+
+def test_exact_n_reaches_ready_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = _contract(tmp_path, job_id="job-ready-three", target=3)
+    pipeline, events = _run_pipeline(monkeypatch, tmp_path, contract=contract, products=[_product(index) for index in range(3)])
+    assert pipeline.run() == 2
+    assert [item.state for item in pipeline.pool.records()] == [ItemState.MODEL_INPUT_LOCKED] * 3
+    assert any(item["type"] == "READY_POOL_COMPLETED" and item["done"] == 3 for item in events)
+    assert sum(int(item["payload"].get("provider_calls", 0)) for item in events) == 0
+
+
+def test_local_agent_review_mode_reaches_ready_pool_without_brain_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("FURNITURE_WORKFLOW_TEST_FIXTURES", raising=False)
+    monkeypatch.setenv("LOCAL_REVIEW_MODE", "agent")
+    monkeypatch.setattr("workers.production_pipeline.SafeHttpClient", FakeMediaClient)
+    contract = _contract(tmp_path, job_id="job-local-agent", target=1)
+    acquisition = FakeAcquisition([_product(0)])
+    events: list[dict] = []
+
+    def emit(event_type, stage, message, done, total, payload):
+        events.append({"type": event_type, "payload": payload or {}})
+
+    pipeline = ProductionPipeline(
+        contract=contract,
+        workspace=Path(contract["workspace"]),
+        emit=emit,
+        acquisition_factory=lambda **_: acquisition,
+        provider_client=None,
+    )
+    assert pipeline.run() == 2
+    record = pipeline.pool.records()[0]
+    assert record.state is ItemState.MODEL_INPUT_LOCKED
+    assert record.lineage["review_provider"] == "LOCAL_AGENT"
+    assert record.lineage["brain_receipt"]["status"] == "LOCAL_AGENT_REVIEW"
+    assert record.lineage["brain_receipt"]["provider_posts"] == 0
+
+
+def test_up_to_n_accepts_smaller_ready_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = _contract(tmp_path, job_id="job-up-to-three", target=3)
+    contract["target_mode"] = "UP_TO_N"
+    pipeline, events = _run_pipeline(
+        monkeypatch,
+        tmp_path,
+        contract=contract,
+        products=[_product(0), _product(1)],
+    )
+    assert pipeline.run() == 2
+    assert [item.state for item in pipeline.pool.records()] == [ItemState.MODEL_INPUT_LOCKED] * 2
+    assert any(item["type"] == "READY_POOL_COMPLETED" and item["done"] == 2 and item["total"] == 3 for item in events), events
+    assert not any(item["type"] == "TARGET_SHORTAGE" for item in events)
+
+
+@pytest.mark.parametrize("target", [1, 3])
+def test_fake_provider_completes_exact_n_delivery(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: int) -> None:
+    contract = _contract(tmp_path, job_id=f"job-delivery-{target}", target=target, provider="lux3d")
+    provider = FakeProvider()
+    pipeline, events = _run_pipeline(
+        monkeypatch,
+        tmp_path,
+        contract=contract,
+        products=[_product(index, name="Shared Product Name") for index in range(target)],
+        provider=provider,
+    )
+    assert pipeline.run() == 0, events
+    assert provider.create_calls == target
+    assert provider.download_calls == target
+    manifest = json.loads((Path(contract["workspace"]) / "05_delivery" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["delivered"] == target
+    assert len({item["filename"] for item in manifest["items"]}) == target
+    assert any(item["type"] == "JOB_COMPLETED" and item["done"] == target for item in events)
+
+
+def test_provider_capacity_wait_preserves_attempt_ledger_and_resumes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = _contract(tmp_path, job_id="job-provider-capacity", target=1, provider="lux3d")
+    waiting_provider = FakeProvider(capacity_rejection=True)
+    first, events = _run_pipeline(monkeypatch, tmp_path, contract=contract, products=[_product(1)], provider=waiting_provider)
+    assert first.run() == 2
+    assert waiting_provider.create_calls == 1
+    assert any(item["payload"].get("blocker") == "PROVIDER_CAPACITY" for item in events)
+
+    finishing_provider = FakeProvider()
+    resumed, _ = _run_pipeline(monkeypatch, tmp_path, contract=contract, products=[], provider=finishing_provider)
+    assert resumed.run() == 0
+    assert finishing_provider.create_calls == 1
+    session = resumed.database.session_factory()
+    try:
+        ledger = session.scalar(select(ProductionProviderTask).where(ProductionProviderTask.job_id == contract["job_id"]))
+        assert ledger and ledger.post_attempts == 2 and ledger.status == "DELIVERED"
+    finally:
+        session.close()
+
+
+def test_provider_off_ready_pool_can_resume_after_approval(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    off_contract = _contract(tmp_path, job_id="job-off-to-live", target=1)
+    first, _ = _run_pipeline(monkeypatch, tmp_path, contract=off_contract, products=[_product(1)])
+    assert first.run() == 2
+    old_hash = first.pool.records()[0].model_input_hash
+
+    live_contract = dict(off_contract)
+    live_contract["provider"] = "lux3d"
+    live_contract["authorization"] = {"approve_paid_generation": True}
+    provider = FakeProvider()
+    resumed, _ = _run_pipeline(monkeypatch, tmp_path, contract=live_contract, products=[], provider=provider)
+    assert resumed.run() == 0
+    record = resumed.pool.records()[0]
+    assert provider.create_calls == 1
+    assert record.model_input_hash != old_hash
+    assert record.lineage["model_input_policy_migrated"] is True
+
+
+def test_resume_does_not_duplicate_provider_post(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = _contract(tmp_path, job_id="job-provider-resume", target=1, provider="lux3d")
+    waiting_provider = FakeProvider(poll_timeout=True)
+    first, _ = _run_pipeline(monkeypatch, tmp_path, contract=contract, products=[_product(1)], provider=waiting_provider)
+    assert first.run() == 2
+    assert waiting_provider.create_calls == 1
+
+    finishing_provider = FakeProvider()
+    resumed, _ = _run_pipeline(monkeypatch, tmp_path, contract=contract, products=[], provider=finishing_provider)
+    assert resumed.run() == 0
+    assert finishing_provider.create_calls == 0
+    session = resumed.database.session_factory()
+    try:
+        ledger = session.scalar(select(ProductionProviderTask).where(ProductionProviderTask.job_id == contract["job_id"]))
+        assert ledger and ledger.post_attempts == 1 and ledger.status == "DELIVERED"
+    finally:
+        session.close()
+
+
+def test_source_name_first_rules(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cases = [
+        ("DIRECT_BRAND", "Lounge Chair", "Maker", "Acme Lounge Chair"),
+        ("MULTI_BRAND_RETAILER", "Aeron Chair", "Herman Miller", "Herman Miller Aeron Chair"),
+        ("MARKETPLACE", "Vintage Chair", "Marketplace Platform", "Vintage Chair"),
+    ]
+    for index, (source_type, source_name, source_brand, expected) in enumerate(cases):
+        case_root = tmp_path / str(index)
+        contract = _contract(case_root, job_id=f"job-name-{index}", target=1, source_type=source_type)
+        pipeline, _ = _run_pipeline(
+            monkeypatch,
+            case_root,
+            contract=contract,
+            products=[_product(index, name=source_name, brand=source_brand)],
+        )
+        assert pipeline.run() == 2
+        record = pipeline.pool.records()[0]
+        assert record.product_name == expected
+        assert record.lineage["naming_decision_source"] == "SOURCE_NAME_FIRST"
+        if source_type == "MARKETPLACE":
+            assert record.lineage["platform_brand_excluded"] is True
+
+
+def test_anthropologie_source_policy_preserves_multi_category_kind() -> None:
+    assert classify_source_type(
+        "https://www.anthropologie.com/anthrohome/collection-shop-all-kitchen",
+        "<html><body>1196 products</body></html>",
+    ) == "MULTI_CATEGORY_RETAILER"
+
+
+def test_production_runtime_uses_workflow_engine() -> None:
+    source = inspect.getsource(ProductionPipeline.run)
+    assert "ProductionWorkflowEngine(" in source
+    assert "engine.tick()" in source
+    assert "CandidatePoolStore" in inspect.getsource(ProductionPipeline.__init__)
+    launcher_source = inspect.getsource(ProductionRuntimeService._launch)
+    assert 'packages" / "workflow-engine" / "src' in launcher_source
+
+
+def test_database_migration_is_additive_and_idempotent(tmp_path: Path) -> None:
+    database_path = tmp_path / "system" / "control.sqlite3"
+    first = Database(database_path)
+    first.create_schema()
+    session = first.session_factory()
+    try:
+        session.add(SiteRegistryRecord(site_key="history.test", domain="history.test", display_name="Historical Site"))
+        session.commit()
+    finally:
+        session.close()
+        first.dispose()
+
+    resumed = Database(database_path)
+    resumed.create_schema()
+    resumed.create_schema()
+    session = resumed.session_factory()
+    try:
+        site = session.get(SiteRegistryRecord, "history.test")
+        assert site and site.display_name == "Historical Site"
+        assert resumed.SCHEMA_VERSION == "workflow-schema.v7-production-converged"
+    finally:
+        session.close()
+        resumed.dispose()

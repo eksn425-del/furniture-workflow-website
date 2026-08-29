@@ -1,0 +1,7 @@
+{
+  "schema_version": "taxonomy-fixture.v2",
+  "categories": [
+    {"category_id": "fixture-storage", "native_name": "Storage", "canonical_name": "Storage", "path": "Storage", "reported_count": 14, "discovered_count": 14, "eligible_count": 14},
+    {"category_id": "fixture-seating", "native_name": "Seating", "canonical_name": "Chair", "path": "Seating", "reported_count": 3, "discovered_count": 3, "eligible_count": 3}
+  ]
+}

@@ -1,0 +1,43 @@
+name: furniture-workflow-control-plane
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api.control-plane
+    environment:
+      OUTPUT_ROOT: /data
+      WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:3000}
+      CONTROL_PLANE_DEMO_FIXTURES: "0"
+      LOCAL_REVIEW_MODE: ${LOCAL_REVIEW_MODE:-agent}
+      WEBSITE_MODEL_MODE: ${WEBSITE_MODEL_MODE:-LOCAL_AGENT}
+      PROVIDER_MODE: ${PROVIDER_MODE:-disabled}
+      WEBSITE_BRAIN_API_KEY: ${WEBSITE_BRAIN_API_KEY:-}
+      WEBSITE_BRAIN_BASE_URL: ${WEBSITE_BRAIN_BASE_URL:-}
+      WEBSITE_BRAIN_MODEL: ${WEBSITE_BRAIN_MODEL:-}
+      LUX3D_API_KEY: ${LUX3D_API_KEY:-}
+      LUX3D_BASE_URL: ${LUX3D_BASE_URL:-}
+      LUX3D_VERSION: ${LUX3D_VERSION:-v3.0-standard}
+    volumes:
+      - ${WORKFLOW_DATA_PATH:-../output/web_projects}:/data
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  web:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_BASE_URL: /api/v1
+    environment:
+      API_INTERNAL_URL: http://api:8000
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
