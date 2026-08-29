@@ -102,6 +102,15 @@ powershell -ExecutionPolicy Bypass -File scripts/check_public_tree.ps1
 git diff --check
 ```
 
+本轮最终执行结果：
+
+- Python 全量回归：`91 passed`；其中本地完整链路 E2E：`1 passed`。
+- Python `compileall`：PASS。
+- Web `npm run typecheck`：PASS。
+- Web `npm run lint`：PASS。
+- Web `npm run build`：PASS，Next.js 生产页面生成完成。
+- `PUBLIC_TREE_CHECK`：PASS；内容级凭据扫描：PASS；本机绝对路径扫描：PASS；`git diff --check`：PASS。
+
 ## 6. 自审与已知边界
 
 - 只改 Website 仓库，Skills 不在本次变更范围内。
@@ -114,5 +123,6 @@ git diff --check
 ## 7. 发布记录
 
 - GitHub repository：`https://github.com/eksn425-del/furniture-workflow-website`
-- 发布分支、commit SHA、远端对账和最终测试计数在提交完成后写入本节。
+- 功能修复提交：`002950d`（`Complete Website end-to-end workflow repair`），已直接推送到 `main`。
+- 本报告的最终测试统计随随后续文档校正提交推送；最终远端 `main` SHA 在交付消息中完成对账。
 - 本报告不保存任何 API key、Cookie、个人信息、公司内部地址或运行产物。
