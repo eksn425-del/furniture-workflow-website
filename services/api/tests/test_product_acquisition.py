@@ -94,3 +94,10 @@ def test_parse_circular_product_diameter_and_height_dimensions() -> None:
         {"width": 30.0, "depth": 30.0, "height": 65.75},
         "in",
     )
+
+
+def test_parse_width_height_depth_dimensions() -> None:
+    assert _parse_dimension_text('Dining chair dimensions: 27.5" W x 31.5" H x 25" D') == (
+        {"width": 27.5, "depth": 25.0, "height": 31.5},
+        "in",
+    )

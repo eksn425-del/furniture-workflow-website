@@ -59,6 +59,14 @@ DIMENSION_SPACED_RE = re.compile(
     r"(?P<h>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*[h高]",
     re.I,
 )
+# Some product pages use the equally common W × H × D order.
+WIDTH_HEIGHT_DEPTH_RE = re.compile(
+    r"(?:overall|整体|total)?[^0-9]{0,40}"
+    r"(?P<w>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*[w宽]\s*[x×*]\s*"
+    r"(?P<h>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*[h高]\s*[x×*]\s*"
+    r"(?P<d>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*[d深]",
+    re.I,
+)
 # 展开后的"Dimensions"标签内容常以 Overall 开头，例如 "Overall: 33"w 35"d 30"h"
 OVERALL_DIMENSION_RE = re.compile(
     r"(?:overall|整体|total)[^0-9]{0,40}"
@@ -573,7 +581,7 @@ class NativeBrowserCollector:
 
 def _parse_dimension_text(visible: str) -> tuple[dict[str, float], str]:
     """从页面可见文本解析 Overall/紧凑/间距式尺寸，返回 (dimensions, unit)。"""
-    for pattern in (OVERALL_DIMENSION_RE, DIMENSION_SPACED_RE, DIMENSION_RE):
+    for pattern in (OVERALL_DIMENSION_RE, WIDTH_HEIGHT_DEPTH_RE, DIMENSION_SPACED_RE, DIMENSION_RE):
         match = pattern.search(visible)
         if match:
             dimensions = {
