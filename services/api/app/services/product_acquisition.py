@@ -67,6 +67,20 @@ OVERALL_DIMENSION_RE = re.compile(
     r"(?P<h>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*[h高]",
     re.I,
 )
+# 圆形灯具等官网常用“直径 × 高度”表达；直径同时作为宽、深，
+# 只有在明确出现 Diam/Diameter 与 H 时才接受，避免把普通二维尺寸误判为 3D。
+DIAMETER_HEIGHT_RE = re.compile(
+    r"(?:overall|整体|total)?[^0-9]{0,40}"
+    r"(?P<diam>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*(?:diam(?:eter)?|dia)\.?\s*[x×*]\s*"
+    r"(?P<h>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*h\b",
+    re.I,
+)
+HEIGHT_DIAMETER_RE = re.compile(
+    r"(?:overall|整体|total)?[^0-9]{0,40}"
+    r"(?P<h>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*h\.?\s*[x×*]\s*"
+    r"(?P<diam>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*(?:diam(?:eter)?|dia)\.?\b",
+    re.I,
+)
 DIMENSION_TAB_LABELS = ("dimensions", "尺寸", "specifications", "规格")
 DIMENSION_UNIT_RE = re.compile(r"(in|inch|cm|mm)", re.I)
 MAGENTO_PWA_CLIENT_RE = re.compile(r"(?:^|[\"'])/client\.[^\"']+\.js", re.I)
@@ -571,6 +585,17 @@ def _parse_dimension_text(visible: str) -> tuple[dict[str, float], str]:
             unit = unit_match.group(0).lower() if unit_match else "source_unit"
             if unit == "source_unit" and "\"" in match.group(0):
                 # 官网常见单位符号：33"w 35"d 30"h -> inch
+                unit = "in"
+            return dimensions, unit
+    for pattern in (DIAMETER_HEIGHT_RE, HEIGHT_DIAMETER_RE):
+        match = pattern.search(visible)
+        if match:
+            diameter = float(match.group("diam"))
+            height = float(match.group("h"))
+            dimensions = {"width": diameter, "depth": diameter, "height": height}
+            unit_match = DIMENSION_UNIT_RE.search(match.group(0))
+            unit = unit_match.group(0).lower() if unit_match else "source_unit"
+            if unit == "source_unit" and "\"" in match.group(0):
                 unit = "in"
             return dimensions, unit
     return {}, ""

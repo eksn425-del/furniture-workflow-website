@@ -1026,9 +1026,26 @@ class ProductionPipeline:
                     continue
                 if provider_off and ready >= target:
                     target_mode = str(self.contract.get("target_mode") or "EXACT_N")
+                    retired_ready = 0
+                    if target_mode == "EXACT_N" and ready > target:
+                        # One engine tick may qualify several candidates before
+                        # this outer safety check runs. Keep the first Exact-N
+                        # locks in creation order and close the surplus as
+                        # auditable, never-submitted candidates.
+                        ready_records = sorted(
+                            (item for item in self.pool.records() if item.state is ItemState.MODEL_INPUT_LOCKED),
+                            key=lambda item: (item.created_at, item.candidate_id),
+                        )
+                        for extra in ready_records[target:]:
+                            self.pool.retire_order_complete_not_needed(
+                                extra.candidate_id,
+                                reason="EXACT_N_TARGET_REACHED",
+                            )
+                            retired_ready += 1
+                        ready = sum(item.state is ItemState.MODEL_INPUT_LOCKED for item in self.pool.records())
                     label = f"Up-To {target}" if target_mode == "UP_TO_N" else f"Exact {target}"
-                    self.emit("READY_POOL_COMPLETED", "READY_POOL", f"{label} Ready Pool 已形成；Provider OFF，未发起外部调用", ready, target, {"ready_count": ready, "eligible_count": ready, "provider_calls": adapter.provider_posts, "target_mode": target_mode, "candidate_pool_path": str(self.pool.path)})
-                    self.emit("JOB_BLOCKED", "PROVIDER_SAFETY", "Ready Pool 已保存；选择并审批 Provider 后恢复同一 Job", ready, target, {"blocker": "PROVIDER_REQUIRED", "ready_count": ready, "provider_calls": adapter.provider_posts, "target_mode": target_mode})
+                    self.emit("READY_POOL_COMPLETED", "READY_POOL", f"{label} Ready Pool 已形成；Provider OFF，未发起外部调用", ready, target, {"ready_count": ready, "eligible_count": ready, "retired_ready": retired_ready, "provider_calls": adapter.provider_posts, "target_mode": target_mode, "candidate_pool_path": str(self.pool.path)})
+                    self.emit("JOB_BLOCKED", "PROVIDER_SAFETY", "Ready Pool 已保存；选择并审批 Provider 后恢复同一 Job", ready, target, {"blocker": "PROVIDER_REQUIRED", "ready_count": ready, "retired_ready": retired_ready, "provider_calls": adapter.provider_posts, "target_mode": target_mode})
                     return 2
                 status = engine.tick()
                 if status is RuntimeStatus.SUCCEEDED:

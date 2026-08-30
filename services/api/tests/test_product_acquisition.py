@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.services.product_acquisition import ProductAcquisitionEngine
+from app.services.product_acquisition import ProductAcquisitionEngine, _parse_dimension_text
 
 
 MAGENTO_SHELL = '<html><body><div id="root" data-media-backend="https://media.example.test"></div><script src="/client.abc123.js"></script></body></html>'
@@ -83,3 +83,14 @@ def test_magento_pwa_shell_discovers_products_from_selected_category(tmp_path: P
     assert products[0].dimensions == {"width": 67.5, "depth": 88.5, "height": 55.0}
     assert any("urlResolver" in str(payload.get("query")) for payload in client.posts)
     assert any("ProductsByCategory" in str(payload.get("query")) for payload in client.posts)
+
+
+def test_parse_circular_product_diameter_and_height_dimensions() -> None:
+    assert _parse_dimension_text('Overall dimensions: 26" Diam. x 63.25" H') == (
+        {"width": 26.0, "depth": 26.0, "height": 63.25},
+        "in",
+    )
+    assert _parse_dimension_text('Overall dimensions: 65.75"h. x 30"diam.') == (
+        {"width": 30.0, "depth": 30.0, "height": 65.75},
+        "in",
+    )
