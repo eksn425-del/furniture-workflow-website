@@ -156,5 +156,5 @@ git diff --check
 - GitHub repository：`https://github.com/eksn425-del/furniture-workflow-website`
 - 功能修复提交：`002950d`（`Complete Website end-to-end workflow repair`），已直接推送到 `main`。
 - 本报告的最终测试统计随随后续文档校正提交推送；最终远端 `main` SHA 在交付消息中完成对账。
-- 本轮（2026-08-31）仅完成当前工作树的修复、回归和报告更新，尚未创建新的 commit 或 push；提交前应重新审查工作树并执行安全检查。
+- 本轮（2026-08-31）已创建提交 `a49b0cc` 并 Push 到 GitHub `main`；该提交仅包含本仓库脱敏的 Website 源码、测试、配置模板和文档，不含 Skills、密钥、个人数据或运行产物。
 - 本报告不保存任何 API key、Cookie、个人信息、公司内部地址或运行产物。
