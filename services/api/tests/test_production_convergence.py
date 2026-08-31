@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import json
 import inspect
+import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
-from app.api.routes.control_plane import _job_categories, approve_job, get_control_site, list_control_sites
+from app.api.routes.control_plane import _job_categories, approve_job, get_candidate_for_review, get_control_site, list_control_sites, record_local_agent_review
 from app.database import Database
 from app.models import (
     ProductionJob,
+    ProductionJobEvent,
     ProductionProviderTask,
+    ProductionRun,
+    RuntimeEvent,
     SiteCategory,
     SiteEntryURL,
     SiteRegistryRecord,
@@ -21,7 +26,8 @@ from app.models import (
     SiteTaxonomySnapshot,
     utc_now,
 )
-from app.schemas import ControlJobApproval, ControlJobStart
+from app.schemas import ControlJobApproval, ControlJobStart, LocalAgentProductReviewRequest
+from app.services.brain_provider import BrainSettings, WebsiteBrainProvider
 from app.services.product_acquisition import (
     AcquiredProduct,
     ProductAcquisitionEngine,
@@ -30,8 +36,10 @@ from app.services.product_acquisition import (
     classify_source_type,
 )
 from app.services.production_runtime import ProductionRuntimeService
+from app.services import production_runtime as production_runtime_module
 from app.services.site_scan_runtime import SiteScanRuntimeService
 from packages.workflow_core.statuses import ItemState
+from packages.workflow_core.candidate_pool import CandidatePoolStore, CandidateRecord
 from workers.blender_adapter import validate_glb
 from workers.production_pipeline import ProductionPipeline
 
@@ -445,6 +453,72 @@ def test_site_scan_persists_across_navigation_and_service_restart(tmp_path: Path
         database.dispose()
 
 
+def test_site_scan_rekeys_path_only_category_ids_per_site(tmp_path: Path) -> None:
+    """A shared path hash from another retailer must not abort a new scan."""
+
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add_all([
+            SiteRegistryRecord(site_key="first.test", domain="first.test", display_name="First"),
+            SiteRegistryRecord(site_key="second.test", domain="second.test", display_name="Second"),
+            SiteCategory(
+                category_id="cat_shared",
+                site_key="first.test",
+                path="/accessories",
+                native_name="Accessories",
+                canonical_name="Accessories",
+                source_url="https://first.test/accessories",
+            ),
+            SiteScanRun(
+                scan_id="scan-second",
+                site_key="second.test",
+                source_url="https://second.test/",
+                status="ANALYZING",
+                live=True,
+            ),
+        ])
+        session.commit()
+    finally:
+        session.close()
+
+    runtime = SiteScanRuntimeService(database, tmp_path / "output", object())
+    try:
+        runtime._persist("scan-second", {
+            "status": "READY",
+            "verified": True,
+            "taxonomy_level": "L1",
+            "source_type": "DIRECT_BRAND",
+            "source_scope": "SITE",
+            "categories": [{
+                "category_id": "cat_shared",
+                "path": "/accessories",
+                "native_name": "Accessories",
+                "canonical_name": "Accessories",
+                "source_url": "https://second.test/accessories",
+                "count_value": 56,
+                "count_kind": "ESTIMATED",
+                "confidence": 0.7,
+                "level": 1,
+                "evidence": [{"role": "navigation"}],
+            }],
+        }, tmp_path / "analysis")
+        session = database.session_factory()
+        try:
+            first = session.scalar(select(SiteCategory).where(SiteCategory.site_key == "first.test"))
+            second = session.scalar(select(SiteCategory).where(SiteCategory.site_key == "second.test"))
+            assert first and first.category_id == "cat_shared"
+            assert second and second.category_id != "cat_shared"
+            assert second.path == "/accessories"
+            assert second.count_value == 56
+        finally:
+            session.close()
+    finally:
+        runtime.shutdown()
+        database.dispose()
+
+
 def test_partial_unknown_scan_escalates_to_browser_l2(tmp_path: Path) -> None:
     class Analyzer:
         def __init__(self) -> None:
@@ -732,6 +806,124 @@ def test_local_agent_review_mode_reaches_ready_pool_without_brain_api(monkeypatc
     assert record.lineage["brain_receipt"]["provider_posts"] == 0
 
 
+def test_strict_source_l2_pending_emits_human_required_instead_of_bounded_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = _contract(tmp_path, job_id="job-l2-human-required", target=1, source_type="DIRECT_BRAND")
+    contract["source_url"] = "https://francfranc.com/collections/living_storage"
+    contract["site_key"] = "francfranc.com"
+    product = _product(0)
+    product.acquisition = "NATIVE"
+    pipeline, events = _run_pipeline(
+        monkeypatch,
+        tmp_path,
+        contract=contract,
+        products=[product],
+    )
+
+    assert pipeline.run() == 2
+    human = next(item for item in events if item["type"] == "HUMAN_REQUIRED")
+    assert human["stage"] == "L2_BROWSER"
+    assert human["payload"]["reason_code"] == "L2_BROWSER_REQUIRED"
+    assert human["payload"]["candidate_id"]
+    assert human["payload"]["url"].startswith("https://example.test/products/")
+    assert not any(item["payload"].get("blocker") == "BOUNDED_TICK_LIMIT" for item in events)
+
+
+def test_local_agent_without_review_evidence_reports_actionable_blocker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("FURNITURE_WORKFLOW_TEST_FIXTURES", raising=False)
+    monkeypatch.setenv("LOCAL_REVIEW_MODE", "agent")
+    monkeypatch.setattr("workers.production_pipeline.SafeHttpClient", FakeMediaClient)
+    contract = _contract(tmp_path, job_id="job-local-agent-awaiting-review", target=1)
+    product = _product(0)
+    product.acquisition = "NATIVE"
+    product.evidence = {}
+    pipeline, events = _run_pipeline(monkeypatch, tmp_path, contract=contract, products=[product])
+    monkeypatch.delenv("FURNITURE_WORKFLOW_TEST_FIXTURES", raising=False)
+
+    assert pipeline.run() == 2
+    blocked = next(item for item in events if item["type"] == "JOB_BLOCKED" and item["stage"] == "BRAIN_DECISION")
+    assert blocked["payload"]["blocker"] == "LOCAL_AGENT_REVIEW_REQUIRED"
+    assert "显式复核证据" in blocked["message"]
+
+
+def test_local_agent_review_endpoint_persists_same_image_evidence_for_resume(tmp_path: Path) -> None:
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    job = _job("job-local-review-endpoint")
+    job.status = "BLOCKED"
+    job.current_stage = "BRAIN_DECISION"
+    pool_path = tmp_path / "candidate_pool.json"
+    job.candidate_pool_path = str(pool_path)
+    session = database.session_factory()
+    try:
+        session.add(job)
+        session.commit()
+    finally:
+        session.close()
+    digest = "a" * 64
+    pool = CandidatePoolStore(pool_path, order_id=job.job_id, job_id=job.job_id)
+    pool.add_candidates([CandidateRecord(
+        candidate_id="candidate-local-review",
+        order_id=job.job_id,
+        job_id=job.job_id,
+        record_id="record-local-review",
+        source="example.test",
+        source_product_id="sku-local-review",
+        canonical_url="https://example.test/products/chair",
+        preview_id="preview-local-review",
+        preview_url="https://example.test/media/chair.png",
+        capture_sha256=digest,
+        image_sha256=digest,
+        category_group="Chairs",
+        state=ItemState.VISUAL_PENDING,
+        rejection_reason="BRAIN_NOT_CONFIGURED",
+        media_status="READY",
+        lineage={
+            "source_name": "Lounge Chair",
+            "media_sha256": digest,
+            "media_binding_status": "COMPATIBLE",
+            "capture_evidence": {"product_identity_match": True},
+        },
+    )])
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        database=database,
+        website_brain=WebsiteBrainProvider(BrainSettings(model_mode="LOCAL_AGENT")),
+    )))
+    review = {
+        "eligible": True,
+        "single_product": True,
+        "background_ok": True,
+        "image_to_3d_suitable": True,
+        "category_group": "Chairs",
+        "product_type": "Lounge Chair",
+        "confidence": 0.95,
+        "reason_codes": ["LOCAL_AGENT_TEST"],
+        "source_image_vision_consistent": True,
+        "reviewed_media_sha256": digest,
+    }
+    try:
+        detail = get_candidate_for_review(job.job_id, "candidate-local-review", request)
+        assert detail["candidate"]["media_sha256"] == digest
+        assert detail["local_agent_enabled"] is True
+        result = record_local_agent_review(
+            job.job_id,
+            "candidate-local-review",
+            LocalAgentProductReviewRequest(review=review, actor="test-local-agent"),
+            request,
+        )
+        assert result["status"] == "RECORDED"
+        assert result["resume_safe"] is True
+        record = pool.records()[0]
+        assert record.lineage["capture_evidence"]["local_agent_review"]["reviewed_media_sha256"] == digest
+        session = database.session_factory()
+        try:
+            refreshed = session.get(ProductionJob, job.job_id)
+            assert refreshed and refreshed.status == "REVIEW_RESOLVED"
+        finally:
+            session.close()
+    finally:
+        database.dispose()
+
+
 def test_up_to_n_accepts_smaller_ready_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     contract = _contract(tmp_path, job_id="job-up-to-three", target=3)
     contract["target_mode"] = "UP_TO_N"
@@ -863,6 +1055,140 @@ def test_production_runtime_uses_workflow_engine() -> None:
     assert 'packages" / "workflow-engine" / "src' in launcher_source
 
 
+def test_production_runtime_keeps_new_resume_alive_during_worker_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    job = _job("job-startup-grace")
+    session = database.session_factory()
+    try:
+        session.add(job)
+        session.commit()
+        claimed_at = utc_now()
+        session.add(RuntimeEvent(
+            runtime_event_id="job-startup-grace:previous",
+            job_id=job.job_id,
+            sequence=1,
+            event_type="JOB_BLOCKED",
+            status="BLOCKED",
+            stage="BRAIN_DECISION",
+            message="previous attempt",
+            created_at=claimed_at - timedelta(seconds=10),
+        ))
+        run = ProductionRun(
+            run_id="run-startup-grace",
+            job_id=job.job_id,
+            status="RUNNING",
+            stage="PREFLIGHT",
+            workspace=str(tmp_path / "workspace"),
+            command_json=json.dumps([sys.executable]),
+            pid=999999,
+            started_at=claimed_at,
+            claimed_at=claimed_at,
+        )
+        session.add(run)
+        session.commit()
+    finally:
+        session.close()
+
+    monkeypatch.setattr(production_runtime_module, "_process_alive", lambda *_: False)
+    monkeypatch.setattr(production_runtime_module, "RUNTIME_EVENT_FLUSH_SECONDS", 0)
+    runtime = ProductionRuntimeService(database, tmp_path / "output")
+    try:
+        current = runtime.reconcile_run("run-startup-grace")
+        assert current and current["status"] == "RUNNING"
+        assert current["stage"] == "PREFLIGHT"
+    finally:
+        database.dispose()
+
+
+def test_production_runtime_retries_empty_worker_launch_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    job = _job("job-empty-launch-retry")
+    session = database.session_factory()
+    try:
+        session.add(job)
+        session.commit()
+        started_at = utc_now()
+        session.add(ProductionRun(
+            run_id="run-empty-launch-retry",
+            job_id=job.job_id,
+            status="RUNNING",
+            stage="PREFLIGHT",
+            workspace=str(tmp_path / "workspace"),
+            command_json=json.dumps([sys.executable]),
+            pid=999999,
+            launch_attempts=1,
+            started_at=started_at,
+            claimed_at=started_at,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    monkeypatch.setattr(production_runtime_module, "_process_alive", lambda *_: False)
+    monkeypatch.setattr(production_runtime_module, "RUNTIME_STARTUP_GRACE_SECONDS", 0)
+    monkeypatch.setattr(production_runtime_module, "RUNTIME_EVENT_FLUSH_SECONDS", 0)
+    launches: list[bool] = []
+    runtime = ProductionRuntimeService(database, tmp_path / "output")
+
+    def fake_launch(session, job, run, *, resume: bool = False) -> None:
+        launches.append(resume)
+        run.status = "RUNNING"
+        run.stage = "PREFLIGHT"
+        run.pid = 123456
+        run.launch_attempts += 1
+
+    monkeypatch.setattr(runtime, "_launch", fake_launch)
+    try:
+        current = runtime.reconcile_run("run-empty-launch-retry")
+        assert current and current["status"] == "RUNNING"
+        assert current["launch_attempts"] == 2
+        assert launches == [False]
+    finally:
+        database.dispose()
+
+
+def test_production_runtime_event_ingestion_is_idempotent_across_read_models(tmp_path: Path) -> None:
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    job = _job("job-event-idempotent")
+    session = database.session_factory()
+    try:
+        session.add(job)
+        session.commit()
+        runtime = ProductionRuntimeService(database, tmp_path / "output")
+        event = {
+            "schema_version": "workflow-event.v2",
+            "event_id": "job-event-idempotent:1",
+            "job_id": job.job_id,
+            "sequence": 1,
+            "type": "JOB_STARTED",
+            "status": "RUNNING",
+            "stage": "PREFLIGHT",
+            "message": "started",
+        }
+        assert runtime.ingest_event(session, event) is True
+        session.commit()
+        # A second browser poll must be a no-op even though both read models
+        # carry the same runtime identity.
+        assert runtime.ingest_event(session, event) is False
+        session.commit()
+        assert session.scalar(
+            select(RuntimeEvent).where(RuntimeEvent.runtime_event_id == event["event_id"])
+        ) is not None
+        assert session.scalar(
+            select(ProductionJobEvent).where(ProductionJobEvent.runtime_event_id == event["event_id"])
+        ) is not None
+    finally:
+        session.close()
+        database.dispose()
+
+
 def test_database_migration_is_additive_and_idempotent(tmp_path: Path) -> None:
     database_path = tmp_path / "system" / "control.sqlite3"
     first = Database(database_path)
@@ -882,7 +1208,7 @@ def test_database_migration_is_additive_and_idempotent(tmp_path: Path) -> None:
     try:
         site = session.get(SiteRegistryRecord, "history.test")
         assert site and site.display_name == "Historical Site"
-        assert resumed.SCHEMA_VERSION == "workflow-schema.v7-production-converged"
+        assert resumed.SCHEMA_VERSION == "workflow-schema.v8-production-launch-retry"
     finally:
         session.close()
         resumed.dispose()

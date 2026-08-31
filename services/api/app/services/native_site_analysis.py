@@ -138,7 +138,9 @@ def _count_from_text(value: str) -> int | None:
 
 def _canonical_name(native: str, path: str) -> str:
     value = " ".join(native.replace("&amp;", "&").split()).strip("-–—|:")
-    return value or path.strip("/").replace("-", " ").replace("_", " ").title() or "Uncategorized"
+    if len(value) > 255:
+        value = path.rstrip("/").rsplit("/", 1)[-1].replace("-", " ").replace("_", " ").title()
+    return (value[:255] or path.strip("/").replace("-", " ").replace("_", " ").title() or "Uncategorized")[:255]
 
 
 def _looks_like_category(url: str, text: str, source_url: str) -> bool:
@@ -152,7 +154,15 @@ def _looks_like_category(url: str, text: str, source_url: str) -> bool:
         return False
     if urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, "")) == urlunsplit((source.scheme, source.netloc, source.path or "/", source.query, "")):
         return False
-    label = text.casefold()
+    label_text = " ".join(text.split())
+    # Some SPA shells accidentally place serialized state/tracking payloads inside
+    # anchors. They are not taxonomy evidence and must not become oversized
+    # category contracts or poison an otherwise valid scan.
+    if len(label_text) > 180 or len(parsed.path) > 512:
+        return False
+    if re.search(r"(?:[{}]|=>|\b(?:window|document|function|__next)\b)", label_text, re.I):
+        return False
+    label = label_text.casefold()
     return bool(segments & CATEGORY_WORDS or any(word in label for word in CATEGORY_WORDS) or len([x for x in path.split("/") if x]) <= 3)
 
 

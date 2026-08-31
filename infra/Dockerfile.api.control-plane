@@ -5,6 +5,7 @@ WORKDIR /app
 
 COPY services/api /app/services/api
 RUN pip install --no-cache-dir -r /app/services/api/requirements.txt
+RUN python -m playwright install --with-deps chromium
 
 WORKDIR /app/services/api
 EXPOSE 8000

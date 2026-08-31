@@ -1,6 +1,6 @@
 # Website 端到端修复与自审报告
 
-日期：2026-08-30
+日期：2026-08-31（本轮更新）
 范围：`FurnitureWorkflow-Website-public`（仅 Website 源码）
 
 ## 1. 结论
@@ -44,6 +44,7 @@ Baseline 已先执行原有后端测试集与前端 TypeScript/lint/build，作�
 ### 3.3 Provider、Blender 与交付
 
 - Provider qualification 同时要求 `LUX3D_API_KEY` 和 `LUX3D_BASE_URL` 非空；空配置不会被判定为可付费生产。
+- 公开站点的 L2 采集默认依赖隔离的 Playwright Chromium；本地执行需先运行 `python -m playwright install chromium`，或显式选择已安装的 `msedge`/`chrome` 通道。每个 Job 继续使用独立持久 profile，不读取个人浏览器 profile。
 - Provider ledger 继续承担幂等键、已知 task 恢复和未知提交隔离；本地 E2E 的 Provider 仅为显式测试组件。
 - 新增显式 Blender adapter boundary：
   - `LOCAL_E2E` 使用 `FakeBlenderAdapter`，只做确定性复制与 GLB 容器 QA；
@@ -102,14 +103,14 @@ powershell -ExecutionPolicy Bypass -File scripts/check_public_tree.ps1
 git diff --check
 ```
 
-本轮最终执行结果：
+本轮最终执行结果（2026-08-31 工作树）：
 
-- Python 全量回归：`91 passed`；其中本地完整链路 E2E：`1 passed`。
+- Python 全量回归：`102 passed`；其中本地完整链路 E2E：`1 passed`。
 - Python `compileall`：PASS。
 - Web `npm run typecheck`：PASS。
-- Web `npm run lint`：PASS。
+- Web `npm run lint`：PASS；仅保留 1 个既有的 `@next/next/no-img-element` 非阻断警告，无错误。
 - Web `npm run build`：PASS，Next.js 生产页面生成完成。
-- `PUBLIC_TREE_CHECK`：PASS；内容级凭据扫描：PASS；本机绝对路径扫描：PASS；`git diff --check`：PASS。
+- `PUBLIC_TREE_CHECK`：PASS（124 个文件）；内容级凭据扫描：PASS；本机绝对路径扫描：PASS；`git diff --check`：PASS。
 
 ## 6. 自审与已知边界
 
@@ -120,9 +121,40 @@ git diff --check
 - headless Blender CLI 是适配接口，不在没有安装 Blender 的机器上声称已经完成真实 Blender 运行；缺失时会显示 `BLENDER_NOT_CONFIGURED` 并阻断交付。
 - 真正公司环境仍需单独做小规模 live smoke、人工验证接管、真实 Brain/Vision 连通和真实 Lux3D 付费确认；这些结果必须与离线 E2E 分开记录。
 
-## 7. 发布记录
+## 7. 2026-08-31 真实 UI 回归与本轮修复
+
+本轮使用可见的 Website 浏览器页面完成连续 UI 操作，验证了新站点导入、摸底、类目数量、类目选择、建任务、L2 发现、Local Agent 复核、恢复同一 Job 和安全阻断。未调用真实 Brain/Vision 或 Lux3D Provider，也没有为了通过测试放宽生产 Gate。
+
+### 7.1 Interior Define：失败证据与有界重试
+
+- Dining → All dining tables 页面显示当前数量 `22`，选择汇总 `22`；Exact-2 Job `job_b9495c7c8aae4284afd8c70277741054`。
+- 首次运行 `run_f4bda66d8c204ec4850d78c5a9cfeaa3` 真实复现了 Worker 启动后无终态事件的问题；保留了失败状态、工作区合同和日志证据，没有把失败伪装成成功。
+- 通过新增的空事件有界重试，恢复同一 Job 后运行 `run_06e15bedff1c4ec2b3817350a1d81369` 成功输出 `JOB_STARTED`、`BRAIN_BOUNDARY_CHECKED`、`DISCOVERY_COMPLETED`（6 个唯一候选），随后按 Local Agent 规则安全暂停复核；没有重复候选或 Provider 调用。
+- 启动信息写入 `website_runtime_launcher.log`，Python 以无缓冲模式启动，方便定位“进程已启动但事件未落盘”的问题。
+
+### 7.2 Francfranc：跨类目与数量语义
+
+- `Living Storage` 页面显示约 `94` 件，创建 Exact-1 Job `job_d814e04e071240a29e21714fcc0b2d75`。
+- L2 发现 3 个唯一候选；第一候选完成 Local Agent 复核并恢复同一 Job，因缺少深度字段被 `DIMENSION_REJECTED`，没有为了凑数量继续放行。
+- 同一站点其他类目中已观察到 `EXACT` 数量和 `UNKNOWN` 数量并存，页面不会把未知类目当作 0 或假精确总数。
+
+### 7.3 MUJI：新站点导入与跨站点类别 ID 冲突
+
+- 首次 MUJI 摸底真实失败，错误证据为旧分析器复用路径型 `category_id`，SQLite 报 `UNIQUE constraint failed: site_categories.category_id`；失败快照和错误状态被保留。
+- 最小修复：持久化层检测跨站点/跨路径的旧 ID 冲突，并生成确定性的站点级类别 ID；同站点既有路径 ID 保持稳定，避免破坏已有任务引用。
+- 修复后重新摸底完成 `47` 个类目（`PARTIAL`），`Accessories` 当前数量显示 `56`；选择汇总 `56`，创建 Exact-1 Job `job_12e35981d9844b5180010f039ebc3d16`。
+- L2 发现 3 个候选；`Hakama Pants` 经 Local Agent 判定为服装/非家具，保存为 `VISUAL_REJECTED`，剩余候选保留在同一候选池等待处理，没有把非家具当作建模产品，也没有 Provider 调用。
+
+### 7.4 本轮部署边界
+
+- 本地服务运行在 `LOCAL_AGENT`/`WEBSITE_MODEL_MODE=LOCAL_AGENT`，Provider 保持 OFF；这些 UI 结果证明的是 Website 控制面、状态机、证据链和安全闸门，不是付费模型服务已连通。
+- 未来公司环境仍可分别注入 Brain（或单一多模态模型/文本 Brain + Vision）和 Lux3D 配置；配置后还必须进行独立的 live smoke，确认真实认证、限流、费用闸门、人工验证接管以及模型下载/Blender QA。
+- 真实站点允许出现 `PARTIAL`、`UNKNOWN`、`HUMAN_REQUIRED` 和产品级拒绝；这属于系统对证据不足的诚实表达，不应在部署时改成默认放行。
+
+## 8. 发布记录
 
 - GitHub repository：`https://github.com/eksn425-del/furniture-workflow-website`
 - 功能修复提交：`002950d`（`Complete Website end-to-end workflow repair`），已直接推送到 `main`。
 - 本报告的最终测试统计随随后续文档校正提交推送；最终远端 `main` SHA 在交付消息中完成对账。
+- 本轮（2026-08-31）仅完成当前工作树的修复、回归和报告更新，尚未创建新的 commit 或 push；提交前应重新审查工作树并执行安全检查。
 - 本报告不保存任何 API key、Cookie、个人信息、公司内部地址或运行产物。

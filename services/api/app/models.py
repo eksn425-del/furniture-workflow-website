@@ -590,6 +590,7 @@ class ProductionRun(Base):
     checkpoint_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     queue_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     worker_key: Mapped[str] = mapped_column(String(64), nullable=False, default="production-v1")
+    launch_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

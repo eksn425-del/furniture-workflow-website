@@ -231,6 +231,41 @@ export function getControlJob(jobId: string): Promise<ControlJobDetail> {
   return request(`/jobs/${encodeURIComponent(jobId)}`);
 }
 
+export interface LocalReviewCandidate {
+  candidate_id: string;
+  record_id: string;
+  canonical_url: string;
+  preview_url: string;
+  source_name: string;
+  source_brand: string;
+  category_group: string;
+  source_dimensions: Record<string, number>;
+  dimension_unit: string;
+  media_sha256: string;
+  media_binding_status: string;
+  media_binding_confidence: number | null;
+  image_role: string;
+  layered_scene7: boolean;
+  identity_fields: Record<string, unknown>;
+  scope_status: string;
+  state: string;
+  visual_status: string;
+  rejection_reason: string | null;
+  local_agent_review?: Record<string, unknown> | null;
+}
+
+export function getLocalReviewCandidate(jobId: string, candidateId: string): Promise<{ candidate: LocalReviewCandidate; local_agent_enabled: boolean }> {
+  return request(`/jobs/${encodeURIComponent(jobId)}/candidates/${encodeURIComponent(candidateId)}`);
+}
+
+export function recordLocalAgentReview(jobId: string, candidateId: string, review: Record<string, unknown>, actor = "local-agent"): Promise<{ status: string; resume_safe: boolean; candidate: LocalReviewCandidate }> {
+  return request(`/jobs/${encodeURIComponent(jobId)}/candidates/${encodeURIComponent(candidateId)}/local-review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ review, actor }),
+  });
+}
+
 export function getControlReviews(): Promise<{ items: ControlReview[]; total: number }> {
   return request<{ items: ControlReview[]; total: number }>("/reviews");
 }

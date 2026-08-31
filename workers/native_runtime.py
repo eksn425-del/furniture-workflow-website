@@ -9,9 +9,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+
+def _bootstrap_import_paths() -> None:
+    """Make the native worker runnable outside the API process environment.
+
+    The API normally supplies these paths through ``PYTHONPATH`` when it
+    launches the worker.  A deployable Website worker must also be safe to
+    start directly (or from a different process supervisor), so resolve its
+    repository-owned imports from this file instead of relying on inherited
+    shell state.
+    """
+    repository_root = Path(__file__).resolve().parent.parent
+    import_roots = (
+        repository_root,
+        repository_root / "services" / "api",
+        repository_root / "packages" / "workflow-engine" / "src",
+    )
+    for import_root in reversed(import_roots):
+        value = str(import_root)
+        if value not in sys.path:
+            sys.path.insert(0, value)
 
 
 def _timestamp() -> str:
@@ -100,6 +122,7 @@ def _event_status(event_type: str) -> str:
 
 
 def run_job(contract_path: Path, events_path: Path, workspace: Path, *, resume: bool) -> int:
+    _bootstrap_import_paths()
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     for key, value in _env_dotlocal().items():
         os.environ.setdefault(key, value)

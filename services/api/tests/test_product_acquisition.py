@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.services.product_acquisition import ProductAcquisitionEngine, _parse_dimension_text
+import pytest
+
+from app.services.product_acquisition import ProductAcquisitionEngine, ProductSupplyExhausted, _parse_dimension_text
 
 
 MAGENTO_SHELL = '<html><body><div id="root" data-media-backend="https://media.example.test"></div><script src="/client.abc123.js"></script></body></html>'
@@ -101,3 +103,84 @@ def test_parse_width_height_depth_dimensions() -> None:
         {"width": 27.5, "depth": 25.0, "height": 31.5},
         "in",
     )
+
+
+def test_collection_open_graph_metadata_is_not_promoted_to_product_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class Client:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_html(self, _: str) -> str:
+            return (
+                '<html><head><title>Living Storage</title>'
+                '<meta property="og:image" content="/cdn/collections/living-storage.jpg">'
+                '</head><body><h1>Living Storage</h1></body></html>'
+            )
+
+    monkeypatch.setattr(
+        "app.services.product_acquisition.NativeBrowserCollector.get_html",
+        lambda _collector, _url: '<html><head><title>Living Storage</title><meta property="og:image" content="/cdn/collections/living-storage.jpg"></head><body><h1>Living Storage</h1></body></html>',
+    )
+
+    engine = ProductAcquisitionEngine(
+        source_url="https://shop.example/collections/living_storage",
+        site_key="shop.example",
+        source_type="DIRECT_BRAND",
+        categories=[{
+            "category_id": "living-storage",
+            "canonical_name": "Living Storage",
+            "source_url": "https://shop.example/collections/living_storage",
+            "selected": True,
+        }],
+        workspace=tmp_path,
+        browser_session_dir=tmp_path / "browser",
+        client_factory=lambda **_: Client(),
+    )
+
+    with pytest.raises(ProductSupplyExhausted):
+        engine.discover(1)
+
+
+def test_dynamic_category_shell_escalates_to_l2_for_product_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    category_html = '<html><head><title>Living Storage</title></head><body><div id="app"></div></body></html>'
+    dynamic_html = '<html><body><a href="/products/chair-one">Chair One</a></body></html>'
+    detail_html = """
+    <h1>Chair One</h1>
+    <script type="application/ld+json">
+    {"@type":"Product","name":"Chair One","sku":"CHAIR-ONE","url":"/products/chair-one","image":"/media/chair-one.png"}
+    </script><p>24 W x 26 D x 31 H in</p>
+    """
+
+    class Client:
+        def __init__(self, **_: object) -> None:
+            self.urls: list[str] = []
+
+        def get_html(self, url: str) -> str:
+            self.urls.append(url)
+            return detail_html if "/products/" in url else category_html
+
+    client = Client()
+    monkeypatch.setattr(
+        "app.services.product_acquisition.NativeBrowserCollector.get_html",
+        lambda _collector, _url: dynamic_html,
+    )
+    engine = ProductAcquisitionEngine(
+        source_url="https://shop.example/collections/living_storage",
+        site_key="shop.example",
+        source_type="DIRECT_BRAND",
+        categories=[{
+            "category_id": "living-storage",
+            "canonical_name": "Living Storage",
+            "source_url": "https://shop.example/collections/living_storage",
+            "selected": True,
+        }],
+        workspace=tmp_path,
+        browser_session_dir=tmp_path / "browser",
+        client_factory=lambda **_: client,
+    )
+
+    products = engine.discover(1)
+
+    assert len(products) == 1
+    assert products[0].source_name == "Chair One"
+    assert products[0].canonical_url == "https://shop.example/products/chair-one"

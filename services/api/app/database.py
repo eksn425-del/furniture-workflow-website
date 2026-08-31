@@ -11,7 +11,7 @@ from app.models import Base
 
 
 class Database:
-    SCHEMA_VERSION = "workflow-schema.v7-production-converged"
+    SCHEMA_VERSION = "workflow-schema.v8-production-launch-retry"
 
     def __init__(self, database_path: Path) -> None:
         output_root = database_path.parent.resolve()
@@ -69,6 +69,7 @@ class Database:
                 "checkpoint_path": "TEXT",
                 "queue_position": "INTEGER",
                 "worker_key": "VARCHAR(64) NOT NULL DEFAULT 'production-v1'",
+                "launch_attempts": "INTEGER NOT NULL DEFAULT 0",
                 "heartbeat_at": "TIMESTAMP",
                 "claimed_at": "TIMESTAMP",
             })

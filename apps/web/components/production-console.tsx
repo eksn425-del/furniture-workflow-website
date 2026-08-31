@@ -570,7 +570,8 @@ export function NewJobWizard() {
       } else if (current.status === "SUCCEEDED") {
         setMessage("生产完成！可在「交付」页面查看产物。");
       } else if (current.status === "FAILED" || current.status === "BLOCKED") {
-        setBlocker(`生产结束（${current.status}）：${current.progress_note ?? "请查看运行日志"}。`);
+        const requiresHuman = current.stage === "L2_BROWSER" || job.status === "HUMAN_REQUIRED";
+        setBlocker(requiresHuman ? `需要人工处理（L2 浏览器）：${current.progress_note ?? "请处理可见浏览器页面后恢复同一 Job"}。` : `生产结束（${current.status}）：${current.progress_note ?? "请查看运行日志"}。`);
       }
     } catch { /* 轮询失败则下轮重试 */ }
   }

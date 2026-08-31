@@ -32,6 +32,7 @@ Copy-Item .env.example .env.local
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r services/api/requirements.txt
+python -m playwright install chromium
 Set-Location apps/web
 npm ci
 npm run build
@@ -71,6 +72,7 @@ npm run dev
 `.env.example` lists variable names only. It contains no live endpoints, API keys, tokens, passwords, cookies, or account identifiers.
 
 - Website Brain uses the `WEBSITE_BRAIN_*` namespace.
+- Public-site L2 uses an isolated Playwright browser. The default is `WEBSITE_L2_BROWSER_ENGINE=chromium`; run `python -m playwright install chromium` once. `msedge`/`chrome` are supported for machines that have those browsers installed, but each Website job still receives its own persistent profile.
 - Lux3D uses `LUX3D_*` and remains disabled until qualification, an idempotency ledger, an explicit cost ceiling, and the production gate all pass.
 - Blender post-processing uses `BLENDER_WORKER_ENABLED=true` plus a resolvable `BLENDER_EXECUTABLE`; if it is not configured, model delivery stops with an explicit QA/configuration state.
 - A failed or unknown provider submission is quarantined; the runtime must not blindly resubmit it.

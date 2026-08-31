@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -196,6 +197,7 @@ class SiteScanRuntimeService:
             raw_categories = receipt.get("categories") if isinstance(receipt.get("categories"), list) else []
             categories: list[tuple[SiteCategory, dict[str, Any]]] = []
             seen_paths: set[str] = set()
+            reserved_category_ids: set[str] = set()
             for item in raw_categories:
                 if not isinstance(item, dict):
                     continue
@@ -207,8 +209,29 @@ class SiteScanRuntimeService:
                 seen_paths.add(path)
                 category = session.scalar(select(SiteCategory).where(SiteCategory.site_key == site.site_key, SiteCategory.path == path))
                 if category is None:
+                    requested_category_id = str(item.get("category_id") or "").strip()
+                    category_id = requested_category_id or self._site_category_id(site.site_key, path)
+                    existing_by_id = session.get(SiteCategory, category_id)
+                    if (
+                        category_id in reserved_category_ids
+                        or existing_by_id is not None
+                        and (existing_by_id.site_key != site.site_key or existing_by_id.path != path)
+                    ):
+                        # Analyzer IDs are often derived from only the URL path.  That is
+                        # stable for one site, but SQLite keeps category_id globally unique;
+                        # a second retailer with the same /accessories path would otherwise
+                        # abort the whole snapshot.  Re-key only the conflicting new row so
+                        # existing Job policies and same-site path IDs remain stable.
+                        category_id = self._site_category_id(site.site_key, path)
+                        scoped = session.get(SiteCategory, category_id)
+                        if (
+                            category_id in reserved_category_ids
+                            or scoped is not None
+                            and (scoped.site_key != site.site_key or scoped.path != path)
+                        ):
+                            category_id = f"cat_{uuid4().hex}"
                     category = SiteCategory(
-                        category_id=str(item.get("category_id") or f"cat_{uuid4().hex}"),
+                        category_id=category_id,
                         site_key=site.site_key,
                         path=path,
                         native_name=str(item.get("native_name") or path),
@@ -229,6 +252,7 @@ class SiteScanRuntimeService:
                 category.verified_at = utc_now() if receipt.get("verified") else None
                 category.last_scanned_at = utc_now()
                 session.add(category)
+                reserved_category_ids.add(category.category_id)
                 categories.append((category, item))
             session.flush()
             by_path = {category.path: category.category_id for category, _ in categories}
@@ -297,6 +321,19 @@ class SiteScanRuntimeService:
             session.commit()
         finally:
             session.close()
+
+    @staticmethod
+    def _site_category_id(site_key: str, path: str) -> str:
+        """Return a deterministic ID that is unique across sites for a path.
+
+        Receipts produced by older analyzers may use a path-only hash.  The
+        persistence layer owns the database boundary, so it must protect the
+        global primary key without changing IDs that are already bound to a
+        same-site category path.
+        """
+
+        digest = hashlib.sha256(f"{site_key}\x00{path}".encode("utf-8")).hexdigest()[:16]
+        return f"cat_{digest}"
 
     @staticmethod
     def _job_event(session, job: ProductionJob, event_type: str, status: str, message: str, payload: dict[str, Any]) -> None:

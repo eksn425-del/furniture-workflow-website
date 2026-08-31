@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 
 from app.core.config import feature_flag
@@ -41,8 +42,11 @@ from app.models import (
     SiteEntryURL,
     utc_now,
 )
-from app.schemas import CompanyTestSiteRequest, ControlJobApproval, ControlJobCreate, ControlJobEdit, ControlJobStart, ControlJobTargetPatch, HumanReviewAction
+from app.schemas import CompanyTestSiteRequest, ControlJobApproval, ControlJobCreate, ControlJobEdit, ControlJobStart, ControlJobTargetPatch, HumanReviewAction, LocalAgentProductReviewRequest
 from app.services.brain_provider import BrainError, BrainNotConfigured
+from app.services.native_contracts import BrainProductDecision
+from packages.workflow_core.candidate_pool import CandidatePoolError, CandidatePoolStore
+from packages.workflow_core.statuses import ItemState
 
 
 router = APIRouter(prefix="/control", tags=["control-plane"])
@@ -751,6 +755,116 @@ def approve_job(job_id: str, payload: ControlJobApproval, request: Request) -> d
         _audit(session, "APPROVE_PRODUCTION_PLAN", "production_job", job.job_id, actor=payload.actor, result=job.status)
         session.commit()
         return {"status": job.status, "provider_calls": 0, "job": _job_dict(job)}
+    finally:
+        session.close()
+
+
+def _candidate_detail(record) -> dict[str, object]:
+    """Return reviewable public evidence without exposing private runtime state."""
+    lineage = record.lineage if isinstance(record.lineage, dict) else {}
+    capture = lineage.get("capture_evidence") if isinstance(lineage.get("capture_evidence"), dict) else {}
+    return {
+        "candidate_id": record.candidate_id,
+        "record_id": record.record_id,
+        "canonical_url": record.canonical_url,
+        "preview_url": record.preview_url,
+        "source_name": lineage.get("source_name") or record.product_name or "",
+        "source_brand": lineage.get("source_brand") or "",
+        "category_group": record.category_group or lineage.get("category_group") or "",
+        "source_dimensions": lineage.get("source_dimensions") or {},
+        "dimension_unit": lineage.get("dimension_unit") or "",
+        "media_sha256": lineage.get("media_sha256") or record.image_sha256 or "",
+        "media_binding_status": lineage.get("media_binding_status") or "UNKNOWN",
+        "media_binding_confidence": lineage.get("media_binding_confidence"),
+        "image_role": lineage.get("image_role") or capture.get("image_role") or "",
+        "layered_scene7": bool(lineage.get("layered_scene7") or capture.get("layered_scene7")),
+        "identity_fields": lineage.get("identity_fields") or capture.get("identity_fields") or {},
+        "scope_status": lineage.get("scope_status") or capture.get("scope_status") or "UNKNOWN",
+        "state": record.state.value,
+        "visual_status": record.visual_status,
+        "rejection_reason": record.rejection_reason,
+        "local_agent_review": capture.get("local_agent_review"),
+    }
+
+
+@router.get("/jobs/{job_id}/candidates/{candidate_id}")
+def get_candidate_for_review(job_id: str, candidate_id: str, request: Request) -> dict[str, object]:
+    """Read the exact public evidence needed for one local visual review."""
+    session = _session(request)
+    try:
+        job = session.get(ProductionJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="production job not found")
+        if not job.candidate_pool_path:
+            raise HTTPException(status_code=404, detail="candidate pool not available")
+        try:
+            pool = CandidatePoolStore(Path(job.candidate_pool_path), order_id=job.job_id, job_id=job.job_id)
+            record = next((item for item in pool.records() if item.candidate_id == candidate_id), None)
+        except (CandidatePoolError, OSError) as error:
+            raise HTTPException(status_code=409, detail=f"candidate pool is unavailable: {type(error).__name__}") from error
+        if record is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        return {"candidate": _candidate_detail(record), "local_agent_enabled": bool(request.app.state.website_brain.settings.local_agent_mode)}
+    finally:
+        session.close()
+
+
+@router.post("/jobs/{job_id}/candidates/{candidate_id}/local-review")
+def record_local_agent_review(job_id: str, candidate_id: str, payload: LocalAgentProductReviewRequest, request: Request) -> dict[str, object]:
+    """Persist one explicit local-agent review so the same Job can resume."""
+    if not request.app.state.website_brain.settings.local_agent_mode:
+        raise HTTPException(status_code=409, detail="LOCAL_AGENT review is disabled; configure Website Brain or enable LOCAL_REVIEW_MODE=agent")
+    session = _session(request)
+    try:
+        job = session.get(ProductionJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="production job not found")
+        if not job.candidate_pool_path:
+            raise HTTPException(status_code=404, detail="candidate pool not available")
+        try:
+            pool = CandidatePoolStore(Path(job.candidate_pool_path), order_id=job.job_id, job_id=job.job_id)
+            record = next((item for item in pool.records() if item.candidate_id == candidate_id), None)
+        except (CandidatePoolError, OSError) as error:
+            raise HTTPException(status_code=409, detail=f"candidate pool is unavailable: {type(error).__name__}") from error
+        if record is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        if record.state is not ItemState.VISUAL_PENDING or record.rejection_reason not in {"BRAIN_NOT_CONFIGURED", "LOCAL_AGENT_REVIEW_REQUIRED"}:
+            raise HTTPException(status_code=409, detail="candidate is not waiting for a local visual review")
+        try:
+            review = BrainProductDecision.model_validate(payload.review)
+        except ValidationError as error:
+            raise HTTPException(status_code=422, detail="local review does not match the Website Brain product schema") from error
+        review_data = review.model_dump(mode="json")
+        current_media_sha = str(record.lineage.get("media_sha256") or record.image_sha256 or "").strip()
+        reviewed_media_sha = str(review_data.get("reviewed_media_sha256") or "").strip()
+        if not current_media_sha or not reviewed_media_sha or reviewed_media_sha != current_media_sha:
+            raise HTTPException(status_code=400, detail="reviewed_media_sha256 must exactly match the captured main image")
+        capture = record.lineage.get("capture_evidence") if isinstance(record.lineage.get("capture_evidence"), dict) else {}
+        capture = dict(capture)
+        capture["local_agent_review"] = review_data
+        capture["local_agent_review_actor"] = payload.actor
+        pool.enrich_candidate(candidate_id, lineage={
+            "capture_evidence": capture,
+            # Use the same lineage keys emitted by the configured Brain path;
+            # the Job summary, UI gate, and downstream production record then
+            # all expose one authoritative Review Provider value.
+            "review_provider": "LOCAL_AGENT",
+            "review_actor": payload.actor,
+        })
+        job.status = "REVIEW_RESOLVED"
+        job.current_stage = "BRAIN_DECISION"
+        job.last_reason = f"本地 Agent 已记录候选复核（{payload.actor}）；可恢复同一 Job"
+        _event(session, job, "LOCAL_AGENT_REVIEW_RECORDED", job.status, job.last_reason, {
+            "candidate_id": candidate_id,
+            "review_provider": "LOCAL_AGENT",
+            "reviewed_media_sha256": reviewed_media_sha,
+            "provider_calls": 0,
+            "resume_safe": True,
+        })
+        _audit(session, "LOCAL_AGENT_REVIEW", "production_candidate", candidate_id, actor=payload.actor, result="RECORDED", payload={"job_id": job_id, "provider_calls": 0})
+        session.commit()
+        updated = next(item for item in pool.records() if item.candidate_id == candidate_id)
+        return {"status": "RECORDED", "resume_safe": True, "candidate": _candidate_detail(updated)}
     finally:
         session.close()
 

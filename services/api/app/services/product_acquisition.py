@@ -740,15 +740,25 @@ class ProductAcquisitionEngine:
                     break
                 continue
             links = self._product_links(scope_url, html)
-            if not links and self._product_from_html(scope_url, html, scope, acquisition) is not None:
-                links = [scope_url]
+            if not links and not PRODUCT_PATH.search(urlsplit(scope_url).path):
+                # L0/L1 may receive only a storefront shell while the visible
+                # product grid is populated by JavaScript. Escalate one
+                # bounded scope to the same persistent headed L2 session
+                # before declaring the selected category exhausted.
+                html = NativeBrowserCollector(self.browser_session_dir).get_html(scope_url)
+                acquisition = "L2_BROWSER"
+                links = self._product_links(scope_url, html)
+            if not links:
+                page_product = self._product_from_html(scope_url, html, scope, acquisition)
+                if page_product is not None and self._is_product_detail_url(scope_url, page_product):
+                    links = [scope_url]
             for product_url in links[:limit]:
                 try:
                     product_html, detail_mode = (html, acquisition) if product_url == scope_url else self._get_html(product_url)
                 except (HttpStatusError, NetworkPolicyError, RequestBudgetExceeded):
                     continue
                 product = self._product_from_html(product_url, product_html, scope, detail_mode)
-                if product is None:
+                if product is None or not self._is_product_detail_url(product_url, product):
                     continue
                 serialized = asdict(product)
                 serialized["identity_key"] = product.identity_key
@@ -974,6 +984,24 @@ class ProductAcquisitionEngine:
             seen.add(canonical)
             unique.append(canonical)
         return unique
+
+    @staticmethod
+    def _is_product_detail_url(url: str, product: AcquiredProduct) -> bool:
+        """Reject collection/category metadata that only looks product-like.
+
+        Some storefronts expose an Open Graph title and image on collection
+        pages. That is useful category evidence, but it is not enough to
+        create a sellable candidate. A detail URL or explicit Product JSON-LD
+        is required before the URL can enter the production candidate pool.
+        """
+
+        path = urlsplit(url).path
+        evidence = product.evidence if isinstance(product.evidence, dict) else {}
+        return bool(
+            PRODUCT_PATH.search(path)
+            or evidence.get("json_ld_product")
+            or evidence.get("jsonld_product_selected")
+        )
 
     def _product_from_html(
         self,

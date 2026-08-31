@@ -21,6 +21,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.models import (
     BrowserSession,
@@ -44,10 +45,25 @@ TERMINAL_RUNTIME_EVENTS = {
     "JOB_COMPLETED", "JOB_BLOCKED", "JOB_FAILED", "JOB_CANCELLED",
     "HUMAN_REQUIRED", "TARGET_SHORTAGE",
 }
+# Python cold-start and import time on Windows can be longer than the first
+# browser polling interval.  A missing PID during this short launch window is
+# not evidence that the worker failed; the append-only event stream remains the
+# source of truth and the run is reconciled after this bounded grace period.
+RUNTIME_STARTUP_GRACE_SECONDS = 8.0
+RUNTIME_EVENT_FLUSH_SECONDS = 2.0
+MAX_EMPTY_LAUNCH_RETRIES = 1
 
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def _utc_age_seconds(value: datetime | None) -> float:
+    """Return elapsed seconds for both SQLite-naive and UTC-aware timestamps."""
+    if value is None:
+        return RUNTIME_STARTUP_GRACE_SECONDS
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return max(0.0, (datetime.now(UTC) - normalized).total_seconds())
 
 
 def _expected_executable(command_json: str | None) -> str | None:
@@ -256,6 +272,7 @@ class ProductionRuntimeService:
             "contract_path": run.contract_path,
             "checkpoint_path": run.checkpoint_path,
             "queue_position": run.queue_position,
+            "launch_attempts": run.launch_attempts,
             "heartbeat_at": _iso(run.heartbeat_at),
             "created_at": _iso(run.created_at),
             "started_at": _iso(run.started_at),
@@ -314,7 +331,11 @@ class ProductionRuntimeService:
         source_event_id = str(event.get("event_id") or "")
         if not job_id or not source_event_id:
             return False
-        if session.get(RuntimeEvent, source_event_id) is not None:
+        if session.get(RuntimeEvent, source_event_id) is not None or session.scalar(
+            select(ProductionJobEvent.event_id).where(
+                ProductionJobEvent.runtime_event_id == source_event_id
+            )
+        ) is not None:
             return False
         job = session.get(ProductionJob, job_id)
         if job is None:
@@ -333,21 +354,35 @@ class ProductionRuntimeService:
             items_total=int(event["total"]) if event.get("total") is not None else None,
             payload_json=json.dumps(payload, ensure_ascii=False),
         )
-        session.add(raw)
-        session.add(ProductionJobEvent(
-            job_id=job_id,
-            sequence=self._job_event_sequence(session, job_id),
-            event_type=raw.event_type,
-            runtime_event_id=source_event_id,
-            schema_version=raw.schema_version,
-            source_sequence=raw.sequence,
-            status=raw.status,
-            message=raw.message,
-            stage=raw.stage,
-            items_done=raw.items_done,
-            items_total=raw.items_total,
-            payload_json=json.dumps(payload, ensure_ascii=False),
-        ))
+        try:
+            # Browser polling can reconcile the same run concurrently.  Keep
+            # both read models in one savepoint so a losing writer treats a
+            # duplicate event as an idempotent no-op instead of surfacing a
+            # 500 from the UNIQUE(runtime_event_id) constraint.
+            with session.begin_nested():
+                session.add(raw)
+                session.add(ProductionJobEvent(
+                    job_id=job_id,
+                    sequence=self._job_event_sequence(session, job_id),
+                    event_type=raw.event_type,
+                    runtime_event_id=source_event_id,
+                    schema_version=raw.schema_version,
+                    source_sequence=raw.sequence,
+                    status=raw.status,
+                    message=raw.message,
+                    stage=raw.stage,
+                    items_done=raw.items_done,
+                    items_total=raw.items_total,
+                    payload_json=json.dumps(payload, ensure_ascii=False),
+                ))
+                session.flush()
+        except IntegrityError as exc:
+            # The pre-check above closes the normal path.  This branch is for
+            # the small race between two API polls; only suppress the event
+            # identity collision, and preserve all other integrity failures.
+            if "runtime_event_id" not in str(exc).casefold():
+                raise
+            return False
         event_type = raw.event_type
         if raw.stage:
             job.current_stage = raw.stage
@@ -450,20 +485,38 @@ class ProductionRuntimeService:
                 added += 1
         return added
 
-    def _terminal_event_seen(self, session, job_id: str) -> bool:
-        return session.scalar(
-            select(RuntimeEvent.runtime_event_id).where(
-                RuntimeEvent.job_id == job_id,
-                RuntimeEvent.event_type.in_(TERMINAL_RUNTIME_EVENTS),
-            )
-        ) is not None
+    def _terminal_event_seen(self, session, job_id: str, *, since: datetime | None = None) -> bool:
+        event_query = select(RuntimeEvent.runtime_event_id).where(
+            RuntimeEvent.job_id == job_id,
+            RuntimeEvent.event_type.in_(TERMINAL_RUNTIME_EVENTS),
+        )
+        if since is not None:
+            event_query = event_query.where(RuntimeEvent.created_at >= since)
+        return session.scalar(event_query) is not None
+
+    def _runtime_event_seen(self, session, job_id: str, *, since: datetime | None = None) -> bool:
+        event_query = select(RuntimeEvent.runtime_event_id).where(RuntimeEvent.job_id == job_id)
+        if since is not None:
+            event_query = event_query.where(RuntimeEvent.created_at >= since)
+        return session.scalar(event_query) is not None
+
+    @staticmethod
+    def _command_is_resume(command_json: str | None) -> bool:
+        try:
+            command = json.loads(command_json or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return isinstance(command, list) and "--resume" in command
 
     def _sync_run_from_events(self, session, run: ProductionRun) -> None:
-        latest = session.scalar(
-            select(RuntimeEvent)
-            .where(RuntimeEvent.job_id == run.job_id)
-            .order_by(RuntimeEvent.sequence.desc())
-        )
+        event_query = select(RuntimeEvent).where(RuntimeEvent.job_id == run.job_id)
+        launch_time = run.claimed_at or run.started_at
+        if launch_time is not None:
+            # A resumed Job intentionally reuses the append-only event stream.
+            # Do not let the previous attempt's terminal event overwrite the
+            # current Run's stage while its new worker is starting.
+            event_query = event_query.where(RuntimeEvent.created_at >= launch_time)
+        latest = session.scalar(event_query.order_by(RuntimeEvent.sequence.desc()))
         if latest is not None:
             run.stage = latest.stage or run.stage
             run.progress_note = latest.message or run.progress_note
@@ -492,16 +545,24 @@ class ProductionRuntimeService:
                 # A short-lived runtime can finish between two API polls while
                 # the last JSONL lines are still being appended. Do not turn
                 # that partial read into a permanent FAILED run; re-read the
-                # append-only stream for a bounded flush window first.
-                if not self._terminal_event_seen(session, run.job_id):
-                    for _ in range(6):
-                        time.sleep(0.05)
+                # append-only stream for a bounded flush window first. A newly
+                # launched worker gets a separate startup grace period so each
+                # browser poll stays fast instead of sleeping through the full
+                # flush window.
+                launch_time = run.claimed_at or run.started_at or run.created_at
+                launch_age = _utc_age_seconds(launch_time)
+                if not self._terminal_event_seen(session, run.job_id, since=launch_time) and launch_age < RUNTIME_STARTUP_GRACE_SECONDS:
+                    session.commit()
+                    return self._run_dict(run)
+                if not self._terminal_event_seen(session, run.job_id, since=launch_time):
+                    for _ in range(20):
+                        time.sleep(RUNTIME_EVENT_FLUSH_SECONDS / 20)
                         self._ingest_file(session, run)
-                        if self._terminal_event_seen(session, run.job_id):
+                        if self._terminal_event_seen(session, run.job_id, since=launch_time):
                             break
                 self._sync_run_from_events(session, run)
                 job = session.get(ProductionJob, run.job_id)
-                if job is not None and self._terminal_event_seen(session, run.job_id):
+                if job is not None and self._terminal_event_seen(session, run.job_id, since=launch_time):
                     if job.status == "COMPLETED":
                         run.status, run.stage, run.exit_code = "SUCCEEDED", "DELIVERY", 0
                     elif job.status == "CANCELLED":
@@ -513,11 +574,35 @@ class ProductionRuntimeService:
                     run.finished_at = utc_now()
                     run.pid = None
                 elif job is not None:
-                    run.status, run.stage, run.exit_code = "FAILED", "RUNTIME", 1
-                    run.error = "Website Native Runtime exited before a terminal workflow event"
-                    job.status, job.current_stage, job.last_reason = "FAILED", "RUNTIME", run.error
-                    run.finished_at = utc_now()
-                    run.pid = None
+                    # A process that exits without writing even its first
+                    # event is a launch-boundary failure, not a product or
+                    # provider result.  One bounded retry is safe here: no
+                    # runtime event means no candidate claim and no Provider
+                    # POST could have been committed.  If the retry also
+                    # produces no event, keep the failure explicit and stop.
+                    if (
+                        not self._runtime_event_seen(session, run.job_id, since=launch_time)
+                        and run.launch_attempts < MAX_EMPTY_LAUNCH_RETRIES + 1
+                    ):
+                        run.error = None
+                        run.exit_code = None
+                        run.finished_at = None
+                        run.progress_note = (
+                            "Worker 启动未输出事件，已自动重试一次；"
+                            "不会重复候选或 Provider 调用"
+                        )
+                        self._launch(
+                            session,
+                            job,
+                            run,
+                            resume=self._command_is_resume(run.command_json),
+                        )
+                    else:
+                        run.status, run.stage, run.exit_code = "FAILED", "RUNTIME", 1
+                        run.error = "Website Native Runtime exited before a terminal workflow event"
+                        job.status, job.current_stage, job.last_reason = "FAILED", "RUNTIME", run.error
+                        run.finished_at = utc_now()
+                        run.pid = None
             session.commit()
             return self._run_dict(run)
         finally:
@@ -557,6 +642,7 @@ class ProductionRuntimeService:
         contract_path, events_path, _ = self._contract(session, job, workspace)
         command = [
             str(self.python_executable),
+            "-u",
             str(self.native_entrypoint),
             "run-job",
             "--contract", str(contract_path),
@@ -574,9 +660,19 @@ class ProductionRuntimeService:
             part for part in (website_root, api_root, engine_root, env.get("PYTHONPATH", "")) if part
         )
         log_path = workspace / "website_runtime_launcher.log"
+        # Capture the launch boundary before spawning so even a very fast
+        # worker cannot write an event before the persisted timestamp used by
+        # resume reconciliation.
+        launch_time = utc_now()
+        run.launch_attempts = int(run.launch_attempts or 0) + 1
         try:
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
             with log_path.open("a", encoding="utf-8") as log:
+                log.write(
+                    f"[{launch_time.isoformat()}] spawning Website Native Runtime "
+                    f"attempt={run.launch_attempts} command={json.dumps(command, ensure_ascii=False)}\n"
+                )
+                log.flush()
                 process = subprocess.Popen(
                     command,
                     cwd=str(cwd),
@@ -587,7 +683,14 @@ class ProductionRuntimeService:
                     text=True,
                     creationflags=creationflags,
                 )
+                log.write(f"[{utc_now().isoformat()}] spawned pid={process.pid}\n")
+                log.flush()
         except OSError as exc:
+            try:
+                with log_path.open("a", encoding="utf-8") as log:
+                    log.write(f"[{utc_now().isoformat()}] spawn failed: {type(exc).__name__}: {exc}\n")
+            except OSError:
+                pass
             run.status, run.stage, run.error, run.exit_code = "FAILED", "RUNTIME", str(exc), 1
             run.finished_at = utc_now()
             job.status, job.current_stage, job.last_reason = "FAILED", "RUNTIME", str(exc)
@@ -600,8 +703,12 @@ class ProductionRuntimeService:
         run.events_path = str(events_path)
         run.contract_path = str(contract_path)
         run.checkpoint_path = str(workspace / "checkpoint.json")
-        run.started_at = run.started_at or utc_now()
-        run.claimed_at = utc_now()
+        # Each resume is a fresh worker launch for the same durable Run.  Keep
+        # the original created_at for history, but reset the launch timestamps
+        # so startup reconciliation does not use a stale timestamp from the
+        # previous attempt.
+        run.started_at = launch_time
+        run.claimed_at = launch_time
         run.heartbeat_at = utc_now()
         job.status = "RUNNING"
         job.current_stage = "PREFLIGHT"
@@ -676,6 +783,9 @@ class ProductionRuntimeService:
             latest.exit_code = None
             latest.finished_at = None
             latest.pid = None
+            # Count retries per user-requested launch, not across every
+            # resume of the durable Job.
+            latest.launch_attempts = 0
             if self._active_run(session) is not None:
                 latest.queue_position = int(session.scalar(select(func.count()).select_from(ProductionRun).where(ProductionRun.status == "QUEUED")) or 0)
                 job.status, job.current_stage, job.last_reason = "QUEUED", "RESUME", "已进入持久化恢复队列"

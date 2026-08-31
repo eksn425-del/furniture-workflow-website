@@ -14,6 +14,7 @@
 ```powershell
 Copy-Item .env.example .env.local
 python -m pip install -r services/api/requirements.txt
+python -m playwright install chromium
 Set-Location apps/web
 npm ci
 npm run build
@@ -22,6 +23,8 @@ python launch_website.py
 ```
 
 默认只启动本地控制面，Provider 为 OFF，不需要任何外部 AI 密钥。将来的 Brain 可以选择单一多模态模型，或文本 Brain 加独立 Vision 模型；配置只从 `WEBSITE_BRAIN_*` 读取。Lux3D 只通过 `LUX3D_*` 配置，且必须经过明确成本审批和安全收据。
+
+公开站点的 L2 浏览器默认使用隔离的 Playwright Chromium。也可以设置 `WEBSITE_L2_BROWSER_ENGINE=msedge` 或 `chrome` 使用已安装的系统浏览器，但 Website 仍使用独立 profile，不占用个人浏览器的登录态。
 
 ## 不要提交的内容
 

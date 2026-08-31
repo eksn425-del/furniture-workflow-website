@@ -35,7 +35,7 @@ from furniture_workflow_engine import (
     StageOutcome,
     SupplyExhaustedError,
 )
-from packages.workflow_core.candidate_pool import CandidatePoolStore, CandidateRecord
+from packages.workflow_core.candidate_pool import CandidatePoolStore, CandidateRecord, TERMINAL_ITEM_STATES
 from packages.workflow_core.dimensions import govern_dimensions
 from packages.workflow_core.locks import make_order_policy_lock, provider_idempotency_key, stable_hash
 from packages.workflow_core.naming import (
@@ -62,6 +62,11 @@ from workers.scrape.http_client import NetworkPolicyError, SafeHttpClient
 
 Emit = Callable[[str, str, str, int | None, int | None, dict[str, Any] | None], None]
 
+_L2_HUMAN_REQUIRED_REASONS = frozenset({
+    L2_BROWSER_REQUIRED,
+    "DIMENSIONS_BROWSER_HUMAN_REQUIRED",
+})
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -70,6 +75,21 @@ def _json(value: Any) -> str:
 def _safe_name(value: str) -> str:
     text = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", " ", str(value or ""))
     return re.sub(r"\s+", " ", text).strip(" .")[:140]
+
+
+def _candidate_progress_signature(records: list[CandidateRecord]) -> tuple[tuple[str, str, str, str, str, str], ...]:
+    """Capture durable fields that prove one engine tick made progress."""
+    return tuple(sorted(
+        (
+            record.candidate_id,
+            record.state.value,
+            str(record.rejection_reason or ""),
+            str(record.provider_status or ""),
+            str(record.product_name or ""),
+            str(record.raw_glb_path or ""),
+        )
+        for record in records
+    ))
 
 
 def _candidate_from_product(contract: dict[str, Any], product: AcquiredProduct) -> CandidateRecord:
@@ -1047,6 +1067,7 @@ class ProductionPipeline:
                     self.emit("READY_POOL_COMPLETED", "READY_POOL", f"{label} Ready Pool 已形成；Provider OFF，未发起外部调用", ready, target, {"ready_count": ready, "eligible_count": ready, "retired_ready": retired_ready, "provider_calls": adapter.provider_posts, "target_mode": target_mode, "candidate_pool_path": str(self.pool.path)})
                     self.emit("JOB_BLOCKED", "PROVIDER_SAFETY", "Ready Pool 已保存；选择并审批 Provider 后恢复同一 Job", ready, target, {"blocker": "PROVIDER_REQUIRED", "ready_count": ready, "retired_ready": retired_ready, "provider_calls": adapter.provider_posts, "target_mode": target_mode})
                     return 2
+                before_tick = _candidate_progress_signature(self.pool.records())
                 status = engine.tick()
                 if status is RuntimeStatus.SUCCEEDED:
                     return self._deliver(target, adapter.provider_posts)
@@ -1071,9 +1092,54 @@ class ProductionPipeline:
                 if adapter.provider_capacity_waiting():
                     self.emit("JOB_BLOCKED", "PROVIDER_CAPACITY", "Provider 当前容量已满；checkpoint 已保存，将从同一 Job 安全恢复", self.pool.success_count(), target, {"blocker": "PROVIDER_CAPACITY", "provider_calls": adapter.provider_posts, "resume_safe": True})
                     return 2
-                pending_reasons = {str(item.rejection_reason or "") for item in self.pool.records() if item.state in {ItemState.VISUAL_PENDING, ItemState.DIMENSION_PENDING}}
+                # A local-agent review may unblock a candidate while another
+                # candidate is still waiting for review. Finish every durable
+                # stage that can proceed before stopping at that review
+                # boundary; otherwise one resume would advance only one stage
+                # and the operator would need to press resume repeatedly for
+                # the same already-reviewed product.
+                if before_tick != _candidate_progress_signature(self.pool.records()):
+                    continue
+                active_records = [item for item in self.pool.records() if item.state not in TERMINAL_ITEM_STATES]
+                pending_reasons = {str(item.rejection_reason or "") for item in active_records}
+                l2_pending = next(
+                    (
+                        item for item in sorted(active_records, key=lambda value: (value.created_at, value.candidate_id))
+                        if str(item.rejection_reason or "") in _L2_HUMAN_REQUIRED_REASONS
+                    ),
+                    None,
+                )
+                if l2_pending is not None:
+                    reason_code = str(l2_pending.rejection_reason)
+                    browser = self.contract.get("browser_session") or {}
+                    session_dir = str(browser.get("user_data_dir") or self.workspace / "browser_session")
+                    self.emit(
+                        "HUMAN_REQUIRED",
+                        "L2_BROWSER",
+                        f"{reason_code}：候选需要在同一可见浏览器会话中核对主商品图片/尺寸；完成后恢复同一 Job",
+                        self.pool.success_count(),
+                        target,
+                        {
+                            "reason_code": reason_code,
+                            "candidate_id": l2_pending.candidate_id,
+                            "record_id": l2_pending.record_id,
+                            "url": l2_pending.canonical_url,
+                            "browser_session_dir": session_dir,
+                            "provider_calls": adapter.provider_posts,
+                            "resume_safe": True,
+                        },
+                    )
+                    return 2
                 if "BRAIN_NOT_CONFIGURED" in pending_reasons:
-                    self.emit("JOB_BLOCKED", "BRAIN_DECISION", "WEBSITE_BRAIN_* 未配置；需要 Qwen3.6 决策的候选保持暂停", 0, target, {"blocker": "BRAIN_NOT_CONFIGURED", "provider_calls": adapter.provider_posts})
+                    local_agent_mode = bool(getattr(getattr(self.brain, "settings", None), "local_agent_mode", False))
+                    blocker = "LOCAL_AGENT_REVIEW_REQUIRED" if local_agent_mode else "BRAIN_NOT_CONFIGURED"
+                    message = (
+                        "LOCAL_AGENT_REVIEW_REQUIRED：本地 Agent 已就绪，但当前候选没有显式复核证据；"
+                        "补充复核后恢复同一 Job"
+                        if local_agent_mode
+                        else "WEBSITE_BRAIN_* 未配置；需要 Qwen3.6 决策的候选保持暂停"
+                    )
+                    self.emit("JOB_BLOCKED", "BRAIN_DECISION", message, 0, target, {"blocker": blocker, "provider_calls": adapter.provider_posts, "resume_safe": True})
                     return 2
         except BrowserHumanRequired as error:
             self.emit("HUMAN_REQUIRED", "L2_BROWSER", str(error), self.pool.success_count(), target, {"reason_code": error.reason_code, "url": error.url, "browser_session_dir": str(error.session_dir), "provider_calls": adapter.provider_posts})

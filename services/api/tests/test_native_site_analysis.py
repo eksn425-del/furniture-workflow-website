@@ -77,6 +77,17 @@ def test_site_root_does_not_turn_missing_count_into_zero(tmp_path: Path) -> None
     assert category["count_kind"] == "UNKNOWN"
 
 
+def test_navigation_parser_ignores_script_payload_inside_anchor(tmp_path: Path) -> None:
+    analyzer = NativeSiteAnalyzer(tmp_path)
+    categories, _ = analyzer._l0_l1(
+        "https://www.article.com/",
+        '<a href="/shop/furniture">Get a free design plan. token { "state": "x" }</a>'
+        '<a href="/living-room">Living Room</a>',
+    )
+
+    assert [item.path for item in categories] == ["/living-room"]
+
+
 def test_coarsen_does_not_sum_known_children_over_unknown_member() -> None:
     categories = [
         TaxonomyCategoryContract(
