@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from app.services.product_acquisition import ProductAcquisitionEngine, ProductSupplyExhausted, _parse_dimension_text
+from workers.scrape.http_client import HttpStatusError
 
 
 MAGENTO_SHELL = '<html><body><div id="root" data-media-backend="https://media.example.test"></div><script src="/client.abc123.js"></script></body></html>'
@@ -184,3 +185,36 @@ def test_dynamic_category_shell_escalates_to_l2_for_product_links(tmp_path: Path
     assert len(products) == 1
     assert products[0].source_name == "Chair One"
     assert products[0].canonical_url == "https://shop.example/products/chair-one"
+
+
+def test_method_or_edge_access_status_escalates_selected_scope_to_l2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class BlockedClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_html(self, _: str) -> str:
+            raise HttpStatusError(405, retryable=False)
+
+    monkeypatch.setattr(
+        "app.services.product_acquisition.NativeBrowserCollector.get_html",
+        lambda _collector, _url: "<html><body><a href='/products/chair-one'>Chair One</a></body></html>",
+    )
+    engine = ProductAcquisitionEngine(
+        source_url="https://shop.example/collections/chairs",
+        site_key="shop.example",
+        source_type="DIRECT_BRAND",
+        categories=[{
+            "category_id": "chairs",
+            "canonical_name": "Chairs",
+            "source_url": "https://shop.example/collections/chairs",
+            "selected": True,
+        }],
+        workspace=tmp_path,
+        browser_session_dir=tmp_path / "browser",
+        client_factory=lambda **_: BlockedClient(),
+    )
+
+    html, acquisition = engine._get_html("https://shop.example/collections/chairs")
+
+    assert "chair-one" in html
+    assert acquisition == "L2_BROWSER"

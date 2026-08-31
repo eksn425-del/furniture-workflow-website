@@ -128,13 +128,28 @@ export interface ControlOverview {
 export interface SystemStatus {
   schema_version: string;
   skills: { runtime_mode: string; root_configured: boolean; bundled: boolean; doctor: Record<string, unknown> };
-  website_brain: { status: string; configured: boolean; model: string | null; namespace: string; provider_posts: number; model_mode?: string; review_provider?: string };
+  website_brain: { status: string; configured: boolean; model: string | null; namespace: string; provider_posts: number; model_mode?: string; review_provider?: string; local_agent_override?: boolean; mode_source?: string; override_reason?: string };
   provider: { status: string; provider_calls: number; safety_gate: string };
   database: { engine: string; status: string };
   object_storage: { status: string; note: string };
   workers: Record<string, string>;
   runtime_agent_dependency: string;
   feature_flags: Record<string, unknown>;
+  diagnostics?: {
+    api?: { status: string; reason_code?: string };
+    database?: { status: string; engine?: string };
+    l2_browser?: { status: string; engine?: string; mode?: string; reason_code?: string };
+    brain?: { status: string; effective_mode?: string; configured?: boolean; review_provider?: string };
+    brain_override?: { status: string; reason?: string };
+    lux3d?: { status: string; reason_code?: string };
+    blender?: { status: string; reason_code?: string };
+    production_worker?: { status: string; reason_code?: string };
+    site_scan_worker?: { status: string; reason_code?: string };
+  };
+  l2_browser?: { status: string; engine?: string; mode?: string; reason_code?: string };
+  lux3d?: { status: string; reason_code?: string };
+  blender?: { status: string; reason_code?: string };
+  production_worker?: { status: string; reason_code?: string };
 }
 
 const CONTROL_ROOT = `${API_ROOT}/control`;

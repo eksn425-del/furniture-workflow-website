@@ -156,7 +156,11 @@ def main() -> int:
     ])
     env["OUTPUT_ROOT"] = env_values.get("OUTPUT_ROOT", str(root.parent / "output" / "web_projects"))
     env["WEB_BASE_URL"] = env_values.get("WEB_BASE_URL", f"http://localhost:{WEB_PORT}")
-    env["NEXT_PUBLIC_API_BASE_URL"] = f"http://127.0.0.1:{API_PORT}"
+    # Keep browser requests same-origin so embedded browsers and isolated
+    # browser contexts can reach the API through Next's internal proxy. The
+    # proxy forwards to the local API without exposing loopback assumptions to
+    # the client bundle.
+    env["NEXT_PUBLIC_API_BASE_URL"] = "/api/v1"
 
     # 1. 启动后端 API
     api_cmd = [PYTHON, "-m", "uvicorn", "app.asgi:app", "--app-dir", str(root / "services" / "api"),

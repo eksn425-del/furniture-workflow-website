@@ -50,6 +50,7 @@ const STATUS_LABELS: Record<string, string> = {
   DISCOVERING: "扫描中",
   WAITING_REVIEW: "等待复核",
   HUMAN_REQUIRED: "需要人工",
+  ROBOTS_DENIED: "robots.txt 拒绝",
   TEMPORARY_FAILURE: "临时故障",
   ACCESS_CHANGE_REQUIRED: "访问条件待处理",
   SESSION_CONTINUITY_BROKEN: "会话待恢复",
@@ -87,7 +88,7 @@ const STAGE_LABELS: Record<string, string> = {
 };
 
 const ACTIVE_SITE_SCAN_STATUSES = new Set(["QUEUED", "ANALYZING", "L2_BROWSER"]);
-const BLOCKED_SITE_SCAN_STATUSES = new Set(["HUMAN_REQUIRED", "TEMPORARY_FAILURE", "ACCESS_CHANGE_REQUIRED", "SESSION_CONTINUITY_BROKEN", "BROWSER_REQUIRED", "BROWSER_RUNTIME_NOT_INSTALLED", "FAILED", "BRAIN_NOT_CONFIGURED"]);
+const BLOCKED_SITE_SCAN_STATUSES = new Set(["HUMAN_REQUIRED", "ROBOTS_DENIED", "TEMPORARY_FAILURE", "ACCESS_CHANGE_REQUIRED", "SESSION_CONTINUITY_BROKEN", "BROWSER_REQUIRED", "BROWSER_RUNTIME_NOT_INSTALLED", "FAILED", "BRAIN_NOT_CONFIGURED"]);
 
 function label(value: string | null | undefined, fallback = "未标记") {
   if (!value) return fallback;
@@ -123,6 +124,7 @@ function siteScanBlocker(site: ControlSite) {
   const detail = String(site.latest_scan_error_message ?? "").trim();
   const reason = detail ? `（${detail}）` : "";
   if (status === "HUMAN_REQUIRED") return `最新扫描需要人工验证${reason}请回网站库点击“恢复同一扫描”，验证通过后再补全类目数量。`;
+  if (status === "ROBOTS_DENIED") return `最新扫描被 robots.txt 拒绝${reason}这不是人机验证；请确认官方导出/授权接口，或停止当前扫描。`;
   if (status === "TEMPORARY_FAILURE") return `最新扫描遇到临时页面或导航故障${reason}同一浏览器会话和检查点已保留，可直接恢复重试。`;
   if (status === "ACCESS_CHANGE_REQUIRED") return `最新扫描在可见浏览器中仍被拒绝，但没有验证控件${reason}请检查网络或站点访问条件后恢复。`;
   if (status === "SESSION_CONTINUITY_BROKEN") return `最新扫描的持久浏览器会话中断${reason}请恢复同一扫描，不要新建重复任务。`;
@@ -695,9 +697,61 @@ export function ReviewCenterPage() {
 }
 
 export function SystemStatusPage() {
-  const [status, setStatus] = useState<SystemStatus | null>(null); const [error, setError] = useState<string | null>(null); const [busy, setBusy] = useState(true);
-  useEffect(() => { void getSystemStatus().then(setStatus).catch((reason) => setError(readableConsoleError(reason))).finally(() => setBusy(false)); }, []);
-  return <div className="console-page"><PageHeader eyebrow="System / 运行边界" title="系统健康与安全" description="这里看 Website Native Runtime、独立 Website Brain、Provider Safety、Worker 和存储的真实状态。密钥只读取就绪状态，不在界面显示。" action={<Link className="console-button console-button--quiet" href="/">返回 Dashboard</Link>} />{error ? <div className="console-alert console-alert--danger"><strong>系统状态读取失败</strong><span>{error}</span></div> : null}<div className="system-health-grid"><HealthStatusCard title="Website API" value={error ? "连接异常" : "在线 · v0.16.0"} detail="控制平面响应正常" tone={error ? "danger" : "success"} /><HealthStatusCard title="Website Brain" value={status?.website_brain.status ?? (busy ? "读取中…" : "未知")} detail={status?.website_brain.review_provider === "LOCAL_AGENT" ? "本地 Agent · 不发外部 API" : status?.website_brain.configured ? status.website_brain.model ?? "已配置" : "缺少 WEBSITE_BRAIN_*"} tone={status?.website_brain.review_provider === "LOCAL_AGENT" || status?.website_brain.configured ? "success" : "attention"} /><HealthStatusCard title="Provider Safety" value={status?.provider.status ?? (busy ? "读取中…" : "未知")} detail="任务级资格检查与显式成本审批后放行" tone="attention" /><HealthStatusCard title="对象存储" value={status?.object_storage.status ?? (busy ? "读取中…" : "未配置")} detail="大文件生产环境接入 MinIO/S3" tone="attention" /></div><div className="system-grid"><section className="console-panel"><SectionTitle title="Native Runtime" detail="Website 正式运行链不加载外部 Skills；开发细节折叠展示。" /><div className="system-kv"><div><span>Runtime 依赖</span><strong>{status?.runtime_agent_dependency ?? "NONE"}</strong></div><div><span>Native Worker</span><strong>Website/workers/native_runtime.py</strong></div><div><span>Brain namespace</span><strong>{status?.website_brain.namespace ?? "WEBSITE_BRAIN_*"}</strong></div><div><span>Review mode</span><strong>{status?.website_brain.model_mode ?? "TEXT_BRAIN_PLUS_VISION"}</strong></div><div><span>Brain posts</span><strong>{String(status?.website_brain.provider_posts ?? 0)}</strong></div></div><details className="developer-details"><summary>开发诊断</summary><pre>{JSON.stringify({ brain: status?.website_brain, provider: status?.provider, workers: status?.workers }, null, 2)}</pre></details></section><section className="console-panel"><SectionTitle title="Worker 与队列" detail="心跳缺失时显示未知，不伪造在线。" /><div className="health-rows">{Object.entries(status?.workers ?? { scrape: "读取中…", site_scan: "读取中…", modeling: "读取中…", qa: "读取中…" }).map(([name, value]) => <HealthRow key={name} label={`${name} worker`} value={value} tone={value === "READY" || value === "WEBSITE_NATIVE" ? "success" : "attention"} />)}</div></section></div></div>;
+  const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(true);
+  useEffect(() => {
+    void getSystemStatus()
+      .then(setStatus)
+      .catch((reason) => setError(readableConsoleError(reason)))
+      .finally(() => setBusy(false));
+  }, []);
+
+  const diagnostics = status?.diagnostics;
+  const l2 = status?.l2_browser ?? diagnostics?.l2_browser;
+  const brain = diagnostics?.brain;
+  const brainOverride = diagnostics?.brain_override;
+  const lux3d = status?.lux3d ?? diagnostics?.lux3d;
+  const blender = status?.blender ?? diagnostics?.blender;
+  const productionWorker = status?.production_worker ?? diagnostics?.production_worker;
+  const diagnosticValue = (value: string | undefined, fallback = busy ? "读取中…" : "未知") => value ?? fallback;
+  const diagnosticTone = (value: string | undefined) => value === "READY" || value === "LOCAL_AGENT" || value === "ON" || value === "WEBSITE_NATIVE" ? "success" : value === "BUSY" || value === "RECEIPT_GATED" || value === "OFF_BY_DEFAULT" || value === "NOT_CONFIGURED" || value === "NOT_INSTALLED" ? "attention" : "danger";
+  const workerRows = Object.fromEntries(Object.entries(status?.workers ?? { scrape: "读取中…", site_scan: "读取中…", modeling: "读取中…", qa: "读取中…" }).filter(([name]) => name !== "production"));
+
+  return <div className="console-page">
+    <PageHeader eyebrow="System / 运行边界" title="系统健康与安全" description="这里看 Website Native Runtime、实际生效的 Brain、L2、Blender、Provider Safety 和 Worker 状态。密钥、私有 URL、会话目录不会显示。" action={<Link className="console-button console-button--quiet" href="/">返回 Dashboard</Link>} />
+    {error ? <div className="console-alert console-alert--danger"><strong>系统状态读取失败</strong><span>{error}</span></div> : null}
+    {brainOverride?.status === "ON" || status?.website_brain.local_agent_override ? <div className="console-alert console-alert--attention"><strong>Local Agent Override 已生效</strong><span>{brainOverride?.reason ?? status?.website_brain.override_reason ?? "当前复核由本地 Agent 完成，不发起外部 Brain 请求。"}</span></div> : null}
+    <div className="system-health-grid">
+      <HealthStatusCard title="Website API" value={diagnosticValue(diagnostics?.api?.status, error ? "ERROR" : "READY")} detail="控制平面响应正常" tone={error ? "danger" : "success"} />
+      <HealthStatusCard title="Database" value={diagnosticValue(diagnostics?.database?.status ?? status?.database.status)} detail="状态来自实际 SELECT 1 检查" tone={diagnosticTone(diagnostics?.database?.status ?? status?.database.status)} />
+      <HealthStatusCard title="L2 Browser" value={diagnosticValue(l2?.status)} detail={`${l2?.engine ?? "chromium"} · ${l2?.mode ?? "ISOLATED_PERSISTENT"}`} tone={diagnosticTone(l2?.status)} />
+      <HealthStatusCard title="Website Brain" value={diagnosticValue(brain?.status ?? (status?.website_brain.review_provider === "LOCAL_AGENT" ? "LOCAL_AGENT" : status?.website_brain.status))} detail={brain?.effective_mode === "LOCAL_AGENT" || status?.website_brain.review_provider === "LOCAL_AGENT" ? "本地 Agent · 不发外部 API" : status?.website_brain.configured ? "已配置独立 Brain" : "未配置 WEBSITE_BRAIN_*"} tone={diagnosticTone(brain?.status ?? status?.website_brain.status)} />
+    </div>
+    <div className="system-grid">
+      <section className="console-panel">
+        <SectionTitle title="实际运行边界" detail="所有状态都来自当前进程、运行时探测或持久化数据库；不因配置模板而伪造 READY。" />
+        <div className="system-kv">
+          <div><span>Brain Effective Mode</span><strong>{diagnosticValue(brain?.effective_mode ?? status?.website_brain.model_mode)}</strong></div>
+          <div><span>Brain Override</span><strong>{diagnosticValue(brainOverride?.status, "OFF")}</strong></div>
+          <div><span>Lux3D</span><strong>{diagnosticValue(lux3d?.status)}</strong></div>
+          <div><span>Blender</span><strong>{diagnosticValue(blender?.status)}</strong></div>
+          <div><span>Provider Safety</span><strong>{diagnosticValue(status?.provider.status)}</strong></div>
+          <div><span>Object Storage</span><strong>{diagnosticValue(status?.object_storage.status)}</strong></div>
+          <div><span>Brain namespace</span><strong>{status?.website_brain.namespace ?? "WEBSITE_BRAIN_*"}</strong></div>
+          <div><span>Brain posts</span><strong>{String(status?.website_brain.provider_posts ?? 0)}</strong></div>
+        </div>
+        <details className="developer-details"><summary>开发诊断</summary><pre>{JSON.stringify({ diagnostics, brain: status?.website_brain, provider: status?.provider }, null, 2)}</pre></details>
+      </section>
+      <section className="console-panel">
+        <SectionTitle title="Worker 与队列" detail="生产槽位和扫描队列取自数据库；单个站点阻断不会伪装成全局失败。" />
+        <div className="health-rows">
+          {Object.entries(workerRows).map(([name, value]) => <HealthRow key={name} label={`${name} worker`} value={value} tone={diagnosticTone(value)} />)}
+          <HealthRow label="production worker" value={productionWorker?.status ?? "读取中…"} tone={diagnosticTone(productionWorker?.status)} />
+        </div>
+      </section>
+    </div>
+  </div>;
 }
 
 function HealthStatusCard({ title, value, detail, tone: cardTone }: { title: string; value: string; detail: string; tone: string }) { return <section className="health-status-card"><span className={`signal-dot signal-dot--${cardTone}`} /><div><span>{title}</span><strong>{value}</strong><small>{detail}</small></div></section>; }
@@ -778,7 +832,7 @@ export function SitesPage() {
           await refreshSiteCards();
           return;
         }
-        if (finished && ["HUMAN_REQUIRED", "TEMPORARY_FAILURE", "ACCESS_CHANGE_REQUIRED", "SESSION_CONTINUITY_BROKEN", "FAILED", "BROWSER_RUNTIME_NOT_INSTALLED", "BRAIN_NOT_CONFIGURED"].includes(status)) {
+        if (finished && ["HUMAN_REQUIRED", "ROBOTS_DENIED", "TEMPORARY_FAILURE", "ACCESS_CHANGE_REQUIRED", "SESSION_CONTINUITY_BROKEN", "FAILED", "BROWSER_RUNTIME_NOT_INSTALLED", "BRAIN_NOT_CONFIGURED"].includes(status)) {
           if (trackedScanId.current === scanId) trackedScanId.current = null;
           setRescanKey(null);
           const errorMessage = String((scan as { error_message?: unknown })?.error_message ?? "");

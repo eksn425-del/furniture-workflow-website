@@ -153,7 +153,7 @@ class SiteScanRuntimeService:
         session = self.database.session_factory()
         try:
             scan = session.get(SiteScanRun, scan_id)
-            if scan is None or scan.status in {"READY", "PARTIAL", "FAILED", "HUMAN_REQUIRED", "TEMPORARY_FAILURE", "ACCESS_CHANGE_REQUIRED", "SESSION_CONTINUITY_BROKEN", "BRAIN_NOT_CONFIGURED", "BROWSER_RUNTIME_NOT_INSTALLED"}:
+            if scan is None or scan.status in {"READY", "PARTIAL", "FAILED", "HUMAN_REQUIRED", "ROBOTS_DENIED", "TEMPORARY_FAILURE", "ACCESS_CHANGE_REQUIRED", "SESSION_CONTINUITY_BROKEN", "BRAIN_NOT_CONFIGURED", "BROWSER_RUNTIME_NOT_INSTALLED"}:
                 return
             scan.status = "ANALYZING"
             scan.heartbeat_at = utc_now()

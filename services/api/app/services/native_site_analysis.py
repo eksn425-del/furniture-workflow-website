@@ -32,6 +32,7 @@ COUNT_RE = re.compile(r"(?<![\w])([0-9][0-9,]*)\s*(?:items?|products?|results?|�
 PRODUCT_RE = re.compile(r"/(?:products?|product-page|p|item|sku)/[^/?#]+", re.I)
 ASSET_RE = re.compile(r"\.(?:css|js|png|jpe?g|gif|svg|webp|ico|pdf|xml|zip)(?:$|[?#])", re.I)
 MAX_COUNT_PROBES = 20
+BROWSER_ESCALATION_HTTP_STATUSES = frozenset({401, 403, 405, 430})
 CATEGORY_WORDS = {
     "furniture", "living", "bedroom", "dining", "office", "outdoor", "seating", "chairs", "sofas",
     "tables", "desks", "beds", "lighting", "rugs", "storage", "decor", "accessories", "casegoods",
@@ -302,7 +303,7 @@ class NativeSiteAnalyzer:
             html = client.get_html(normalized)
             result.update({"status": "READY", "network_called": True, "content_type": "text/html", "http": client.telemetry(), "page_bytes": len(html.encode("utf-8"))})
         except RobotsDenied as error:
-            result.update({"status": "HUMAN_REQUIRED", "network_called": True, "next_action": "robots.txt 拒绝了该入口，需人工确认官方导出或停止", "blocker": {"code": "ROBOTS_DENIED", "message": str(error)}})
+            result.update({"status": "ROBOTS_DENIED", "network_called": True, "next_action": "robots.txt 拒绝了该入口，需人工确认官方导出或停止", "blocker": {"code": "ROBOTS_DENIED", "message": str(error)}})
         except AccessControlDetected as error:
             status, blocker, brain = self._access_decision(normalized, stage="PREFLIGHT", reason_code=error.kind.upper())
             result.update({"status": status, "network_called": True, "next_action": blocker["message"], "blocker": blocker, "brain": brain})
@@ -310,7 +311,7 @@ class NativeSiteAnalyzer:
             # 522/5xx、429 和显式访问控制不是“网址不存在”。预检必须把
             # 这类信号交给后续同一站点的可见 L2 会话，否则新建任务会在
             # L2 之前被前端当成普通失败而提前截断。
-            if error.status_code in {401, 403, 429} or error.retryable:
+            if error.status_code in BROWSER_ESCALATION_HTTP_STATUSES or error.status_code == 429 or error.retryable:
                 status, blocker, brain = self._access_decision(normalized, stage="PREFLIGHT", reason_code=f"HTTP_{error.status_code}")
                 result.update({
                     "status": status,
@@ -417,7 +418,7 @@ class NativeSiteAnalyzer:
                 status = "BROWSER_REQUIRED"
             receipt = self._receipt(normalized, site_key, live=True, status=status, categories=categories, evidence={"l0": signals, "http": client.telemetry(), "sitemaps": sitemap_urls, "sitemap_hits": len(sitemap_hits), "magento_graphql_taxonomy": magento_taxonomy_evidence, "magento_graphql_counts": magento_count_evidence}, brain=brain_metadata, blocker=None if status == "READY" else {"code": str(status), "message": self._blocker_message(str(status))}, source_type=source_type)
         except RobotsDenied as error:
-            receipt = self._receipt(normalized, site_key, live=True, status="HUMAN_REQUIRED", categories=[], evidence={"network_called": True}, blocker={"code": "ROBOTS_DENIED", "message": str(error)})
+            receipt = self._receipt(normalized, site_key, live=True, status="ROBOTS_DENIED", categories=[], evidence={"network_called": True}, blocker={"code": "ROBOTS_DENIED", "message": str(error)})
         except AccessControlDetected as error:
             status, blocker, brain = self._access_decision(normalized, stage="L1", reason_code=error.kind.upper())
             receipt = self._receipt(normalized, site_key, live=True, status=status, categories=[], evidence={"network_called": True, "access_signal": error.kind}, blocker=blocker, brain=brain)
@@ -428,7 +429,7 @@ class NativeSiteAnalyzer:
             # to a plain HTTP client while the same URL is available in a
             # headed browser.  Escalate only retryable server-side responses;
             # do not treat client errors or rate limits as permission to retry.
-            status = "BROWSER_REQUIRED" if error.status_code in {401, 403, 429} or (error.retryable and error.status_code >= 500) else "FAILED"
+            status = "BROWSER_REQUIRED" if error.status_code in BROWSER_ESCALATION_HTTP_STATUSES or error.status_code == 429 or (error.retryable and error.status_code >= 500) else "FAILED"
             receipt = self._receipt(
                 normalized,
                 site_key,
@@ -1027,6 +1028,7 @@ class NativeSiteAnalyzer:
             "BROWSER_REQUIRED": "页面没有足够的公开服务器证据，需要同一可见浏览器标签页继续取证。",
             "TEMPORARY_FAILURE": "页面暂时不可用或浏览器导航失败；已保留同一会话和检查点，可恢复重试。",
             "ACCESS_CHANGE_REQUIRED": "可见浏览器被拒绝且没有人工验证控件；请检查网络或站点访问条件。",
+            "ROBOTS_DENIED": "robots.txt 拒绝了该入口；请人工确认官方导出、授权接口或停止当前扫描。",
             "SESSION_CONTINUITY_BROKEN": "持久可见浏览器会话中断；请恢复同一扫描。",
             "PARTIAL": "已保存可验证的部分证据，但仍有未知数量或未完成类目。",
         }.get(status, "扫描尚未达到可验证状态。")

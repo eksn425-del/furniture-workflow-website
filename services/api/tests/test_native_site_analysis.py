@@ -7,7 +7,7 @@ from app.services.brain_provider import BrainSettings, WebsiteBrainProvider
 from app.services.native_contracts import TaxonomyCategoryContract
 from app.services.native_site_analysis import NativeSiteAnalyzer
 from app.services.product_acquisition import NativeBrowserCollector
-from workers.scrape.http_client import AccessControlDetected, HttpStatusError, SafeHttpClient
+from workers.scrape.http_client import AccessControlDetected, HttpStatusError, RobotsDenied, SafeHttpClient
 
 
 class FakeSiteClient:
@@ -145,6 +145,33 @@ def test_preflight_retryable_server_status_keeps_l2_path_open(tmp_path: Path) ->
     assert result["status"] == "BROWSER_REQUIRED"
     assert result["blocker"]["code"] == "HTTP_522"
     assert "可见浏览器" in result["next_action"]
+
+
+def test_preflight_method_or_edge_access_status_escalates_to_l2(tmp_path: Path) -> None:
+    class EdgeBlockedClient(FakeSiteClient):
+        def get_html(self, _: str) -> str:
+            raise HttpStatusError(430, retryable=False)
+
+    analyzer = NativeSiteAnalyzer(tmp_path, client_factory=EdgeBlockedClient)
+    result = analyzer.preflight("https://example.test/", live=True)
+
+    assert result["status"] == "BROWSER_REQUIRED"
+    assert result["blocker"]["code"] == "HTTP_430"
+
+
+def test_robots_denied_is_not_reported_as_human_challenge(tmp_path: Path) -> None:
+    class RobotsBlockedClient(FakeSiteClient):
+        def get_html(self, _: str) -> str:
+            raise RobotsDenied("robots.txt disallows URL")
+
+    analyzer = NativeSiteAnalyzer(tmp_path, client_factory=RobotsBlockedClient)
+    preflight = analyzer.preflight("https://example.test/", live=True)
+    receipt = analyzer.analyze("https://example.test/", live=True, output_dir=tmp_path / "robots")
+
+    assert preflight["status"] == "ROBOTS_DENIED"
+    assert preflight["blocker"]["code"] == "ROBOTS_DENIED"
+    assert receipt["status"] == "ROBOTS_DENIED"
+    assert receipt["blocker"]["code"] == "ROBOTS_DENIED"
 
 
 def test_script_only_captcha_words_are_not_access_challenge() -> None:

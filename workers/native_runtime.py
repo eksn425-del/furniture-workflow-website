@@ -139,8 +139,11 @@ def run_job(contract_path: Path, events_path: Path, workspace: Path, *, resume: 
     if _fixture_enabled(contract) and not local_e2e:
         _emit(events_path, contract, "JOB_BLOCKED", status="BLOCKED", stage="FIXTURE_GATE", message="测试 fixture 不能进入真实交付", payload={"blocker": "FIXTURE_ONLY", "provider_calls": 0})
         return 2
-    local_review = local_e2e or os.getenv("LOCAL_REVIEW_MODE", "").strip().casefold() == "agent"
-    model_mode = os.getenv("WEBSITE_MODEL_MODE", "").strip() or os.getenv("LUNAMAX_MODEL_MODE", "").strip() or ("LOCAL_AGENT" if local_review else "TEXT_BRAIN_PLUS_VISION")
+    from app.services.brain_provider import BrainSettings
+
+    brain_settings = BrainSettings.from_environment()
+    local_review = local_e2e or brain_settings.local_agent_mode
+    model_mode = "LOCAL_AGENT" if local_e2e else brain_settings.model_mode
     _emit(
         events_path,
         contract,

@@ -16,7 +16,7 @@ npm ci
 npm run dev
 ```
 
-Set `NEXT_PUBLIC_API_BASE_URL` to the local API URL when the Web app is not using its proxy route.
+The default `NEXT_PUBLIC_API_BASE_URL=/api/v1` uses the Next same-origin proxy and is the recommended value for local and embedded browsers. Set an absolute API URL only when the Web app is intentionally hosted separately from the API service.
 
 ## Tests
 

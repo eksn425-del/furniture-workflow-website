@@ -686,7 +686,7 @@ class ProductAcquisitionEngine:
         except HttpStatusError as error:
             # 反爬站点对机器人 UA 常直接回 403/429/5xx（而不是正常验证页），
             # 这类访问控制状态升级到可见浏览器（真实指纹 + 人工验证），而不是直接判失败。
-            if error.status_code in {401, 403, 429} or error.retryable:
+            if error.status_code in {401, 403, 405, 429, 430} or error.retryable:
                 return NativeBrowserCollector(self.browser_session_dir).get_html(url), "L2_BROWSER"
             raise
         except (NetworkPolicyError, RequestBudgetExceeded):

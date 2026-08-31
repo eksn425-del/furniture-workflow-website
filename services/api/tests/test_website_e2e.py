@@ -139,3 +139,7 @@ def test_add_site_to_delivery_runs_complete_local_workflow(monkeypatch, tmp_path
                 names = archive.namelist()
                 assert "manifest.json" in names
                 assert len([name for name in names if name.endswith(".glb")]) == batch["file_count"]
+                batch_manifest = json.loads(archive.read("manifest.json"))
+                assert all(item["target_dimensions"] for item in batch_manifest["items"])
+                assert all(item["dimension_source"] == "OFFICIAL_STRUCTURED" for item in batch_manifest["items"])
+                assert all(item["blender_qa"]["status"] == "PASS" for item in batch_manifest["items"])

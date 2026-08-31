@@ -117,6 +117,7 @@ class LocalMockAcquisition:
                 "scope_reasons": ["LOCAL_CATEGORY_SCOPE"],
                 "image_role": "MAIN_PRODUCT",
                 "layered_scene7": False,
+                "dimension_source": "OFFICIAL_STRUCTURED",
             }
             products.append(AcquiredProduct(
                 source_product_id=sku,

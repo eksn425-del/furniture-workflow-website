@@ -86,6 +86,11 @@ class BrainProductDecision(BaseModel):
     depth: float | None = Field(default=None, gt=0)
     height: float | None = Field(default=None, gt=0)
     dimension_unit: str = ""
+    # Dimensions supplied by the Brain are estimates unless the Website has
+    # already attached official structured/page evidence.  Keeping this field
+    # explicit prevents a reviewer-entered estimate from being mislabeled as
+    # an official catalog value.
+    dimension_source: Literal["OFFICIAL_STRUCTURED", "OFFICIAL_PAGE", "AI_ESTIMATED", "UNKNOWN"] = "AI_ESTIMATED"
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reason_codes: list[str] = Field(default_factory=list, max_length=16)
     source_image_vision_consistent: bool | None = None

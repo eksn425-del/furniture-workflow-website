@@ -49,6 +49,8 @@ class BrainSettings:
     max_retries: int = 2
     rpm_limit: int = 30
     model_mode: str = "TEXT_BRAIN_PLUS_VISION"
+    local_agent_override: bool = False
+    mode_source: str = "explicit"
 
     @classmethod
     def from_environment(cls) -> "BrainSettings":
@@ -56,9 +58,21 @@ class BrainSettings:
         # Qwen/OpenAI variables. Do not add fallback aliases here.
         requested_mode = (os.getenv("LOCAL_REVIEW_MODE", "").strip().casefold() == "agent")
         raw_mode = os.getenv("WEBSITE_MODEL_MODE", "").strip() or os.getenv("LUNAMAX_MODEL_MODE", "").strip()
-        normalized_mode = raw_mode.upper().replace("-", "_") if raw_mode else "TEXT_BRAIN_PLUS_VISION"
+        credentials_present = all(os.getenv(name, "").strip() for name in (
+            "WEBSITE_BRAIN_API_KEY", "WEBSITE_BRAIN_BASE_URL", "WEBSITE_BRAIN_MODEL",
+        ))
+        # A company deployment can explicitly choose TEXT_BRAIN_PLUS_VISION or
+        # MULTIMODAL_SINGLE_MODEL.  For a local checkout with no Brain
+        # credentials, however, the useful and truthful default is the local
+        # reviewer: the UI can keep working without pretending a remote model
+        # is configured.  An explicit mode always wins over this convenience.
+        mode_source = "explicit" if raw_mode else "configured_default" if credentials_present else "local_default"
+        normalized_mode = raw_mode.upper().replace("-", "_") if raw_mode else (
+            "TEXT_BRAIN_PLUS_VISION" if credentials_present else "LOCAL_AGENT"
+        )
         if requested_mode:
             normalized_mode = "LOCAL_AGENT"
+            mode_source = "local_review_override"
         if normalized_mode not in MODEL_MODES:
             normalized_mode = "TEXT_BRAIN_PLUS_VISION"
         return cls(
@@ -69,6 +83,8 @@ class BrainSettings:
             max_retries=max(0, min(int(os.getenv("WEBSITE_BRAIN_MAX_RETRIES", "2")), 3)),
             rpm_limit=max(1, min(int(os.getenv("WEBSITE_BRAIN_RPM_LIMIT", "30")), 600)),
             model_mode=normalized_mode,
+            local_agent_override=requested_mode,
+            mode_source=mode_source,
         )
 
     @property
@@ -101,6 +117,15 @@ class WebsiteBrainProvider:
             "model_mode": self.settings.model_mode,
             "review_provider": self.review_provider,
             "provider_posts": self.post_count,
+            "local_agent_override": self.settings.local_agent_override,
+            "mode_source": self.settings.mode_source,
+            "override_reason": (
+                "LOCAL_REVIEW_MODE=agent"
+                if self.settings.local_agent_override
+                else "未配置 WEBSITE_BRAIN_*，本地开发默认使用 LOCAL_AGENT"
+                if self.settings.mode_source == "local_default"
+                else "显式 Website Brain 模式"
+            ),
         }
 
     @property
@@ -166,6 +191,7 @@ class WebsiteBrainProvider:
                 "- \"depth\": number or null\n"
                 "- \"height\": number or null\n"
                 "- \"dimension_unit\": string (in/cm/mm; empty if unknown)\n"
+                "- \"dimension_source\": one of OFFICIAL_STRUCTURED, OFFICIAL_PAGE, AI_ESTIMATED, UNKNOWN; use AI_ESTIMATED when the Website did not provide official dimensions\n"
                 "- \"confidence\": number 0..1\n"
                 "- \"reason_codes\": array of short uppercase codes\n"
                 "Use the source_name, source_brand, category_group, and source_dimensions in the evidence as authoritative "
@@ -285,7 +311,10 @@ class WebsiteBrainProvider:
         if explicit_control and visible_challenge:
             return {"access_state": "HUMAN_REQUIRED", "next_action": "WAIT_FOR_HUMAN", "confidence": 0.98,
                     "reason_codes": [code or "VISIBLE_CHALLENGE"], "summary": "页面存在可见且可操作的人机验证控件"}
-        if code in {"TEMPORARY_PAGE_FAILURE", "BROWSER_NAVIGATION_FAILED", "HTTP_500", "HTTP_502", "HTTP_503", "HTTP_504", "HTTP_522", "HTTP_524"}:
+        if code in {"HTTP_500", "HTTP_502", "HTTP_503", "HTTP_504", "HTTP_522", "HTTP_524"}:
+            return {"access_state": "ESCALATE_L2", "next_action": "ESCALATE_L2", "confidence": 0.92,
+                    "reason_codes": [code], "summary": "可重试的服务器响应保留同一会话并升级 L2"}
+        if code in {"TEMPORARY_PAGE_FAILURE", "BROWSER_NAVIGATION_FAILED"}:
             return {"access_state": "TEMPORARY_FAILURE", "next_action": "RETRY_SAME_SESSION", "confidence": 0.92,
                     "reason_codes": [code], "summary": "临时页面或导航故障，不等同于人机验证"}
         if stage in {"L0", "L1", "HTTP", "PREFLIGHT"}:

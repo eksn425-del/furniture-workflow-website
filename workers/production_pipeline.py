@@ -56,7 +56,7 @@ from packages.workflow_core.source_identity import normalize_identity_fields
 from packages.workflow_core.source_policy import resolve_source_policy
 from packages.workflow_core.statuses import ItemState
 from workers.modeling_provider import Lux3DClient, is_capacity_rejection
-from workers.blender_adapter import BlenderAdapterError, resolve_blender_adapter, validate_glb
+from workers.blender_adapter import BlenderAdapterError, ModelDimensionConflict, resolve_blender_adapter, validate_glb
 from workers.scrape.http_client import NetworkPolicyError, SafeHttpClient
 
 
@@ -143,6 +143,7 @@ def _candidate_from_product(contract: dict[str, Any], product: AcquiredProduct) 
             "image_url": product.image_url,
             "source_dimensions": product.dimensions,
             "dimension_unit": product.dimension_unit,
+            "dimension_source": str(evidence.get("dimension_source") or "UNKNOWN"),
             "capture_evidence": product.evidence,
             "acquisition": product.acquisition,
             "identity_fields": identity_fields,
@@ -405,15 +406,25 @@ class WebsiteStageAdapter:
         return StageOutcome(StageDecision.ACCEPTED, "DATE_POLICY_NOT_RESTRICTED", {"date_policy": "SOURCE_CURRENT_PUBLIC_CATALOG"})
 
     def _stage_dimension(self, candidate: CandidateRecord) -> StageOutcome:
+        axes = ("width", "depth", "height")
         values = candidate.lineage.get("source_dimensions") or {}
-        source = "SOURCE_EXPLICIT"
-        if not all(values.get(axis) for axis in ("width", "depth", "height")):
-            decision = candidate.lineage.get("brain_product_decision") or {}
-            values = {axis: decision.get(axis) for axis in ("width", "depth", "height")}
-            source = "WEBSITE_BRAIN"
-        if not all(values.get(axis) for axis in ("width", "depth", "height")):
-            # 页面/Brain 都没有尺寸：用同一 L2 可见会话打开详情页，
-            # 展开 Dimensions 标签自动抓官方尺寸，避免人工手动注入。
+        source_hint = str(candidate.lineage.get("dimension_source") or "").strip().upper()
+        source_aliases = {
+            "EXPLICIT_PAGE_TEXT": "OFFICIAL_PAGE",
+            "L2_BROWSER_DIMENSIONS_TAB": "OFFICIAL_PAGE",
+            "L2_BROWSER_DIMENSIONS": "OFFICIAL_PAGE",
+            "GRAPHQL_DESCRIPTION": "OFFICIAL_PAGE",
+            "GRAPHQL_STRUCTURED": "OFFICIAL_STRUCTURED",
+            "EXPLICIT_STRUCTURED": "OFFICIAL_STRUCTURED",
+            "SOURCE_EXPLICIT": "OFFICIAL_PAGE",
+        }
+        source = source_aliases.get(source_hint, source_hint if source_hint in {"OFFICIAL_STRUCTURED", "OFFICIAL_PAGE"} else "")
+        if all(values.get(axis) for axis in axes):
+            source = source or "OFFICIAL_PAGE"
+        else:
+            # L1/HTML evidence may omit an accordion's Dimensions block.  Give
+            # the same bounded L2 session one chance to obtain official values
+            # before accepting any Brain estimate.
             browser_dims: dict[str, float] = {}
             browser_unit = ""
             try:
@@ -423,15 +434,33 @@ class WebsiteStageAdapter:
                 return StageOutcome(StageDecision.PENDING, "DIMENSIONS_BROWSER_HUMAN_REQUIRED")
             except BrowserRuntimeMissing:
                 browser_dims, browser_unit = {}, ""
-            if all(browser_dims.get(axis) for axis in ("width", "depth", "height")):
-                values = {axis: browser_dims[axis] for axis in ("width", "depth", "height")}
-                source = "L2_BROWSER_DIMENSIONS"
-                candidate.lineage.setdefault("dimension_unit", browser_unit or "source_unit")
+            if all(browser_dims.get(axis) for axis in axes):
+                values = {axis: browser_dims[axis] for axis in axes}
+                source = "OFFICIAL_PAGE"
+                candidate.lineage["dimension_source_detail"] = "L2_BROWSER_DIMENSIONS_TAB"
+                candidate.lineage["dimension_unit"] = browser_unit or candidate.lineage.get("dimension_unit") or "source_unit"
+
+        if not all(values.get(axis) for axis in axes):
+            decision = candidate.lineage.get("brain_product_decision") or {}
+            estimated_values = {axis: decision.get(axis) for axis in axes}
+            if all(estimated_values.get(axis) for axis in axes):
+                values = estimated_values
+                source = "AI_ESTIMATED"
+                candidate.lineage["dimension_source_detail"] = "BRAIN_DECISION_AFTER_OFFICIAL_LOOKUP"
+                if decision.get("dimension_unit"):
+                    candidate.lineage["dimension_unit"] = decision.get("dimension_unit")
         try:
             governed = govern_dimensions(values)
         except ValueError:
             return StageOutcome(StageDecision.REJECTED, "DIMENSIONS_MISSING_OR_INVALID")
-        evidence = {"dimensions": governed, "dimension_source": source, "dimension_unit": candidate.lineage.get("dimension_unit") or "source_unit"}
+        target_dimensions = dict(governed)
+        evidence = {
+            "dimensions": governed,
+            "target_dimensions": target_dimensions,
+            "dimension_source": source or "UNKNOWN",
+            "dimension_unit": candidate.lineage.get("dimension_unit") or "source_unit",
+            "dimension_source_detail": candidate.lineage.get("dimension_source_detail") or source,
+        }
         self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
         return StageOutcome(StageDecision.ACCEPTED, "DIMENSIONS_READY", evidence)
 
@@ -537,6 +566,9 @@ class WebsiteStageAdapter:
             "product_name": current.product_name,
             "category_group": current.category_group,
             "dimensions": current.lineage.get("dimensions"),
+            "target_dimensions": current.lineage.get("target_dimensions") or current.lineage.get("dimensions"),
+            "dimension_source": current.lineage.get("dimension_source") or "UNKNOWN",
+            "dimension_unit": current.lineage.get("dimension_unit") or "source_unit",
             "media_sha256": current.lineage.get("media_sha256"),
             "identity_fields": current.lineage.get("identity_fields") or {},
             "media_binding_status": current.lineage.get("media_binding_status") or "UNKNOWN",
@@ -554,6 +586,9 @@ class WebsiteStageAdapter:
             "candidate_id": current.candidate_id,
             "image_sha256": current.lineage.get("media_sha256"),
             "dimensions": current.lineage.get("dimensions"),
+            "target_dimensions": current.lineage.get("target_dimensions") or current.lineage.get("dimensions"),
+            "dimension_source": current.lineage.get("dimension_source") or "UNKNOWN",
+            "dimension_unit": current.lineage.get("dimension_unit") or "source_unit",
             "product_name": current.product_name,
             "catalog_lock_hash": current.lineage.get("catalog_lock_hash"),
             "provider": self.contract.get("provider"),
@@ -755,7 +790,20 @@ class WebsiteStageAdapter:
                 return StageOutcome(StageDecision.HARD_STOP, "BLENDER_NOT_CONFIGURED")
             normalized_target = self.model_root / "normalized" / target.name
             try:
-                qa = self.blender_adapter.normalize_and_qa(target, normalized_target)
+                current = next(item for item in self.pool.records() if item.candidate_id == candidate.candidate_id)
+                qa = self.blender_adapter.normalize_and_qa(
+                    target,
+                    normalized_target,
+                    target_dimensions=current.lineage.get("target_dimensions") or current.lineage.get("dimensions"),
+                    dimension_unit=current.lineage.get("dimension_unit") or "source_unit",
+                )
+            except ModelDimensionConflict as error:
+                ledger.status = ledger.checkpoint_state = "MODEL_DIMENSION_CONFLICT"
+                ledger.error_code = "MODEL_DIMENSION_CONFLICT"
+                ledger.error_message = str(error)[:1000]
+                ledger.finished_at = utc_now()
+                session.commit()
+                return StageOutcome(StageDecision.REJECTED, f"MODEL_DIMENSION_CONFLICT:{error}")
             except BlenderAdapterError as error:
                 ledger.status = ledger.checkpoint_state = "BLENDER_QA_FAILED"
                 ledger.error_code = "BLENDER_QA_FAILED"
@@ -1189,6 +1237,9 @@ class ProductionPipeline:
                 "raw_glb_path": str(raw_source),
                 "raw_glb_sha256": item.raw_glb_sha256,
                 "normalized_glb_path": str(normalized_source),
+                "target_dimensions": item.lineage.get("target_dimensions") or item.lineage.get("dimensions") or {},
+                "dimension_source": item.lineage.get("dimension_source") or "UNKNOWN",
+                "dimension_unit": item.lineage.get("dimension_unit") or "source_unit",
                 "blender_qa": item.lineage.get("blender_qa") or {},
             })
         requested = requested_target or target

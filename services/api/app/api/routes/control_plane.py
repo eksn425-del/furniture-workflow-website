@@ -45,6 +45,7 @@ from app.models import (
 from app.schemas import CompanyTestSiteRequest, ControlJobApproval, ControlJobCreate, ControlJobEdit, ControlJobStart, ControlJobTargetPatch, HumanReviewAction, LocalAgentProductReviewRequest
 from app.services.brain_provider import BrainError, BrainNotConfigured
 from app.services.native_contracts import BrainProductDecision
+from app.services.runtime_diagnostics import collect_runtime_diagnostics
 from packages.workflow_core.candidate_pool import CandidatePoolError, CandidatePoolStore
 from packages.workflow_core.statuses import ItemState
 
@@ -547,7 +548,11 @@ def get_control_job(job_id: str, request: Request) -> dict:
                             "production_gate_reasons": lineage.get("production_gate_reasons") or [],
                             "review_provider": lineage.get("review_provider"),
                             "media_binding_status": lineage.get("media_binding_status"),
+                            "target_dimensions": lineage.get("target_dimensions") or lineage.get("dimensions") or {},
+                            "dimension_source": lineage.get("dimension_source") or "UNKNOWN",
+                            "dimension_unit": lineage.get("dimension_unit") or "source_unit",
                             "blender_qa_status": lineage.get("blender_qa_status"),
+                            "blender_qa": lineage.get("blender_qa") or {},
                             "identity_conflicts": lineage.get("identity_conflicts") or [],
                         })
                     candidate_pool = {"path": str(pool_path), "job_status": raw_pool.get("job_status"), "target_count": raw_pool.get("target_count"), "state_counts": states, "items": summaries, "updated_at": raw_pool.get("updated_at")}
@@ -907,8 +912,12 @@ def act_on_review(review_id: str, payload: HumanReviewAction, request: Request) 
 @router.get("/system")
 def system_status(request: Request) -> dict:
     brain_status = request.app.state.website_brain.health()
+    diagnostics = collect_runtime_diagnostics(request.app.state.database, request.app.state.website_brain)
+    database_status = str((diagnostics.get("database") or {}).get("status") or "ERROR")
+    production_worker_status = str((diagnostics.get("production_worker") or {}).get("status") or "READY")
+    site_scan_worker_status = str((diagnostics.get("site_scan_worker") or {}).get("status") or "READY")
     return {
-        "schema_version": "website-system-status.v2",
+        "schema_version": "website-system-status.v3",
         "website_brain": brain_status,
         "skills": {
             "runtime_mode": "frozen-reference-only",
@@ -916,13 +925,20 @@ def system_status(request: Request) -> dict:
             "bundled": False,
             "doctor": {"status": "NOT_REQUIRED", "modified_files": 0},
         },
-        "provider": {"status": "OFF_BY_DEFAULT", "provider_calls": 0, "safety_gate": "RECEIPT_REQUIRED"},
-        "database": {"engine": "sqlite-dev-or-configured", "status": "READY"},
+        "provider": {"status": "OFF_BY_DEFAULT", "provider_calls": brain_status.get("provider_posts", 0), "safety_gate": "RECEIPT_REQUIRED"},
+        "database": {"engine": "sqlite-dev-or-configured", "status": database_status},
         "object_storage": {"status": "NOT_CONFIGURED", "note": "Website 1.0 本地开发仍使用 OUTPUT_ROOT；生产对象存储需在部署环境配置。"},
-        "workers": {"scrape": "WEBSITE_NATIVE", "site_scan": "WEBSITE_NATIVE", "modeling": "RECEIPT_GATED", "qa": "RECEIPT_GATED"},
+        "workers": {"scrape": "WEBSITE_NATIVE", "site_scan": site_scan_worker_status, "modeling": "RECEIPT_GATED", "qa": "RECEIPT_GATED", "production": production_worker_status},
         "runtime_agent_dependency": "NONE",
         "native_runtime": {"entrypoint": "Website/workers/native_runtime.py", "provider_posts": 0},
         "feature_flags": {"website_brain_enabled": feature_flag("WEBSITE_BRAIN_ENABLED", default=True), "native_runtime": True},
+        "diagnostics": diagnostics,
+        # Stable top-level aliases make the matrix easy for a CLI/monitor to
+        # consume while the nested `diagnostics` object remains extensible.
+        "l2_browser": diagnostics["l2_browser"],
+        "lux3d": diagnostics["lux3d"],
+        "blender": diagnostics["blender"],
+        "production_worker": diagnostics["production_worker"],
     }
 
 
