@@ -40,7 +40,7 @@ Set-Location ../..
 python launch_website.py
 ```
 
-The launcher starts the API on `http://127.0.0.1:8000` and the Web UI on `http://127.0.0.1:3000`. It reads only non-secret routing values from `.env.local`; provider credentials are read by the API process when explicitly configured.
+The launcher starts the API on `http://127.0.0.1:8000` and the Web UI on `http://127.0.0.1:3000`. It reads an explicit allowlist of runtime values from the ignored `.env.local` and passes them to the child processes without printing them; values already present in the process environment take precedence. This includes private Brain/Lux3D credentials and local Blender settings, so they do not need to be pasted into chat or committed to Git.
 
 ### Deterministic end-to-end check
 

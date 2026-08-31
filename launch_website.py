@@ -6,7 +6,7 @@
   3. 等待两个服务就绪后自动用系统默认浏览器打开 http://127.0.0.1:3000
   4. 当前窗口实时显示两个服务的日志；关闭窗口或按 Ctrl+C 即停止服务
 
-依赖机器上已安装的 Python 与 Node 环境。本文件不读取或打印任何密钥。
+依赖机器上已安装的 Python 与 Node 环境。本文件只把本地白名单配置传给子进程，绝不打印密钥。
 """
 
 from __future__ import annotations
@@ -28,6 +28,47 @@ API_HEALTH_URL = f"http://127.0.0.1:{API_PORT}/api/v1/health"
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}/"
 WEBSITE_VERSION = "0.16.0"
 
+# .env.local is deliberately ignored by Git. Keep this list explicit so the
+# launcher never forwards arbitrary local variables (for example shell or
+# test switches) into a production-like run. Values already present in the
+# process environment take precedence over this file.
+LOCAL_ENV_KEYS = frozenset({
+    "APP_ENV",
+    "OUTPUT_ROOT",
+    "WORKFLOW_RELEASE_VERSION",
+    "DATABASE_URL",
+    "WEB_BASE_URL",
+    "LOCAL_REVIEW_MODE",
+    "WEBSITE_MODEL_MODE",
+    "LUNAMAX_MODEL_MODE",
+    "PROVIDER_MODE",
+    "WEBSITE_L2_BROWSER_ENGINE",
+    "WEBSITE_L2_NAVIGATION_TIMEOUT_MS",
+    "WEBSITE_BROWSER_HANDOFF_SECONDS",
+    "WEBSITE_L2_COUNT_PROBES",
+    "WEBSITE_BRAIN_API_KEY",
+    "WEBSITE_BRAIN_BASE_URL",
+    "WEBSITE_BRAIN_MODEL",
+    "WEBSITE_BRAIN_TIMEOUT_SECONDS",
+    "WEBSITE_BRAIN_MAX_RETRIES",
+    "WEBSITE_BRAIN_RPM_LIMIT",
+    "LUX3D_API_KEY",
+    "LUX3D_BASE_URL",
+    "LUX3D_VERSION",
+    "LUX3D_FACE_COUNT",
+    "LUX3D_QUERY_INTERVAL",
+    "LUX3D_QUERY_MAX_ATTEMPTS",
+    "MODELING_ENABLED",
+    "EXACT_COUNT_AUTHORIZATION",
+    "BLENDER_WORKER_ENABLED",
+    "BLENDER_EXECUTABLE",
+    "AUTO_MODEL_COST_CEILING_MINOR",
+    "MODEL_ESTIMATED_COST_PER_ITEM_MINOR",
+    "INTERNAL_SERVICE_TOKEN",
+    "INTRANET_AUTH_USER",
+    "INTRANET_AUTH_PASSWORD",
+})
+
 
 def app_root() -> Path:
     """定位 Website 项目根目录（含 services/api、apps/web）。"""
@@ -37,7 +78,7 @@ def app_root() -> Path:
 
 
 def load_env_values(root: Path) -> dict[str, str]:
-    """从 .env.local 读取非密钥的关键配置（OUTPUT_ROOT、WEB_BASE_URL）。"""
+    """从 .env.local 读取白名单配置；返回值不会被启动器打印。"""
     values: dict[str, str] = {}
     env_file = root / ".env.local"
     if not env_file.is_file():
@@ -49,8 +90,9 @@ def load_env_values(root: Path) -> dict[str, str]:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip()
-        # 只提取路径/URL 类配置，绝不提取任何 *_API_KEY / *_TOKEN 密钥
-        if key in {"OUTPUT_ROOT", "WEB_BASE_URL"} and value:
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key in LOCAL_ENV_KEYS and value:
             values[key] = value
     return values
 
@@ -148,14 +190,18 @@ def main() -> int:
 
     # 构建子进程环境
     env = dict(os.environ)
+    # Explicit process variables win; .env.local is a private, ignored local
+    # fallback for company machines that launch by double-clicking this file.
+    for key, value in env_values.items():
+        env.setdefault(key, value)
     env["PYTHONPATH"] = os.pathsep.join([
         str(root),
         str(root / "services" / "api"),
         str(root / "packages" / "workflow-engine" / "src"),
         env.get("PYTHONPATH", ""),
     ])
-    env["OUTPUT_ROOT"] = env_values.get("OUTPUT_ROOT", str(root.parent / "output" / "web_projects"))
-    env["WEB_BASE_URL"] = env_values.get("WEB_BASE_URL", f"http://localhost:{WEB_PORT}")
+    env["OUTPUT_ROOT"] = env.get("OUTPUT_ROOT") or str(root.parent / "output" / "web_projects")
+    env["WEB_BASE_URL"] = env.get("WEB_BASE_URL") or f"http://localhost:{WEB_PORT}"
     # Keep browser requests same-origin so embedded browsers and isolated
     # browser contexts can reach the API through Next's internal proxy. The
     # proxy forwards to the local API without exposing loopback assumptions to
