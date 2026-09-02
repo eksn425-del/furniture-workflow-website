@@ -163,6 +163,12 @@ def _policy(job: ProductionJob) -> dict:
 
 def _job_dict(job: ProductionJob) -> dict:
     target = job.target_value if job.target_mode != "ALL" else None
+    try:
+        approved_plan = json.loads(job.plan_json or "{}")
+        if not isinstance(approved_plan, dict):
+            approved_plan = {}
+    except (TypeError, ValueError):
+        approved_plan = {}
     return {
         "job_id": job.job_id,
         "title": job.title,
@@ -194,6 +200,7 @@ def _job_dict(job: ProductionJob) -> dict:
         "provider": job.provider,
         "provider_calls": job.provider_calls,
         "provider_safety": job.provider_safety,
+        "approved_provider_call_limit": approved_plan.get("approved_provider_call_limit"),
         "provider_qualification_version": job.provider_qualification_version,
         "candidate_pool_path": job.candidate_pool_path,
         "last_reason": job.last_reason,
@@ -793,6 +800,11 @@ def approve_job(job_id: str, payload: ControlJobApproval, request: Request) -> d
             if payload.approved_cost_ceiling_minor <= 0:
                 raise HTTPException(status_code=400, detail="Provider 非 OFF 时，审批必须填写大于 0 的成本上限（approved_cost_ceiling_minor）")
             provider = job.provider.casefold()
+            call_limit = payload.approved_provider_call_limit
+            if call_limit is None:
+                call_limit = int(job.target_value or job.requested_count or 0)
+            if call_limit <= 0:
+                raise HTTPException(status_code=400, detail="Provider 非 OFF 时必须审批大于 0 的硬调用次数上限（approved_provider_call_limit）")
             credential_configured = bool(os.getenv("LUX3D_API_KEY", "").strip())
             endpoint_configured = bool(os.getenv("LUX3D_BASE_URL", "").strip())
             qualification = {
@@ -808,6 +820,7 @@ def approve_job(job_id: str, payload: ControlJobApproval, request: Request) -> d
                     "provider_concurrency_bounded": True,
                     "provider_concurrency_max": 5,
                     "explicit_cost_authorization": True,
+                    "hard_provider_call_limit": True,
                 },
                 "provider_posts": 0,
             }
@@ -816,6 +829,7 @@ def approve_job(job_id: str, payload: ControlJobApproval, request: Request) -> d
                 "job_id": job.job_id,
                 "provider": provider,
                 "approved_cost_ceiling_minor": payload.approved_cost_ceiling_minor,
+                "approved_provider_call_limit": call_limit,
                 "actor": payload.actor,
                 "policy": _policy(job),
             }
@@ -848,8 +862,9 @@ def approve_job(job_id: str, payload: ControlJobApproval, request: Request) -> d
             job.status = "APPROVAL_RECORDED"
             job.current_stage = "PRODUCTION_PLAN"
             job.last_reason = "审批已记录；Provider 当前为 OFF，不会产生外部付费调用"
-        job.plan_json = json.dumps({"approved_cost_ceiling_minor": payload.approved_cost_ceiling_minor, "actor": payload.actor, "authorization_hash": authorization_hash if job.provider != "OFF" else None, "provider_calls": 0}, ensure_ascii=False)
-        _event(session, job, "APPROVAL_RECORDED", job.status, job.last_reason, {"actor": payload.actor, "provider_calls": 0})
+        approved_call_limit = call_limit if job.provider != "OFF" else 0
+        job.plan_json = json.dumps({"approved_cost_ceiling_minor": payload.approved_cost_ceiling_minor, "approved_provider_call_limit": approved_call_limit, "actor": payload.actor, "authorization_hash": authorization_hash if job.provider != "OFF" else None, "provider_calls": 0}, ensure_ascii=False)
+        _event(session, job, "APPROVAL_RECORDED", job.status, job.last_reason, {"actor": payload.actor, "approved_provider_call_limit": approved_call_limit, "provider_calls": 0})
         _audit(session, "APPROVE_PRODUCTION_PLAN", "production_job", job.job_id, actor=payload.actor, result=job.status)
         session.commit()
         return {"status": job.status, "provider_calls": 0, "job": _job_dict(job)}

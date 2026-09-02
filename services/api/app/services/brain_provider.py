@@ -40,6 +40,14 @@ class BrainRequestFailed(BrainError):
     code = "BRAIN_REQUEST_FAILED"
 
 
+class VisionProviderNotConfigured(BrainError):
+    code = "VISION_PROVIDER_NOT_CONFIGURED"
+
+
+class VisionInputRequired(BrainError):
+    code = "VISION_INPUT_REQUIRED"
+
+
 @dataclass(frozen=True, slots=True)
 class BrainSettings:
     api_key: str = ""
@@ -96,27 +104,90 @@ class BrainSettings:
         return self.model_mode == "LOCAL_AGENT"
 
 
+@dataclass(frozen=True, slots=True)
+class VisionSettings:
+    """Independent Vision endpoint used only by TEXT_BRAIN_PLUS_VISION.
+
+    Keep this namespace separate from Website Brain.  A text-capable Brain is
+    not evidence that a second model inspected the captured product image.
+    """
+
+    api_key: str = ""
+    base_url: str = ""
+    model: str = ""
+    timeout_seconds: float = 25.0
+    max_retries: int = 2
+    rpm_limit: int = 30
+
+    @classmethod
+    def from_environment(cls) -> "VisionSettings":
+        return cls(
+            api_key=os.getenv("WEBSITE_VISION_API_KEY", "").strip(),
+            base_url=os.getenv("WEBSITE_VISION_BASE_URL", "").strip().rstrip("/"),
+            model=os.getenv("WEBSITE_VISION_MODEL", "").strip(),
+            timeout_seconds=max(1.0, min(float(os.getenv("WEBSITE_VISION_TIMEOUT_SECONDS", "25")), 120.0)),
+            max_retries=max(0, min(int(os.getenv("WEBSITE_VISION_MAX_RETRIES", "2")), 3)),
+            rpm_limit=max(1, min(int(os.getenv("WEBSITE_VISION_RPM_LIMIT", "30")), 600)),
+        )
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key and self.base_url and self.model)
+
+
 T = TypeVar("T", bound=BaseModel)
 
 
 class WebsiteBrainProvider:
     """A strict, receipt-friendly, OpenAI-compatible Website Brain client."""
 
-    def __init__(self, settings: BrainSettings | None = None, *, session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        settings: BrainSettings | None = None,
+        *,
+        session: requests.Session | None = None,
+        vision_settings: VisionSettings | None = None,
+        vision_session: requests.Session | None = None,
+    ) -> None:
         self.settings = settings or BrainSettings.from_environment()
         self.session = session or requests.Session()
+        self.vision_settings = vision_settings or VisionSettings.from_environment()
+        self.vision_session = vision_session or requests.Session()
         self.post_count = 0
+        self.vision_post_count = 0
         self._last_post_at = 0.0
 
     def health(self) -> dict[str, object]:
+        vision_required = self.settings.model_mode == "TEXT_BRAIN_PLUS_VISION"
+        operational = self.settings.local_agent_mode or (
+            self.settings.configured and (not vision_required or self.vision_settings.configured)
+        )
+        if self.settings.local_agent_mode:
+            status = "LOCAL_AGENT_READY"
+        elif not self.settings.configured:
+            status = BrainNotConfigured.code
+        elif vision_required and not self.vision_settings.configured:
+            status = VisionProviderNotConfigured.code
+        else:
+            status = "READY"
         return {
-            "status": "LOCAL_AGENT_READY" if self.settings.local_agent_mode else "READY" if self.settings.configured else BrainNotConfigured.code,
+            "status": status,
             "configured": self.settings.configured,
+            "operational": operational,
             "model": self.settings.model if self.settings.configured else None,
             "namespace": "WEBSITE_BRAIN_*",
             "model_mode": self.settings.model_mode,
             "review_provider": self.review_provider,
             "provider_posts": self.post_count,
+            "vision_configured": self.vision_settings.configured,
+            "vision_provider_posts": self.vision_post_count,
+            "vision_input": (
+                "LOCAL_AGENT_EXPLICIT_REVIEW"
+                if self.settings.local_agent_mode
+                else "IMAGE_URL_IN_BRAIN_REQUEST"
+                if self.settings.model_mode == "MULTIMODAL_SINGLE_MODEL"
+                else "INDEPENDENT_VISION_RECEIPT"
+            ),
             "local_agent_override": self.settings.local_agent_override,
             "mode_source": self.settings.mode_source,
             "override_reason": (
@@ -173,8 +244,7 @@ class WebsiteBrainProvider:
         )
 
     def reason_product(self, *, source_url: str, evidence: dict[str, object]) -> tuple[BrainProductDecision, dict[str, object]]:
-        return self.reason(
-            prompt=(
+        prompt = (
                 "Evaluate one furniture product candidate from explicit Website evidence. Return JSON ONLY and match the "
                 "exact schema below; do not add or rename fields and do not wrap in markdown.\n"
                 "Required JSON object fields:\n"
@@ -196,10 +266,83 @@ class WebsiteBrainProvider:
                 "- \"reason_codes\": array of short uppercase codes\n"
                 "Use the source_name, source_brand, category_group, and source_dimensions in the evidence as authoritative "
                 "facts. reason_codes must be short codes, not private reasoning."
-            ),
+        )
+        media_sha256 = str(evidence.get("media_sha256") or "").strip().casefold()
+        image_url = str(evidence.get("selected_media_url") or evidence.get("image_url") or "").strip()
+        if self.settings.model_mode == "TEXT_BRAIN_PLUS_VISION" and not self.settings.local_agent_mode:
+            if not self.vision_settings.configured:
+                raise VisionProviderNotConfigured(
+                    "TEXT_BRAIN_PLUS_VISION requires WEBSITE_VISION_API_KEY/BASE_URL/MODEL and an independent receipt"
+                )
+            if not image_url or not media_sha256:
+                raise VisionInputRequired("A captured image URL and media_sha256 are required for visual review")
+            vision_provider = WebsiteBrainProvider(
+                BrainSettings(
+                    api_key=self.vision_settings.api_key,
+                    base_url=self.vision_settings.base_url,
+                    model=self.vision_settings.model,
+                    timeout_seconds=self.vision_settings.timeout_seconds,
+                    max_retries=self.vision_settings.max_retries,
+                    rpm_limit=self.vision_settings.rpm_limit,
+                    model_mode="MULTIMODAL_SINGLE_MODEL",
+                    mode_source="independent_vision_provider",
+                ),
+                session=self.vision_session,
+                vision_settings=self.vision_settings,
+                vision_session=self.vision_session,
+            )
+            vision_decision, vision_receipt = vision_provider.reason(
+                prompt=prompt,
+                input_payload={"source_url": source_url, "evidence": evidence},
+                schema=BrainProductDecision,
+            )
+            self.vision_post_count += vision_provider.post_count
+            augmented = dict(evidence)
+            augmented["independent_vision_decision"] = vision_decision.model_dump(mode="json")
+            decision, metadata = self.reason(
+                prompt=prompt + " Use independent_vision_decision as the authoritative visual evidence; do not claim you saw the image.",
+                input_payload={"source_url": source_url, "evidence": augmented},
+                schema=BrainProductDecision,
+            )
+            merged = decision.model_copy(update={
+                "eligible": bool(decision.eligible and vision_decision.eligible),
+                "single_product": bool(decision.single_product and vision_decision.single_product),
+                "background_ok": bool(decision.background_ok and vision_decision.background_ok),
+                "image_to_3d_suitable": bool(decision.image_to_3d_suitable and vision_decision.image_to_3d_suitable),
+                "confidence": min(decision.confidence, vision_decision.confidence),
+                "source_image_vision_consistent": bool(
+                    decision.source_image_vision_consistent is not False
+                    and vision_decision.source_image_vision_consistent is not False
+                ),
+                "reviewed_media_sha256": media_sha256,
+                "reason_codes": list(dict.fromkeys([*vision_decision.reason_codes, *decision.reason_codes]))[:16],
+            })
+            metadata.update({
+                "review_provider": "TEXT_BRAIN_PLUS_VISION",
+                "vision_input": "IMAGE_URL",
+                "visual_input_included": True,
+                "reviewed_media_sha256": media_sha256,
+                "independent_vision_receipt": {
+                    "status": vision_receipt.get("status"),
+                    "model_mode": vision_receipt.get("model_mode"),
+                    "model": vision_receipt.get("model"),
+                    "input_hash": vision_receipt.get("input_hash"),
+                    "reviewed_media_sha256": media_sha256,
+                    "visual_input_included": True,
+                },
+            })
+            return merged, metadata
+        decision, metadata = self.reason(
+            prompt=prompt,
             input_payload={"source_url": source_url, "evidence": evidence},
             schema=BrainProductDecision,
         )
+        if self.settings.model_mode == "MULTIMODAL_SINGLE_MODEL" and not self.settings.local_agent_mode:
+            decision = decision.model_copy(update={
+                "reviewed_media_sha256": media_sha256,
+                "source_image_vision_consistent": decision.source_image_vision_consistent is not False,
+            })
+        return decision, metadata
 
     def reason(self, *, prompt: str, input_payload: dict[str, object], schema: type[T]) -> tuple[T, dict[str, object]]:
         if self.settings.local_agent_mode:
@@ -219,6 +362,12 @@ class WebsiteBrainProvider:
             }
         if not self.settings.configured:
             raise BrainNotConfigured("WEBSITE_BRAIN_API_KEY/BASE_URL/MODEL are required")
+        evidence = self._evidence(input_payload)
+        visual_request = schema is BrainProductDecision and self.settings.model_mode == "MULTIMODAL_SINGLE_MODEL"
+        visual_url = str(evidence.get("selected_media_url") or evidence.get("image_url") or "").strip()
+        media_sha256 = str(evidence.get("media_sha256") or "").strip().casefold()
+        if visual_request and (not visual_url or not media_sha256):
+            raise VisionInputRequired("MULTIMODAL_SINGLE_MODEL requires image_url and media_sha256")
         request_body = {
             "model": self.settings.model,
             "temperature": 0,
@@ -266,7 +415,7 @@ class WebsiteBrainProvider:
                 validated = schema.model_validate(parsed)
             except (ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError, ValidationError) as error:
                 raise BrainInvalidSchema("Website Brain response did not match the required JSON schema") from error
-            return validated, {
+            metadata = {
                 "status": "READY",
                 "review_provider": self.review_provider,
                 "model_mode": self.settings.model_mode,
@@ -275,6 +424,13 @@ class WebsiteBrainProvider:
                 "input_hash": hashlib.sha256(json.dumps(input_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
                 "provider_posts": self.post_count,
             }
+            if visual_request:
+                metadata.update({
+                    "vision_input": "IMAGE_URL",
+                    "visual_input_included": True,
+                    "reviewed_media_sha256": media_sha256,
+                })
+            return validated, metadata
         raise last_error or BrainRequestFailed("Website Brain request failed")
 
     @staticmethod
@@ -377,5 +533,6 @@ class WebsiteBrainProvider:
 __all__ = [
     "MODEL_MODES",
     "BrainAccessDecision", "BrainError", "BrainInvalidSchema", "BrainNotConfigured", "BrainRateLimited",
-    "BrainRequestFailed", "BrainSettings", "BrainTimeout", "WebsiteBrainProvider",
+    "BrainRequestFailed", "BrainSettings", "BrainTimeout", "VisionInputRequired",
+    "VisionProviderNotConfigured", "VisionSettings", "WebsiteBrainProvider",
 ]

@@ -48,6 +48,7 @@ export interface ControlJob {
   provider: string;
   provider_calls: number;
   provider_safety: string;
+  approved_provider_call_limit?: number | null;
   last_reason: string | null;
   policy: Record<string, unknown>;
   run?: ProductionRun | null;
@@ -131,7 +132,7 @@ export interface ControlOverview {
 export interface SystemStatus {
   schema_version: string;
   skills: { runtime_mode: string; root_configured: boolean; bundled: boolean; doctor: Record<string, unknown> };
-  website_brain: { status: string; configured: boolean; model: string | null; namespace: string; provider_posts: number; model_mode?: string; review_provider?: string; local_agent_override?: boolean; mode_source?: string; override_reason?: string };
+  website_brain: { status: string; configured: boolean; model: string | null; namespace: string; provider_posts: number; model_mode?: string; review_provider?: string; local_agent_override?: boolean; mode_source?: string; override_reason?: string; vision_input?: string; vision_configured?: boolean };
   provider: { status: string; provider_calls: number; safety_gate: string };
   database: { engine: string; status: string };
   object_storage: { status: string; note: string };
@@ -142,7 +143,7 @@ export interface SystemStatus {
     api?: { status: string; reason_code?: string };
     database?: { status: string; engine?: string };
     l2_browser?: { status: string; engine?: string; mode?: string; reason_code?: string };
-    brain?: { status: string; effective_mode?: string; configured?: boolean; review_provider?: string };
+    brain?: { status: string; effective_mode?: string; effective_mode_source?: string; configured?: boolean; review_provider?: string; vision_input?: string; vision_configured?: boolean };
     brain_override?: { status: string; reason?: string };
     lux3d?: { status: string; reason_code?: string };
     blender?: { status: string; reason_code?: string };
@@ -343,7 +344,7 @@ export function updateControlTarget(jobId: string, input: { action: "ADD_CATEGOR
   });
 }
 
-export function approveControlJob(jobId: string, input: { confirm: boolean; approved_cost_ceiling_minor: number; actor: string }): Promise<{ status: string; provider_calls: number; job: ControlJob }> {
+export function approveControlJob(jobId: string, input: { confirm: boolean; approved_cost_ceiling_minor: number; approved_provider_call_limit?: number; actor: string }): Promise<{ status: string; provider_calls: number; job: ControlJob }> {
   return request(`/jobs/${encodeURIComponent(jobId)}/approve`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

@@ -9,6 +9,9 @@ def test_launcher_loads_allowlisted_private_runtime_values_without_arbitrary_key
             (
                 "LUX3D_API_KEY" + "=fixture-secret-never-printed",
                 "LUX3D_BASE_URL='https://provider.example.test'",
+                "WEBSITE_VISION_API_KEY=fixture-vision-secret",
+                "WEBSITE_VISION_BASE_URL=https://vision.example.test/v1",
+                "WEBSITE_VISION_MODEL=vision-model",
                 "BLENDER_WORKER_ENABLED=true",
                 "BLENDER_EXECUTABLE=blender.exe",
                 "OUTPUT_ROOT=./private-output",
@@ -23,6 +26,9 @@ def test_launcher_loads_allowlisted_private_runtime_values_without_arbitrary_key
 
     assert values["LUX3D_API_KEY"] == "fixture-secret-never-printed"
     assert values["LUX3D_BASE_URL"] == "https://provider.example.test"
+    assert values["WEBSITE_VISION_API_KEY"] == "fixture-vision-secret"
+    assert values["WEBSITE_VISION_BASE_URL"] == "https://vision.example.test/v1"
+    assert values["WEBSITE_VISION_MODEL"] == "vision-model"
     assert values["BLENDER_WORKER_ENABLED"] == "true"
     assert values["BLENDER_EXECUTABLE"] == "blender.exe"
     assert values["OUTPUT_ROOT"] == "./private-output"

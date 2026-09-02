@@ -19,8 +19,10 @@ from app.models import ProductionProviderTask, ProductionRegistryEntry, utc_now
 from app.services.brain_provider import BrainError, BrainNotConfigured, WebsiteBrainProvider
 from app.services.product_acquisition import (
     AcquiredProduct,
+    BrowserAccessDenied,
     BrowserHumanRequired,
     BrowserRuntimeMissing,
+    BrowserTemporaryFailure,
     NativeBrowserCollector,
     ProductAcquisitionEngine,
     ProductAcquisitionError,
@@ -444,6 +446,14 @@ class WebsiteStageAdapter:
         consistency = decision.get("source_image_vision_consistent")
         reviewed_hash = str(decision.get("reviewed_media_sha256") or "")
         media_hash = str(candidate.lineage.get("media_sha256") or "")
+        review_mode = str((receipt or {}).get("model_mode") or "")
+        if review_mode in {"MULTIMODAL_SINGLE_MODEL", "TEXT_BRAIN_PLUS_VISION"}:
+            visual_input_included = bool((receipt or {}).get("visual_input_included"))
+            independent_receipt = (receipt or {}).get("independent_vision_receipt")
+            if not visual_input_included or not reviewed_hash or reviewed_hash != media_hash:
+                return StageOutcome(StageDecision.PENDING, "VISION_RECEIPT_INVALID_OR_MEDIA_HASH_MISMATCH")
+            if review_mode == "TEXT_BRAIN_PLUS_VISION" and not isinstance(independent_receipt, dict):
+                return StageOutcome(StageDecision.PENDING, "VISION_PROVIDER_NOT_CONFIGURED")
         if consistency is False or (reviewed_hash and media_hash and reviewed_hash != media_hash):
             self.pool.enrich_candidate(candidate.candidate_id, lineage={
                 "visual_review_status": "REJECTED",
@@ -456,7 +466,7 @@ class WebsiteStageAdapter:
             "visual_confidence": confidence,
             "visual_reason_codes": decision.get("reason_codes") or [],
             "review_provider": review_provider,
-            "review_mode": str((receipt or {}).get("model_mode") or ("LOCAL_AGENT" if review_provider == "LOCAL_AGENT" else "TEXT_BRAIN_PLUS_VISION")),
+            "review_mode": review_mode or ("LOCAL_AGENT" if review_provider == "LOCAL_AGENT" else "TEXT_BRAIN_PLUS_VISION"),
             "reviewed_media_sha256": reviewed_hash or media_hash,
             "source_image_vision_consistent": True if consistency is None else bool(consistency),
             "visual_style": decision.get("style") or "",
@@ -528,6 +538,18 @@ class WebsiteStageAdapter:
                         "dimension_access_url": error.url,
                     },
                 )
+            except BrowserTemporaryFailure as error:
+                return StageOutcome(StageDecision.PENDING, error.reason_code, {
+                    "dimension_access_status": "TEMPORARY_FAILURE",
+                    "dimension_access_reason": error.reason_code,
+                    "dimension_access_url": error.url,
+                })
+            except BrowserAccessDenied as error:
+                return StageOutcome(StageDecision.PENDING, error.code, {
+                    "dimension_access_status": "ACCESS_CHANGE_REQUIRED",
+                    "dimension_access_reason": error.reason_code,
+                    "dimension_access_url": error.url,
+                })
             except BrowserRuntimeMissing:
                 raise
             if all(browser_dims.get(axis) for axis in axes):
@@ -789,6 +811,25 @@ class WebsiteStageAdapter:
             "provider_idempotency_key": idempotency_key,
         }
 
+    def _approved_provider_call_limit(self) -> int:
+        plan = self.contract.get("approved_plan")
+        raw = plan.get("approved_provider_call_limit") if isinstance(plan, dict) else None
+        if raw in (None, ""):
+            # Backward-compatible safe default for pre-hardening Exact-N Jobs.
+            raw = self.contract.get("target_value")
+        try:
+            return max(0, int(raw or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _provider_slot_reserved(ledger: ProductionProviderTask) -> bool:
+        return bool(
+            ledger.provider_task_id
+            or ledger.status in {"CREATE_IN_FLIGHT", "SUBMISSION_UNKNOWN"}
+            or ledger.checkpoint_state in {"CREATE_IN_FLIGHT", "SUBMISSION_UNKNOWN"}
+        )
+
     def _stage_submit(self, candidate: CandidateRecord) -> StageOutcome:
         provider = str(self.contract.get("provider") or "OFF").casefold()
         if provider == "off" or self.provider_client is None:
@@ -820,6 +861,18 @@ class WebsiteStageAdapter:
                 ledger.error_message = "create POST may have reached Provider; manual reconciliation required"
                 session.commit()
                 return StageOutcome(StageDecision.HARD_STOP, "SUBMISSION_UNKNOWN: existing ambiguous create checkpoint")
+            call_limit = self._approved_provider_call_limit()
+            ledgers = list(session.scalars(select(ProductionProviderTask).where(
+                ProductionProviderTask.job_id == self.contract["job_id"],
+            )))
+            reserved_calls = sum(self._provider_slot_reserved(item) for item in ledgers)
+            imminent = 0 if ledger is not None and self._provider_slot_reserved(ledger) else 1
+            if call_limit <= 0 or reserved_calls + imminent > call_limit:
+                return StageOutcome(StageDecision.HARD_STOP, "PROVIDER_CALL_LIMIT_REACHED", {
+                    "approved_provider_call_limit": call_limit,
+                    "reserved_provider_calls": reserved_calls,
+                    "imminent_provider_calls": imminent,
+                })
             if ledger is None:
                 ledger = ProductionProviderTask(
                     ledger_id=f"ledger_{uuid4().hex}",

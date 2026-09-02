@@ -14,7 +14,14 @@ from uuid import uuid4
 
 from app.services.brain_provider import BrainError, BrainNotConfigured, WebsiteBrainProvider
 from app.services.native_contracts import BrainTaxonomyResponse, TaxonomyCategoryContract, TaxonomyReceipt
-from app.services.product_acquisition import BrowserHumanRequired, BrowserRuntimeMissing, NativeBrowserCollector, classify_source_type
+from app.services.product_acquisition import (
+    BrowserAccessDenied,
+    BrowserHumanRequired,
+    BrowserRuntimeMissing,
+    BrowserTemporaryFailure,
+    NativeBrowserCollector,
+    classify_source_type,
+)
 
 import requests
 
@@ -504,7 +511,7 @@ class NativeSiteAnalyzer:
                         html = by_url.get(category.source_url.rstrip("/").casefold())
                         if html is not None and category.count_kind == "UNKNOWN":
                             self._enrich_count(category, html)
-                except BrowserHumanRequired as error:
+                except (BrowserHumanRequired, BrowserTemporaryFailure, BrowserAccessDenied) as error:
                     # Keep the taxonomy already acquired from the accessible
                     # entry page.  The operator can resume the same scan to
                     # complete bounded count probing after the challenge.
@@ -559,6 +566,30 @@ class NativeSiteAnalyzer:
                 status=status,
                 categories=[],
                 evidence={"acquisition": "L2_BROWSER", "browser_session_dir": str(error.session_dir), "current_url": error.url, "access_evidence": error.evidence},
+                blocker=blocker,
+                brain=access_brain,
+            )
+        except BrowserTemporaryFailure as error:
+            status, blocker, access_brain = self._access_decision(normalized, stage="L2", reason_code=error.reason_code, evidence=error.evidence)
+            receipt = self._receipt(
+                normalized,
+                site_key,
+                live=True,
+                status=status,
+                categories=[],
+                evidence={"acquisition": "L2_BROWSER", "current_url": error.url, "access_evidence": error.evidence},
+                blocker=blocker,
+                brain=access_brain,
+            )
+        except BrowserAccessDenied as error:
+            status, blocker, access_brain = self._access_decision(normalized, stage="L2", reason_code=error.reason_code, evidence=error.evidence)
+            receipt = self._receipt(
+                normalized,
+                site_key,
+                live=True,
+                status=status,
+                categories=[],
+                evidence={"acquisition": "L2_BROWSER", "current_url": error.url, "access_evidence": error.evidence},
                 blocker=blocker,
                 brain=access_brain,
             )

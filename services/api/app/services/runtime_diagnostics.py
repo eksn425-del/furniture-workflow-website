@@ -165,16 +165,20 @@ def collect_runtime_diagnostics(database: Any, brain: Any) -> dict[str, object]:
 
     brain_health = dict(brain.health())
     effective_mode = str(brain_health.get("model_mode") or "TEXT_BRAIN_PLUS_VISION")
+    brain_status = str(brain_health.get("status") or "BRAIN_NOT_CONFIGURED")
     production_worker, site_scan_worker = _queue_diagnostic(database)
     return {
         "api": {"status": "READY", "reason_code": "CONTROL_PLANE_RESPONDED"},
         "database": _database_diagnostic(database),
         "l2_browser": browser_diagnostic(),
         "brain": {
-            "status": "LOCAL_AGENT" if effective_mode == "LOCAL_AGENT" else "READY" if brain_health.get("configured") else "NOT_CONFIGURED",
+            "status": "LOCAL_AGENT" if effective_mode == "LOCAL_AGENT" else brain_status,
             "effective_mode": effective_mode,
+            "effective_mode_source": brain_health.get("mode_source"),
             "configured": bool(brain_health.get("configured")),
             "review_provider": brain_health.get("review_provider"),
+            "vision_input": brain_health.get("vision_input"),
+            "vision_configured": bool(brain_health.get("vision_configured")),
         },
         "brain_override": {
             "status": "ON" if brain_health.get("local_agent_override") else "OFF",

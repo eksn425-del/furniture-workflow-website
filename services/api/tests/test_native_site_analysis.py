@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from app.services.brain_provider import BrainSettings, WebsiteBrainProvider
 from app.services.native_contracts import TaxonomyCategoryContract
 from app.services.native_site_analysis import NativeSiteAnalyzer
-from app.services.product_acquisition import NativeBrowserCollector
+from app.services.product_acquisition import BrowserAccessDenied, BrowserTemporaryFailure, NativeBrowserCollector
 from workers.scrape.http_client import AccessControlDetected, HttpStatusError, RobotsDenied, SafeHttpClient
 
 
@@ -265,6 +267,45 @@ def test_hidden_challenge_widget_does_not_pause_visible_browser() -> None:
             return Locator(body=selector == "body")
     evidence = NativeBrowserCollector._visible_access_evidence(Page())
     assert evidence["explicit_challenge_control"] is False
+
+
+def test_static_access_denied_without_control_is_not_human_required(tmp_path: Path) -> None:
+    collector = NativeBrowserCollector(tmp_path / "browser")
+
+    class Page:
+        pass
+
+    collector._visible_access_evidence = lambda _: {  # type: ignore[method-assign]
+        "temporary_failure": False,
+        "access_denied": True,
+        "explicit_challenge_control": False,
+        "visible_challenge_text": False,
+    }
+    with pytest.raises(BrowserAccessDenied) as caught:
+        collector._resolve_challenge(Page(), "https://example.test", headless=True)
+    assert caught.value.code == "ACCESS_CHANGE_REQUIRED"
+
+
+def test_temporary_page_exhaustion_is_not_human_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WEBSITE_L2_TEMP_FAILURE_RETRIES", "1")
+    collector = NativeBrowserCollector(tmp_path / "browser")
+
+    class Page:
+        def wait_for_timeout(self, _: int) -> None:
+            pass
+
+        def reload(self, **_: object) -> None:
+            pass
+
+    collector._visible_access_evidence = lambda _: {  # type: ignore[method-assign]
+        "temporary_failure": True,
+        "access_denied": False,
+        "explicit_challenge_control": False,
+        "visible_challenge_text": False,
+    }
+    with pytest.raises(BrowserTemporaryFailure) as caught:
+        collector._resolve_challenge(Page(), "https://example.test", headless=True)
+    assert caught.value.reason_code == "TEMPORARY_PAGE_FAILURE"
 
 
 def test_local_agent_access_brain_distinguishes_http_from_visible_challenge() -> None:

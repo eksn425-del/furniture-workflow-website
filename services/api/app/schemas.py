@@ -589,6 +589,7 @@ class ControlJobApproval(BaseModel):
 
     confirm: bool = False
     approved_cost_ceiling_minor: int = Field(default=0, ge=0, le=100_000_000)
+    approved_provider_call_limit: int | None = Field(default=None, ge=1, le=5000)
     actor: str = Field(default="operator", min_length=1, max_length=128)
 
 

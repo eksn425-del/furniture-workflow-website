@@ -21,6 +21,18 @@ The Website does not need an AI provider for its local control-plane checks. The
 1. `MULTIMODAL_SINGLE_MODEL`
 2. `TEXT_BRAIN_PLUS_VISION`
 
+Production safety is fail-closed: `MULTIMODAL_SINGLE_MODEL` must send the
+captured image URL and bind its SHA-256 in the review receipt.
+`TEXT_BRAIN_PLUS_VISION` additionally requires an independently configured
+`WEBSITE_VISION_*` endpoint and receipt; a text-only response cannot satisfy
+the visual gate. With no remote credentials, the effective mode is
+`LOCAL_AGENT` and the operator must submit an explicit matching-media review.
+
+Paid Provider approval has two independent hard gates: a cost ceiling and an
+`approved_provider_call_limit`. The default Exact-N call limit is N;
+`SUBMISSION_UNKNOWN` reserves a slot, and the worker checks the durable ledger
+before every create POST.
+
 `LOCAL_AGENT` is available for local review fixtures. Provider calls are disabled by default.
 
 ## Local setup

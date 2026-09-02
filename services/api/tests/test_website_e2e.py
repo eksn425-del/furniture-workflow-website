@@ -97,10 +97,12 @@ def test_add_site_to_delivery_runs_complete_local_workflow(monkeypatch, tmp_path
         approved = client.post(f"/api/v1/control/jobs/{job_id}/approve", json={
             "confirm": True,
             "approved_cost_ceiling_minor": 2100,
+            "approved_provider_call_limit": 21,
             "actor": "local-e2e-test",
         })
         assert approved.status_code == 200, approved.text
         assert approved.json()["status"] == "PRODUCTION_READY"
+        assert approved.json()["job"]["approved_provider_call_limit"] == 21
 
         started = client.post(f"/api/v1/control/jobs/{job_id}/start", json={"resume_browser_session": True})
         assert started.status_code == 200, started.text

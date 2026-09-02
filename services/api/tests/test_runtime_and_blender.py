@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 
 from app.database import Database
-from app.services.brain_provider import BrainSettings, WebsiteBrainProvider
+from app.services.brain_provider import (
+    BrainSettings,
+    VisionInputRequired,
+    VisionProviderNotConfigured,
+    VisionSettings,
+    WebsiteBrainProvider,
+)
 from app.services.native_contracts import BrainProductDecision
 from app.services.runtime_diagnostics import collect_runtime_diagnostics
 from workers.blender_adapter import BlenderCLIAdapter, ModelDimensionConflict, extract_glb_bbox, plan_dimension_normalization
@@ -52,6 +58,94 @@ def test_explicit_remote_mode_without_credentials_is_not_configured(monkeypatch:
     assert WebsiteBrainProvider(settings).health()["status"] == "BRAIN_NOT_CONFIGURED"
 
 
+class _JsonResponse:
+    status_code = 200
+    headers: dict[str, str] = {}
+
+    def json(self) -> dict:
+        decision = {
+            "eligible": True,
+            "single_product": True,
+            "background_ok": True,
+            "image_to_3d_suitable": True,
+            "category_group": "Chairs",
+            "product_type": "Lounge Chair",
+            "confidence": 0.96,
+            "reason_codes": ["VISUAL_OK"],
+            "source_image_vision_consistent": True,
+        }
+        return {"choices": [{"message": {"content": json.dumps(decision)}}]}
+
+
+class _RecordingSession:
+    def __init__(self) -> None:
+        self.posts: list[dict] = []
+
+    def post(self, endpoint: str, **kwargs: object) -> _JsonResponse:
+        self.posts.append({"endpoint": endpoint, **kwargs})
+        return _JsonResponse()
+
+
+def _remote_settings(mode: str) -> BrainSettings:
+    return BrainSettings(api_key="test", base_url="https://brain.example/v1", model="brain", max_retries=0, rpm_limit=600, model_mode=mode)
+
+
+def test_multimodal_product_request_includes_image_and_receipt_hash() -> None:
+    session = _RecordingSession()
+    provider = WebsiteBrainProvider(_remote_settings("MULTIMODAL_SINGLE_MODEL"), session=session)
+    digest = "a" * 64
+    decision, receipt = provider.reason_product(
+        source_url="https://shop.example/products/chair",
+        evidence={"image_url": "https://img.example/chair.jpg", "media_sha256": digest},
+    )
+    content = session.posts[0]["json"]["messages"][1]["content"]  # type: ignore[index]
+    assert any(part.get("type") == "image_url" for part in content)
+    assert decision.reviewed_media_sha256 == digest
+    assert receipt["visual_input_included"] is True
+    assert receipt["reviewed_media_sha256"] == digest
+
+
+def test_multimodal_product_request_fails_closed_without_image_or_hash() -> None:
+    provider = WebsiteBrainProvider(_remote_settings("MULTIMODAL_SINGLE_MODEL"), session=_RecordingSession())
+    with pytest.raises(VisionInputRequired):
+        provider.reason_product(source_url="https://shop.example/products/chair", evidence={"image_url": "https://img.example/chair.jpg"})
+
+
+def test_text_brain_plus_vision_requires_independent_provider() -> None:
+    provider = WebsiteBrainProvider(
+        _remote_settings("TEXT_BRAIN_PLUS_VISION"),
+        session=_RecordingSession(),
+        vision_settings=VisionSettings(),
+    )
+    assert provider.health()["status"] == "VISION_PROVIDER_NOT_CONFIGURED"
+    with pytest.raises(VisionProviderNotConfigured):
+        provider.reason_product(
+            source_url="https://shop.example/products/chair",
+            evidence={"image_url": "https://img.example/chair.jpg", "media_sha256": "b" * 64},
+        )
+
+
+def test_text_brain_plus_vision_records_independent_visual_receipt() -> None:
+    brain_session = _RecordingSession()
+    vision_session = _RecordingSession()
+    provider = WebsiteBrainProvider(
+        _remote_settings("TEXT_BRAIN_PLUS_VISION"),
+        session=brain_session,
+        vision_settings=VisionSettings(api_key="vision-test", base_url="https://vision.example/v1", model="vision", max_retries=0, rpm_limit=600),
+        vision_session=vision_session,
+    )
+    digest = "c" * 64
+    decision, receipt = provider.reason_product(
+        source_url="https://shop.example/products/chair",
+        evidence={"image_url": "https://img.example/chair.jpg", "media_sha256": digest},
+    )
+    assert len(vision_session.posts) == 1
+    assert len(brain_session.posts) == 1
+    assert receipt["independent_vision_receipt"]["reviewed_media_sha256"] == digest
+    assert receipt["visual_input_included"] is True
+    assert decision.reviewed_media_sha256 == digest
+
+
 def test_runtime_diagnostics_is_non_secret_and_reports_effective_capabilities(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("WEBSITE_L2_BROWSER_ENGINE", "unsupported-engine")
     monkeypatch.setenv("PROVIDER_MODE", "disabled")
@@ -65,6 +159,8 @@ def test_runtime_diagnostics_is_non_secret_and_reports_effective_capabilities(mo
         assert diagnostics["api"]["status"] == "READY"
         assert diagnostics["database"]["status"] == "READY"
         assert diagnostics["brain"]["effective_mode"] == "LOCAL_AGENT"
+        assert diagnostics["brain"]["effective_mode_source"] == "explicit"
+        assert diagnostics["brain"]["vision_input"] == "LOCAL_AGENT_EXPLICIT_REVIEW"
         assert diagnostics["lux3d"]["status"] == "OFF"
         assert diagnostics["blender"]["status"] == "NOT_CONFIGURED"
         assert diagnostics["l2_browser"]["status"] == "NOT_INSTALLED"

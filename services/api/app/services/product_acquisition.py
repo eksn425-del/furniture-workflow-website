@@ -46,6 +46,7 @@ SOURCE_TYPES = {
 PRODUCT_PATH = re.compile(r"/(?:products?|product-page|p|item|sku|listing)/[^/?#]+", re.I)
 VISIBLE_CHALLENGE_TEXT = re.compile(r"captcha|verify you are human|checking your browser|security challenge|人机验证|访问验证", re.I)
 TEMPORARY_FAILURE_TEXT = re.compile(r"technical difficulties|try again later|temporarily unavailable|service unavailable|暂时无法|稍后再试", re.I)
+ACCESS_DENIED_TEXT = re.compile(r"access denied|request blocked|restricted access|permission denied|forbidden|访问被拒绝|请求被阻止", re.I)
 DIMENSION_RE = re.compile(
     r"(?P<w>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*[w宽]\s*[x×*]\s*"
     r"(?P<d>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*[d深]\s*[x×*]\s*"
@@ -111,6 +112,28 @@ class BrowserHumanRequired(ProductAcquisitionError):
     code = "HUMAN_REQUIRED"
 
     def __init__(self, message: str, *, url: str, session_dir: Path, reason_code: str, evidence: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.url = url
+        self.session_dir = Path(session_dir)
+        self.reason_code = reason_code
+        self.evidence = evidence or {}
+
+
+class BrowserTemporaryFailure(ProductAcquisitionError):
+    code = "TEMPORARY_FAILURE"
+
+    def __init__(self, message: str, *, url: str, session_dir: Path, reason_code: str = "BROWSER_NAVIGATION_FAILED", evidence: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.url = url
+        self.session_dir = Path(session_dir)
+        self.reason_code = reason_code
+        self.evidence = evidence or {}
+
+
+class BrowserAccessDenied(ProductAcquisitionError):
+    code = "ACCESS_CHANGE_REQUIRED"
+
+    def __init__(self, message: str, *, url: str, session_dir: Path, reason_code: str = "ACCESS_DENIED", evidence: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.url = url
         self.session_dir = Path(session_dir)
@@ -427,10 +450,18 @@ class NativeBrowserCollector:
                 if not evidence["temporary_failure"]:
                     break
             if evidence["temporary_failure"]:
-                raise BrowserHumanRequired(
+                raise BrowserTemporaryFailure(
                     "页面显示临时技术故障；已自动重试仍失败，保留同一浏览器会话可稍后恢复重试",
                     url=url, session_dir=self.session_dir, reason_code="TEMPORARY_PAGE_FAILURE", evidence=evidence,
                 )
+        if evidence["access_denied"] and not evidence["explicit_challenge_control"]:
+            raise BrowserAccessDenied(
+                "可见浏览器页面拒绝访问，但没有可操作的人机验证控件；需要检查网络、登录或站点授权条件",
+                url=url,
+                session_dir=self.session_dir,
+                reason_code="ACCESS_DENIED",
+                evidence=evidence,
+            )
         if not evidence["explicit_challenge_control"] or not evidence["visible_challenge_text"]:
             return None
         if headless:
@@ -495,6 +526,7 @@ class NativeBrowserCollector:
             "visible_challenge_text": bool(VISIBLE_CHALLENGE_TEXT.search(combined)),
             "explicit_challenge_control": explicit_control,
             "temporary_failure": bool(TEMPORARY_FAILURE_TEXT.search(combined)),
+            "access_denied": bool(ACCESS_DENIED_TEXT.search(combined)),
         }
 
     def get_html(self, url: str) -> str:
@@ -514,7 +546,7 @@ class NativeBrowserCollector:
                 body = page.content()
                 context.close()
                 return body
-        except BrowserHumanRequired:
+        except (BrowserHumanRequired, BrowserTemporaryFailure, BrowserAccessDenied):
             raise
         except PlaywrightError as error:
             message = str(error).casefold()
@@ -522,8 +554,8 @@ class NativeBrowserCollector:
                 raise BrowserRuntimeMissing(
                     "Website 原生 L2 浏览器缺少 Chromium；请执行 python -m playwright install chromium"
                 ) from error
-            raise BrowserHumanRequired(
-                f"可见浏览器需要人工确认：{type(error).__name__}",
+            raise BrowserTemporaryFailure(
+                f"浏览器导航暂时失败：{type(error).__name__}",
                 url=url,
                 session_dir=self.session_dir,
                 reason_code="BROWSER_NAVIGATION_FAILED",
@@ -574,7 +606,7 @@ class NativeBrowserCollector:
                         headless = False
                     pages[url] = released if released is not None else page.content()
                 return pages
-        except BrowserHumanRequired:
+        except (BrowserHumanRequired, BrowserTemporaryFailure, BrowserAccessDenied):
             raise
         except PlaywrightError as error:
             message = str(error).casefold()
@@ -582,8 +614,8 @@ class NativeBrowserCollector:
                 raise BrowserRuntimeMissing(
                     "Website 原生 L2 浏览器缺少 Chromium；请执行 python -m playwright install chromium"
                 ) from error
-            raise BrowserHumanRequired(
-                f"可见浏览器需要人工确认：{type(error).__name__}",
+            raise BrowserTemporaryFailure(
+                f"浏览器批量导航暂时失败：{type(error).__name__}",
                 url=urls[-1],
                 session_dir=self.session_dir,
                 reason_code="BROWSER_NAVIGATION_FAILED",
@@ -628,7 +660,7 @@ class NativeBrowserCollector:
                 visible = re.sub(r"<[^>]+>", " ", body)
                 visible = html_lib.unescape(visible)
                 return _parse_dimension_text(visible)
-        except BrowserHumanRequired:
+        except (BrowserHumanRequired, BrowserTemporaryFailure, BrowserAccessDenied):
             raise
         except PlaywrightError as error:
             message = str(error).casefold()
@@ -636,8 +668,8 @@ class NativeBrowserCollector:
                 raise BrowserRuntimeMissing(
                     "Website 原生 L2 浏览器缺少 Chromium；请执行 python -m playwright install chromium"
                 ) from error
-            raise BrowserHumanRequired(
-                f"可见浏览器需要人工确认：{type(error).__name__}",
+            raise BrowserTemporaryFailure(
+                f"尺寸页面导航暂时失败：{type(error).__name__}",
                 url=url,
                 session_dir=self.session_dir,
                 reason_code="BROWSER_NAVIGATION_FAILED",
@@ -1430,12 +1462,13 @@ class ProductAcquisitionEngine:
         visible = html_lib.unescape(re.sub(r"<[^>]+>", " ", page_html))
         dimensions, unit = _parse_dimension_text(visible)
         dimension_source = "explicit_page_text" if dimensions else "missing"
-        if not dimensions:
+        likely_product_detail = bool(product_nodes or PRODUCT_PATH.search(urlsplit(url).path))
+        if not dimensions and likely_product_detail:
             # 部分反爬站点把尺寸放在可折叠标签里，普通 HTML 抓不到；
             # 此时用同一 L2 可见会话打开详情页，展开 Dimensions 标签再解析一次。
             try:
                 browser_dimensions, browser_unit = NativeBrowserCollector(self.browser_session_dir).extract_dimensions(url)
-            except (BrowserHumanRequired, BrowserRuntimeMissing):
+            except (BrowserHumanRequired, BrowserTemporaryFailure, BrowserAccessDenied, BrowserRuntimeMissing):
                 browser_dimensions, browser_unit = {}, ""
             if browser_dimensions:
                 dimensions, unit = browser_dimensions, browser_unit
@@ -1550,7 +1583,7 @@ class ProductAcquisitionEngine:
 
 __all__ = [
     "AcquiredProduct",
-    "BrowserHumanRequired",
+    "BrowserAccessDenied", "BrowserHumanRequired", "BrowserTemporaryFailure",
     "BrowserRuntimeMissing",
     "NativeBrowserCollector",
     "ProductAcquisitionEngine",

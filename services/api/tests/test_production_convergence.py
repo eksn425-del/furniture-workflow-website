@@ -188,7 +188,10 @@ def _contract(tmp_path: Path, *, job_id: str, target: int, provider: str = "OFF"
         "browser_session": {"user_data_dir": str(tmp_path / "browser-session")},
         "workspace": str(tmp_path / job_id),
         "database_path": str(tmp_path / "system" / "control.sqlite3"),
-        "approved_plan": {"approved_cost_ceiling_minor": 1000 if provider.casefold() != "off" else 0},
+        "approved_plan": {
+            "approved_cost_ceiling_minor": 1000 if provider.casefold() != "off" else 0,
+            "approved_provider_call_limit": target if provider.casefold() != "off" else 0,
+        },
     }
 
 
@@ -924,15 +927,40 @@ def test_provider_ready_has_real_qualification_path_without_post(monkeypatch: py
     )
     assert result["status"] == "PRODUCTION_READY"
     assert result["provider_calls"] == 0
+    assert result["job"]["approved_provider_call_limit"] == 1
     database.dispose()
 
 
-def test_exact_n_reaches_ready_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    contract = _contract(tmp_path, job_id="job-ready-three", target=3)
-    pipeline, events = _run_pipeline(monkeypatch, tmp_path, contract=contract, products=[_product(index) for index in range(3)])
+def test_provider_approval_persists_explicit_hard_call_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("LUX3D_API_KEY", "fixture-key-never-sent")
+    monkeypatch.setenv("LUX3D_BASE_URL", "http://provider.test")
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        job = _job("job-provider-limit", provider="lux3d")
+        job.target_value = job.requested_count = 3
+        session.add(job)
+        session.commit()
+    finally:
+        session.close()
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(database=database)))
+    result = approve_job(
+        "job-provider-limit",
+        ControlJobApproval(confirm=True, approved_cost_ceiling_minor=5000, approved_provider_call_limit=4, actor="test-operator"),
+        request,
+    )
+    assert result["job"]["approved_provider_call_limit"] == 4
+    database.dispose()
+
+
+@pytest.mark.parametrize("target", [1, 3])
+def test_exact_n_reaches_ready_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: int) -> None:
+    contract = _contract(tmp_path, job_id=f"job-ready-{target}", target=target)
+    pipeline, events = _run_pipeline(monkeypatch, tmp_path, contract=contract, products=[_product(index) for index in range(target)])
     assert pipeline.run() == 2
-    assert [item.state for item in pipeline.pool.records()] == [ItemState.MODEL_INPUT_LOCKED] * 3
-    assert any(item["type"] == "READY_POOL_COMPLETED" and item["done"] == 3 for item in events)
+    assert [item.state for item in pipeline.pool.records()] == [ItemState.MODEL_INPUT_LOCKED] * target
+    assert any(item["type"] == "READY_POOL_COMPLETED" and item["done"] == target for item in events)
     assert sum(int(item["payload"].get("provider_calls", 0)) for item in events) == 0
 
 
@@ -1115,6 +1143,57 @@ def test_fake_provider_completes_exact_n_delivery(monkeypatch: pytest.MonkeyPatc
     assert any(item["type"] == "JOB_COMPLETED" and item["done"] == target for item in events)
 
 
+def test_provider_hard_limit_blocks_n_plus_one_before_post(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = _contract(tmp_path, job_id="job-hard-limit", target=4, provider="lux3d")
+    contract["approved_plan"]["approved_provider_call_limit"] = 3
+    provider = FakeProvider()
+    pipeline, events = _run_pipeline(
+        monkeypatch,
+        tmp_path,
+        contract=contract,
+        products=[_product(index) for index in range(4)],
+        provider=provider,
+    )
+    assert pipeline.run() == 2
+    assert provider.create_calls == 3
+    assert any("PROVIDER_CALL_LIMIT_REACHED" in str(item["message"]) for item in events)
+
+
+def test_submission_unknown_reserves_provider_call_slot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = _contract(tmp_path, job_id="job-unknown-limit", target=1, provider="lux3d")
+    database = Database(Path(contract["database_path"]))
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(ProductionProviderTask(
+            ledger_id="ledger-unknown",
+            job_id=contract["job_id"],
+            candidate_id="previous-candidate",
+            record_id="previous-record",
+            provider="lux3d",
+            idempotency_key="d" * 64,
+            model_input_hash="e" * 64,
+            status="SUBMISSION_UNKNOWN",
+            checkpoint_state="SUBMISSION_UNKNOWN",
+            post_attempts=1,
+        ))
+        session.commit()
+    finally:
+        session.close()
+        database.dispose()
+    provider = FakeProvider()
+    pipeline, events = _run_pipeline(
+        monkeypatch,
+        tmp_path,
+        contract=contract,
+        products=[_product(1)],
+        provider=provider,
+    )
+    assert pipeline.run() == 2
+    assert provider.create_calls == 0
+    assert any("PROVIDER_CALL_LIMIT_REACHED" in str(item["message"]) for item in events)
+
+
 def test_provider_capacity_wait_preserves_attempt_ledger_and_resumes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     contract = _contract(tmp_path, job_id="job-provider-capacity", target=1, provider="lux3d")
     waiting_provider = FakeProvider(capacity_rejection=True)
@@ -1144,6 +1223,7 @@ def test_provider_off_ready_pool_can_resume_after_approval(monkeypatch: pytest.M
     live_contract = dict(off_contract)
     live_contract["provider"] = "lux3d"
     live_contract["authorization"] = {"approve_paid_generation": True}
+    live_contract["approved_plan"] = {"approved_cost_ceiling_minor": 1000, "approved_provider_call_limit": 1}
     provider = FakeProvider()
     resumed, _ = _run_pipeline(monkeypatch, tmp_path, contract=live_contract, products=[], provider=provider)
     assert resumed.run() == 0
