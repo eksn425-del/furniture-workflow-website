@@ -1,0 +1,188 @@
+Furniture Workflow Website｜公司电脑新版本测试启动 Prompt
+
+你现在负责在公司电脑测试 Furniture Workflow Website 最新公司试点版本。
+
+我会提供：
+
+1. `furniture-workflow-website_company-pilot_20260902_<commit>.zip`
+2. 本启动 Prompt
+
+请持续执行到完成真实公司环境的分阶段验证，不要只分析，也不要因为单个第三方站点失败而停止整轮。
+
+一、先识别版本与旧环境
+
+公司电脑上可能保留 Furniture Workflow Website 的旧版本，以及旧版本已经配置过的 Brain、Lux3D、Browser 和 Blender 环境。
+
+不要直接用新文件覆盖旧项目，也不要把新旧源码混在同一个目录。
+
+请先：
+
+1. 记录旧项目路径、旧 Website 版本、Git commit（如果存在）、Python/Node/Blender 状态。
+2. 把旧项目保留为只读备份。
+3. 只读取旧环境中的配置变量名称和本机依赖位置；不要在日志、报告、终端截图或聊天中显示 API Key、Token、Cookie、私有 endpoint 或个人路径。
+4. 将新 ZIP 解压到全新的独立目录。
+5. 阅读新包根目录的：
+   - `COMPANY_PILOT_README_20260902.md`
+   - `COMPANY_PILOT_BUILD_MANIFEST_20260902.json`
+   - `docs/COMPANY_PILOT_PRODUCTION_HARDENING_REPORT_20260902.md`
+6. 核对压缩包 SHA256 与随包校验值一致。
+
+旧配置大概率可以复用，但必须迁移“配置值”，不能复制旧源码、旧 `.venv`、`node_modules`、`.next`、数据库、Job/Event/Provider ledger、浏览器 Profile、Cookie、输出模型或缓存到新项目。
+
+迁移旧 `.env.local` 时，以新版本 `.env.example` 为字段基准：只把仍存在的变量值逐项写入新项目的 `.env.local`。新版本新增的 `WEBSITE_VISION_*`、`WEBSITE_L2_TEMP_FAILURE_RETRIES` 等字段要按实际公司架构配置；不要让旧配置覆盖新默认安全规则。
+
+二、建立干净运行环境
+
+在新项目根目录使用 PowerShell：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r services\api\requirements.txt
+python -m playwright install chromium
+npm --prefix apps\web ci
+Copy-Item .env.example .env.local
+```
+
+如果已经创建 `.env.local`，不要再次覆盖。Node 依赖必须执行 `npm ci`，不要直接复用旧 `node_modules`，因为新版本的 lockfile 已包含安全依赖修复。
+
+要求：Python 3.11+，Node 20.9+。Blender 可以使用公司电脑现有安装，但要通过 `BLENDER_EXECUTABLE` 指向真实可执行文件，并在 Website System 页面验证。
+
+三、迁移公司配置
+
+所有真实值只保存在公司电脑本地 `.env.local`，禁止提交 GitHub或写进反馈报告。
+
+检查并迁移以下配置组：
+
+- Brain：`WEBSITE_MODEL_MODE`、`WEBSITE_BRAIN_API_KEY`、`WEBSITE_BRAIN_BASE_URL`、`WEBSITE_BRAIN_MODEL`
+- 独立 Vision（仅双模型模式）：`WEBSITE_VISION_API_KEY`、`WEBSITE_VISION_BASE_URL`、`WEBSITE_VISION_MODEL`
+- Lux3D：`PROVIDER_MODE`、`LUX3D_API_KEY`、`LUX3D_BASE_URL`、`LUX3D_CREATE_PATH`、`LUX3D_STATUS_PATH_TEMPLATE`
+- Browser：`WEBSITE_L2_BROWSER_ENABLED`、`WEBSITE_L2_HEADLESS`、`WEBSITE_L2_USER_DATA_DIR`、`WEBSITE_L2_BROWSER_CHANNEL`、`WEBSITE_L2_TEMP_FAILURE_RETRIES`
+- Blender：`BLENDER_EXECUTABLE`、`BLENDER_DIMENSION_TOLERANCE`
+- 并发：`WEBSITE_PROVIDER_CONCURRENCY`
+
+Brain 模式必须按实际能力选择：
+
+1. 公司 Brain endpoint 明确支持图片输入：优先 `MULTIMODAL_SINGLE_MODEL`。
+2. 文本 Brain 与独立 Vision 是两个真实服务，并能产生独立 Vision receipt：使用 `TEXT_BRAIN_PLUS_VISION`。
+3. 如果没有配置独立 Vision，禁止使用 `TEXT_BRAIN_PLUS_VISION` 冒充图片已审核；正确结果应为 `VISION_PROVIDER_NOT_CONFIGURED`。
+4. 暂时没有远程 Brain/Vision 时保持 `LOCAL_AGENT`，不得用文本推断伪造视觉 PASS。
+
+四、启动和运行诊断
+
+执行：
+
+```powershell
+python launch_website.py
+```
+
+打开 Website 后先进入 System / 运行状态，确认实际有效状态，而不是只确认 `.env.local` 写过：
+
+- API READY
+- Database READY
+- L2 Browser READY
+- Brain Mode 与期望一致
+- Effective Mode Source 正确
+- Vision Input 正确
+- Local Agent Override 未意外开启
+- Lux3D READY 或按计划 OFF
+- Blender READY
+- Worker 正常
+
+System 页面和报告中不得显示 Key、Token、私有 API 地址或本机隐私路径。
+
+五、先做 Provider OFF 验证
+
+使用一个普通家具零售站点完成 Exact-1，再完成 Exact-3：
+
+URL → Site Scan → Taxonomy/Count → Category Selection → Job Snapshot → Product Acquisition → Main Image Binding → Source/Image/Vision Review → Official Dimension / AI_ESTIMATED Policy → ≤50 字符命名 → Ready Pool。
+
+验证：
+
+- UNKNOWN 不能显示成 0。
+- Job 创建后的 scope/snapshot 不因 Site rescan 漂移。
+- 产品按稳定 identity 去重，不按压缩后的最终名称去重。
+- 图片 SHA 与 reviewed_media_sha256 完全匹配。
+- Browser 临时导航错误是 `TEMPORARY_FAILURE`。
+- 静态拒绝且没有验证控件是 `ACCESS_CHANGE_REQUIRED`。
+- 只有可见验证文字与可操作验证控件同时出现才是 `HUMAN_REQUIRED`。
+- robots policy 不得升级 Browser 绕过。
+- Provider OFF 只形成 Ready Pool，不发送外部建模请求。
+
+六、真实 Brain/Vision 最小测试
+
+先只审核一个候选：
+
+- 确认请求实际携带候选主图，而不是只发送 URL 文本。
+- 确认 receipt 记录 `visual_input_included`、实际模式和当前媒体 SHA。
+- 双模型模式必须有独立 Vision receipt。
+- 图片 hash 不匹配时必须阻断恢复，不得进入建模。
+
+七、真实 Lux3D + Blender 分阶段测试
+
+第一次只做 Exact-1、Provider 并发 1：
+
+1. 在 Website UI 同时审批“成本上限”和“Provider 调用上限 = 1”。
+2. 确认最多只产生一个 Lux3D create POST。
+3. 若出现 `SUBMISSION_UNKNOWN`，该请求仍占用一个调用额度，禁止自动重提。
+4. 检查 Lux3D task ID、轮询恢复、raw GLB 下载。
+5. 用 Blender 执行 raw bbox → target dimensions → 优先 uniform scale → apply transform → export → final bbox → tolerance QA。
+6. 三轴需要明显 non-uniform deform 时进入 `MODEL_DIMENSION_CONFLICT`，禁止硬拉伸交付。
+7. 在 Delivery 页面真实下载 final GLB，并用 Blender 打开检查网格、材质、朝向、尺寸和可用性。
+
+Exact-1 完整成功后，依次测试 `3 → 10 → 20/21 → 50 → 100`。每一级都必须先核对 Provider ledger、调用额度、失败分类、恢复行为和 Delivery 数量，再进入下一级。早期并发保持 1–3；未完成 Exact-3 前不要直接使用 5 并发。
+
+八、硬停止条件
+
+遇到以下状态停止放量，但保留同一 Job、session、snapshot、ledger 和 receipt 以便恢复：
+
+- `SUBMISSION_UNKNOWN`
+- `PROVIDER_CALL_LIMIT_REACHED`
+- `VISION_PROVIDER_NOT_CONFIGURED`
+- `VISION_RECEIPT_INVALID_OR_MEDIA_HASH_MISMATCH`
+- `MODEL_DIMENSION_CONFLICT`
+- 明确 CAPTCHA/HUMAN、登录、WAF 或网络授权阻断
+- 实际 Provider 费用或调用数超过审批计划
+
+不要删除账本、重建 Job 或静默重发来掩盖问题。
+
+九、最终回归
+
+在新项目根目录执行：
+
+```powershell
+$repoRoot = (Get-Location).Path
+$env:PYTHONPATH = "$repoRoot;$repoRoot\services\api;$repoRoot\packages\workflow-engine\src"
+python -m pytest -q services/api/tests packages/workflow_core/tests packages/workflow-engine/tests
+npm --prefix apps\web run typecheck
+npm --prefix apps\web run lint
+npm --prefix apps\web run build
+npm --prefix apps\web audit
+.\scripts\check_public_tree.ps1
+git diff --check
+```
+
+十、输出公司测试报告
+
+生成一份脱敏 Markdown 报告，至少包括：
+
+- 新包 commit、manifest 与 SHA256 是否匹配
+- 旧配置迁移了哪些“变量名称”，不要写值
+- System Diagnostic 的实际状态
+- Provider OFF Exact-1/3 结果
+- 真实 Brain/Vision receipt 结果
+- 真实 Lux3D 调用数、额度、恢复与错误分类
+- Blender raw/final bbox、目标尺寸、容差和人工打开检查结果
+- Delivery 下载结果
+- 所有测试命令与结果
+- P0/P1/P2 问题、复现证据、修复提交和未解决 blocker
+- 是否建议继续放量
+
+最终结论只能从以下三项选择：
+
+- `COMPANY PILOT READY`
+- `PARTIAL / REQUIRES FIX`
+- `BLOCKED BY COMPANY ENVIRONMENT`
+
+不能因为页面看起来正常就宣布成功，也不能把 Provider OFF、Fake Lux3D、Fake Blender 或 LOCAL_AGENT 结果冒充真实公司 API 验收。
