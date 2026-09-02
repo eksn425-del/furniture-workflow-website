@@ -36,10 +36,11 @@ from furniture_workflow_engine import (
     SupplyExhaustedError,
 )
 from packages.workflow_core.candidate_pool import CandidatePoolStore, CandidateRecord, TERMINAL_ITEM_STATES
-from packages.workflow_core.dimensions import govern_dimensions
+from packages.workflow_core.dimensions import govern_dimensions, round_dimension
 from packages.workflow_core.locks import make_order_policy_lock, provider_idempotency_key, stable_hash
 from packages.workflow_core.naming import (
     NamingReviewRequired,
+    compose_brand_official_name,
     compose_official_name,
     compose_product_name,
     shorten_name_to_limit,
@@ -77,6 +78,22 @@ def _safe_name(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip(" .")[:140]
 
 
+def _distribute_evenly(total: int, groups: list[str]) -> dict[str, int]:
+    """把总数 N 硬性均分到每个已选类目，且各项之和恒等于 N。
+
+    余数按类目顺序逐一分给靠前的类目，保证 sum(quotas) == total。
+    """
+    total = max(1, int(total))
+    if not groups:
+        return {}
+    share = total // len(groups)
+    remainder = total % len(groups)
+    return {
+        str(group): share + (1 if index < remainder else 0)
+        for index, group in enumerate(groups)
+    }
+
+
 def _candidate_progress_signature(records: list[CandidateRecord]) -> tuple[tuple[str, str, str, str, str, str], ...]:
     """Capture durable fields that prove one engine tick made progress."""
     return tuple(sorted(
@@ -90,6 +107,53 @@ def _candidate_progress_signature(records: list[CandidateRecord]) -> tuple[tuple
         )
         for record in records
     ))
+
+
+# 线性流程展示用的细分阶段：把 DISCOVERY 内部逐候选推进的
+# 筛选/尺寸命名/入库/建模，映射为前端时间线上的独立阶段，
+# 这样流程不会从「产品发现」直接跳到「建模」，而是逐步点亮。
+_GRANULAR_STAGE_INDEX = {
+    ItemState.MEDIA_READY: 1,
+    ItemState.VISUAL_PENDING: 1,
+    ItemState.VISUAL_ACCEPTED: 1,
+    ItemState.VISUAL_REJECTED: 1,
+    ItemState.CATEGORY_ACCEPTED: 1,
+    ItemState.CATEGORY_REJECTED: 1,
+    ItemState.DATE_ACCEPTED: 1,
+    ItemState.DATE_REJECTED: 1,
+    ItemState.DIMENSION_PENDING: 2,
+    ItemState.DIMENSION_READY: 2,
+    ItemState.DIMENSION_REJECTED: 2,
+    ItemState.NAMING_READY: 2,
+    ItemState.NAMING_REVIEW: 2,
+    ItemState.CATALOG_READY: 3,
+    ItemState.MODEL_INPUT_LOCKED: 3,
+    ItemState.SUBMITTING: 4,
+    ItemState.PROVIDER_ACTIVE: 4,
+    ItemState.PROVIDER_SUCCESS: 4,
+    ItemState.RAW_GLB_READY: 4,
+    ItemState.COMPLETED: 4,
+}
+_GRANULAR_STAGE_LABEL = {1: "MEDIA", 2: "DIMENSION", 3: "READY_POOL", 4: "PROVIDER"}
+_GRANULAR_STAGE_DETAIL = {
+    1: "候选已通过筛选与复核（媒体/视觉/类目/日期）",
+    2: "候选已进入尺寸与命名阶段",
+    3: "候选已入库（Catalog / Model Input Lock）",
+    4: "候选已进入建模生成阶段",
+}
+
+
+def _max_granular_stage(records: list[CandidateRecord]) -> int:
+    return max((_GRANULAR_STAGE_INDEX.get(record.state, 0) for record in records), default=0)
+
+
+_SUPPORTED_DIMENSION_UNITS = frozenset({
+    "m", "meter", "meters",
+    "cm", "centimeter", "centimeters",
+    "mm", "millimeter", "millimeters",
+    "in", "inch", "inches",
+    "ft", "foot", "feet",
+})
 
 
 def _candidate_from_product(contract: dict[str, Any], product: AcquiredProduct) -> CandidateRecord:
@@ -393,11 +457,15 @@ class WebsiteStageAdapter:
 
     def _stage_category(self, candidate: CandidateRecord) -> StageOutcome:
         decision = candidate.lineage.get("brain_product_decision") or {}
-        group = str(decision.get("category_group") or candidate.category_group or "").strip()
+        brain_group = str(decision.get("category_group") or "").strip()
+        # category_group 保留「所属所选类目」的身份（scope canonical_name），
+        # 用于 PER_CATEGORY 配额匹配；brain 的语义分组单独存 brain_category_group，
+        # 避免用语义分组覆盖类目配额 key 导致 _category_has_capacity 恒 False、提交被跳过。
+        group = str(candidate.category_group or "").strip() or brain_group
         if not group:
             return StageOutcome(StageDecision.REJECTED, "CATEGORY_UNRESOLVED")
         self.pool.enrich_candidate(candidate.candidate_id, category_group=group, lineage={
-            "brain_category_group": group,
+            "brain_category_group": brain_group or group,
             "category_authority": self.source_policy.category_authority,
         })
         return StageOutcome(StageDecision.ACCEPTED, "CATEGORY_ACCEPTED", {"category_group": group})
@@ -424,14 +492,15 @@ class WebsiteStageAdapter:
         else:
             # L1/HTML evidence may omit an accordion's Dimensions block.  Give
             # the same bounded L2 session one chance to obtain official values
-            # before accepting any Brain estimate.
+            # before accepting any Brain estimate. 若 L2 尺寸核对需要人工（访问
+            # 验证等），不再暂停，直接落到 AI 预估高度回退，保证全自动推进。
             browser_dims: dict[str, float] = {}
             browser_unit = ""
             try:
                 session_dir = Path(str(self.acquisition.browser_session_dir))
                 browser_dims, browser_unit = NativeBrowserCollector(session_dir).extract_dimensions(str(candidate.canonical_url))
             except BrowserHumanRequired:
-                return StageOutcome(StageDecision.PENDING, "DIMENSIONS_BROWSER_HUMAN_REQUIRED")
+                browser_dims, browser_unit = {}, ""
             except BrowserRuntimeMissing:
                 browser_dims, browser_unit = {}, ""
             if all(browser_dims.get(axis) for axis in axes):
@@ -442,16 +511,34 @@ class WebsiteStageAdapter:
 
         if not all(values.get(axis) for axis in axes):
             decision = candidate.lineage.get("brain_product_decision") or {}
-            estimated_values = {axis: decision.get(axis) for axis in axes}
-            if all(estimated_values.get(axis) for axis in axes):
-                values = estimated_values
+            est_source = str(decision.get("dimension_source") or "").upper()
+            # 官网无官方尺寸时按规则用 AI 预估高度（单轴）+ 后续等比缩放，
+            # 不因缺少三轴尺寸而拒绝候选。
+            if not any(values.get(axis) for axis in axes) and decision.get("height") and est_source == "AI_ESTIMATED":
+                values = {"width": None, "depth": None, "height": float(decision["height"])}
                 source = "AI_ESTIMATED"
-                candidate.lineage["dimension_source_detail"] = "BRAIN_DECISION_AFTER_OFFICIAL_LOOKUP"
-                if decision.get("dimension_unit"):
-                    candidate.lineage["dimension_unit"] = decision.get("dimension_unit")
+                candidate.lineage["dimension_source_detail"] = "AI_HEIGHT_ESTIMATE"
+                candidate.lineage["dimension_estimation"] = True
+                unit = str(decision.get("dimension_unit") or "in").strip().casefold()
+                candidate.lineage["dimension_unit"] = unit if unit in _SUPPORTED_DIMENSION_UNITS else "in"
+            else:
+                estimated_values = {axis: decision.get(axis) for axis in axes}
+                if all(estimated_values.get(axis) for axis in axes):
+                    values = estimated_values
+                    source = est_source if est_source in {"OFFICIAL_STRUCTURED", "OFFICIAL_PAGE"} else "AI_ESTIMATED"
+                    candidate.lineage["dimension_source_detail"] = "BRAIN_DECISION_AFTER_OFFICIAL_LOOKUP"
+                    if decision.get("dimension_unit"):
+                        candidate.lineage["dimension_unit"] = decision.get("dimension_unit")
+        governed: dict[str, int] = {}
         try:
-            governed = govern_dimensions(values)
+            for axis in axes:
+                raw = values.get(axis)
+                if raw in (None, ""):
+                    continue
+                governed[axis] = round_dimension(raw)
         except ValueError:
+            return StageOutcome(StageDecision.REJECTED, "DIMENSIONS_MISSING_OR_INVALID")
+        if not governed:
             return StageOutcome(StageDecision.REJECTED, "DIMENSIONS_MISSING_OR_INVALID")
         target_dimensions = dict(governed)
         evidence = {
@@ -460,6 +547,7 @@ class WebsiteStageAdapter:
             "dimension_source": source or "UNKNOWN",
             "dimension_unit": candidate.lineage.get("dimension_unit") or "source_unit",
             "dimension_source_detail": candidate.lineage.get("dimension_source_detail") or source,
+            "dimension_estimation": bool(candidate.lineage.get("dimension_estimation")),
         }
         self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
         return StageOutcome(StageDecision.ACCEPTED, "DIMENSIONS_READY", evidence)
@@ -478,9 +566,37 @@ class WebsiteStageAdapter:
         reliable = len(source_name) >= 3 and source_name.casefold() not in {"product", "item", "untitled"}
         decision_source = "SOURCE_NAME_FIRST"
 
+        # 品牌库（界面标记 / 配置登记）：品牌前缀 + 官方名 + 四段式（风格/颜色/材质/类型）。
+        if bool(self.contract.get("is_brand_library")):
+            brand = _safe_name(str(self.contract.get("brand_name") or site_brand or ""))
+            try:
+                if reliable:
+                    governed_name = compose_brand_official_name(
+                        brand=brand,
+                        official_name=source_name,
+                        style=decision.get("style") or candidate.lineage.get("visual_style"),
+                        color=decision.get("color") or candidate.lineage.get("visual_color"),
+                        material=decision.get("material") or candidate.lineage.get("visual_material"),
+                        product_type=decision.get("product_type") or candidate.lineage.get("visual_product_type") or "",
+                    )
+                    decision_source = "BRAND_OFFICIAL_FOUR_PART"
+                else:
+                    governed_name = compose_product_name(
+                        style=decision.get("style") or candidate.lineage.get("visual_style"),
+                        color=decision.get("color") or candidate.lineage.get("visual_color"),
+                        material=decision.get("material") or candidate.lineage.get("visual_material"),
+                        product_type=decision.get("product_type") or candidate.lineage.get("visual_product_type"),
+                        feature=decision.get("feature") or candidate.lineage.get("visual_feature"),
+                        brand=brand,
+                        brand_prefix_policy="REQUIRED",
+                    )
+                    decision_source = "BRAND_GOVERNED_FALLBACK"
+            except NamingReviewRequired as error:
+                return StageOutcome(StageDecision.REJECTED, f"NAMING_REVIEW:{error}")
+
         # CGTrader is visual-first: route/category only records discovery
         # scope and can never replace the reviewed product type.
-        if self.source_policy.source_host == "cgtrader.com":
+        elif self.source_policy.source_host == "cgtrader.com":
             try:
                 governed_name = compose_product_name(
                     style=decision.get("style") or candidate.lineage.get("visual_style"),
@@ -898,10 +1014,19 @@ class ProductionPipeline:
             if products:
                 self.pool.add_candidates([_candidate_from_product(self.contract, item) for item in products])
             base = max(1, len(self.pool.records()))
-        if str(self.contract.get("category_allocation") or "TOTAL_ACROSS_SELECTED") == "PER_CATEGORY":
+        allocation = str(self.contract.get("category_allocation") or "TOTAL_ACROSS_SELECTED")
+        if allocation == "PER_CATEGORY":
+            # 每个类目分别满足：用户填的数字是「每个类目各自的数量」，总计 = 数量 × 类目数。
             groups = [str(item.get("canonical_name") or item.get("category_id")) for item in categories]
             quotas = {group: base for group in groups}
             return max(1, base * len(groups)), quotas, "REQUIRED"
+        # 所选类目合计 + 平均分配：把总数 N 硬性均分到每个已选类目（总计仍是 N），
+        # 而不是像 PER_CATEGORY 那样把 N 当成每个类目的量导致翻倍。
+        strategy = str(self.contract.get("allocation_strategy") or "SEQUENTIAL").upper()
+        if strategy == "EVEN" and categories:
+            groups = [str(item.get("canonical_name") or item.get("category_id")) for item in categories]
+            quotas = _distribute_evenly(max(1, base), groups)
+            return max(1, base), quotas, "REQUIRED"
         return max(1, base), {}, "NONE"
 
     def _record_completion(self, record: CandidateRecord) -> None:
@@ -935,6 +1060,24 @@ class ProductionPipeline:
             session.commit()
         finally:
             session.close()
+
+    def _emit_granular_progress(self, records: list[CandidateRecord], emitted: int) -> int:
+        """把 DISCOVERY 内部逐候选推进的阶段逐步点亮，让前端时间线线性前进。
+
+        返回已发射的最高细分阶段编号；调用方把它保存下来，避免重复发射。
+        """
+        reached = _max_granular_stage(records)
+        for index in range(emitted + 1, reached + 1):
+            label = _GRANULAR_STAGE_LABEL[index]
+            self.emit(
+                "PROGRESS",
+                label,
+                _GRANULAR_STAGE_DETAIL[index],
+                None,
+                None,
+                {"granular_stage": label},
+            )
+        return max(emitted, reached)
 
     def run(self) -> int:
         if not self.contract.get("categories"):
@@ -1055,6 +1198,7 @@ class ProductionPipeline:
                     },
                 )
         engine = ProductionWorkflowEngine(policy=policy, pool=self.pool, adapter=adapter, completion_recorder=self._record_completion)
+        granular_emitted = 0
         if not self.pool.records():
             try:
                 initial = adapter.refill(needed=target, pool=self.pool)
@@ -1073,19 +1217,22 @@ class ProductionPipeline:
                 return 2
             added = self.pool.add_candidates(initial)["added"]
             self.emit("DISCOVERY_COMPLETED", "DISCOVERY", f"已在所选范围发现 {added} 个唯一候选", added, target, {"discovered_count": added, "unique_count": added, "provider_calls": 0})
+            granular_emitted = self._emit_granular_progress(self.pool.records(), granular_emitted)
         try:
             for _ in range(max(80, target * 20)):
                 records = self.pool.records()
+                granular_emitted = self._emit_granular_progress(records, granular_emitted)
                 ready = sum(item.state is ItemState.MODEL_INPUT_LOCKED for item in records)
                 provider_off = str(self.contract.get("provider") or "OFF").casefold() == "off"
                 if provider_off and ready and ready == len(records) and ready < target:
                     try:
                         refill = adapter.refill(needed=target - ready, pool=self.pool)
                     except SupplyExhaustedError:
-                        if str(self.contract.get("target_mode") or "EXACT_N") == "UP_TO_N":
-                            self.pool.set_job_status("READY_POOL", reason=f"UP_TO_N supply exhausted at {ready}/{target}")
-                            self.emit("READY_POOL_COMPLETED", "READY_POOL", f"Up-To {target} Ready Pool 已形成 {ready} 个；所选范围已耗尽且 Provider OFF", ready, target, {"ready_count": ready, "eligible_count": ready, "provider_calls": adapter.provider_posts, "target_mode": "UP_TO_N", "candidate_pool_path": str(self.pool.path)})
-                            self.emit("JOB_BLOCKED", "PROVIDER_SAFETY", "Ready Pool 已保存；选择并审批 Provider 后恢复同一 Job", ready, target, {"blocker": "PROVIDER_REQUIRED", "ready_count": ready, "provider_calls": adapter.provider_posts, "target_mode": "UP_TO_N"})
+                        mode = str(self.contract.get("target_mode") or "EXACT_N")
+                        if mode in ("UP_TO_N", "ALL"):
+                            self.pool.set_job_status("READY_POOL", reason=f"{mode} supply exhausted at {ready}/{target}")
+                            self.emit("READY_POOL_COMPLETED", "READY_POOL", f"{'Up-To ' if mode == 'UP_TO_N' else '全部 '}{target} Ready Pool 已形成 {ready} 个；所选范围已耗尽且 Provider OFF", ready, target, {"ready_count": ready, "eligible_count": ready, "provider_calls": adapter.provider_posts, "target_mode": mode, "candidate_pool_path": str(self.pool.path)})
+                            self.emit("JOB_BLOCKED", "PROVIDER_SAFETY", "Ready Pool 已保存；选择并审批 Provider 后恢复同一 Job", ready, target, {"blocker": "PROVIDER_REQUIRED", "ready_count": ready, "provider_calls": adapter.provider_posts, "target_mode": mode})
                             return 2
                         self.emit("TARGET_SHORTAGE", "EXACT_N", f"所选范围已耗尽：Ready Pool {ready}/{target}", ready, target, {"shortage": target - ready, "provider_calls": adapter.provider_posts})
                         return 2
@@ -1121,18 +1268,38 @@ class ProductionPipeline:
                     return self._deliver(target, adapter.provider_posts)
                 if status is RuntimeStatus.SUPPLY_EXHAUSTED:
                     count = self.pool.success_count()
-                    if str(self.contract.get("target_mode") or "EXACT_N") == "UP_TO_N":
+                    mode = str(self.contract.get("target_mode") or "EXACT_N")
+                    if mode in ("UP_TO_N", "ALL"):
                         if str(self.contract.get("provider") or "OFF").casefold() == "off":
                             ready = sum(item.state is ItemState.MODEL_INPUT_LOCKED for item in self.pool.records())
                             if ready:
-                                self.pool.set_job_status("READY_POOL", reason=f"UP_TO_N supply exhausted at {ready}/{target}")
-                                self.emit("READY_POOL_COMPLETED", "READY_POOL", f"Up-To {target} Ready Pool 已形成 {ready} 个；所选范围已耗尽且 Provider OFF", ready, target, {"ready_count": ready, "eligible_count": ready, "provider_calls": adapter.provider_posts, "target_mode": "UP_TO_N", "candidate_pool_path": str(self.pool.path)})
-                                self.emit("JOB_BLOCKED", "PROVIDER_SAFETY", "Ready Pool 已保存；选择并审批 Provider 后恢复同一 Job", ready, target, {"blocker": "PROVIDER_REQUIRED", "ready_count": ready, "provider_calls": adapter.provider_posts, "target_mode": "UP_TO_N"})
+                                self.pool.set_job_status("READY_POOL", reason=f"{mode} supply exhausted at {ready}/{target}")
+                                self.emit("READY_POOL_COMPLETED", "READY_POOL", f"{'Up-To ' if mode == 'UP_TO_N' else '全部 '}{target} Ready Pool 已形成 {ready} 个；所选范围已耗尽且 Provider OFF", ready, target, {"ready_count": ready, "eligible_count": ready, "provider_calls": adapter.provider_posts, "target_mode": mode, "candidate_pool_path": str(self.pool.path)})
+                                self.emit("JOB_BLOCKED", "PROVIDER_SAFETY", "Ready Pool 已保存；选择并审批 Provider 后恢复同一 Job", ready, target, {"blocker": "PROVIDER_REQUIRED", "ready_count": ready, "provider_calls": adapter.provider_posts, "target_mode": mode})
                                 return 2
                         elif count:
-                            self.pool.set_job_status("SUCCEEDED", reason=f"UP_TO_N delivered {count}/{target} after supply exhaustion")
+                            self.pool.set_job_status("SUCCEEDED", reason=f"{mode} delivered {count}/{target} after supply exhaustion")
                             return self._deliver(count, adapter.provider_posts, requested_target=target)
                     self.emit("TARGET_SHORTAGE", "EXACT_N", f"所选范围已耗尽：完成 {count}/{target}", count, target, {"shortage": target - count, "provider_calls": adapter.provider_posts})
+                    if count and bool((self.contract.get("allow_shortfall_delivery") or False)):
+                        # 操作员已明确「接受缺额交付」：把实际完成的 count 个交付，
+                        # 不再因未达到 Exact-N 而阻断整批。
+                        self.pool.set_job_status("SUCCEEDED", reason=f"EXACT_N delivered {count}/{target} (shortfall accepted)")
+                        return self._deliver(count, adapter.provider_posts, requested_target=target, allow_shortfall=True)
+                    # 未接受缺额：明确进入人工/AI 决策——可「接受缺额并交付」或「暂停调整」。
+                    self.emit(
+                        "HUMAN_DECISION_REQUIRED",
+                        "SHORTAGE",
+                        f"所选范围已耗尽：仅完成 {count}/{target}。请决策：接受缺额交付（完成 {count} 个直接建模交付），或暂停后调整目标/类目再重跑",
+                        count,
+                        target,
+                        {
+                            "shortage": target - count,
+                            "provider_calls": adapter.provider_posts,
+                            "can_accept_shortfall": bool(count),
+                            "resume_safe": True,
+                        },
+                    )
                     return 2
                 if status is RuntimeStatus.MANUAL_RECONCILIATION:
                     self.emit("JOB_BLOCKED", "PROVIDER_RECONCILIATION", "存在 SUBMISSION_UNKNOWN，禁止自动重提", self.pool.success_count(), target, {"blocker": "SUBMISSION_UNKNOWN", "provider_calls": adapter.provider_posts})
@@ -1205,10 +1372,19 @@ class ProductionPipeline:
         self.emit("JOB_BLOCKED", "RUNTIME", "达到有界运行步数；checkpoint 已保存，可恢复同一 Job", self.pool.success_count(), target, {"blocker": "BOUNDED_TICK_LIMIT", "provider_calls": adapter.provider_posts})
         return 2
 
-    def _deliver(self, target: int, provider_posts: int, *, requested_target: int | None = None) -> int:
+    def _deliver(self, target: int, provider_posts: int, *, requested_target: int | None = None, allow_shortfall: bool = False) -> int:
         completed = [item for item in self.pool.records() if item.state is ItemState.COMPLETED and item.raw_glb_path]
+        target_mode = str(self.contract.get("target_mode") or "EXACT_N")
         if len(completed) != target:
-            self.emit("JOB_BLOCKED", "DELIVERY_QA", "Exact-N 与完成模型数量不一致，交付已阻断", len(completed), target, {"blocker": "DELIVERY_COUNT_MISMATCH", "provider_calls": provider_posts})
+            if target_mode == "ALL" or allow_shortfall:
+                # 「全部」模式或「接受缺额」：把实际成功建模的部分交付，
+                # 而不是因个别失败 / 范围耗尽而阻断整批。
+                target = len(completed)
+            else:
+                self.emit("JOB_BLOCKED", "DELIVERY_QA", "Exact-N 与完成模型数量不一致，交付已阻断", len(completed), target, {"blocker": "DELIVERY_COUNT_MISMATCH", "provider_calls": provider_posts})
+                return 2
+        if not completed:
+            self.emit("JOB_BLOCKED", "DELIVERY_QA", "没有可交付的模型", 0, target, {"blocker": "NO_COMPLETED_MODELS", "provider_calls": provider_posts})
             return 2
         delivery = self.workspace / "05_delivery"
         delivery.mkdir(parents=True, exist_ok=True)
@@ -1268,9 +1444,18 @@ class ProductionPipeline:
                 "items": batch_items,
             }
             (batch_dir / "manifest.json").write_text(json.dumps(batch_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            zip_path = delivery / f"{batch_name}.zip"
+            # 每个任务的 zip 以「任务名称 + job_id」为前缀：既体现用户设置的
+            # 任务名（步骤 1 的「任务名称」，可后续编辑），又保证不同任务即使
+            # 同名也不会相互覆盖。
+            task_label = _safe_name(self.contract.get("title") or "")
+            if not task_label:
+                task_label = self.contract["job_id"]
+            zip_name = f"{task_label}_{self.contract['job_id']}_{batch_name}.zip"
+            zip_path = delivery / zip_name
             with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for file_path in sorted(batch_dir.rglob("*")):
+                # 压缩包只装模型 GLB，不把 manifest.json 等 JSON 混进去；
+                # 每批固定最多 20 个模型。
+                for file_path in sorted(batch_dir.rglob("*.glb")):
                     if file_path.is_file():
                         archive.write(file_path, arcname=file_path.relative_to(batch_dir).as_posix())
             batches.append({
@@ -1298,7 +1483,12 @@ class ProductionPipeline:
         manifest_path = delivery / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        label = f"Up-To {requested}" if target_mode == "UP_TO_N" else f"Exact {target}"
+        if target_mode == "ALL":
+            label = f"全部 {target}"
+        elif target_mode == "UP_TO_N":
+            label = f"Up-To {requested}"
+        else:
+            label = f"Exact {target}"
         for batch in batches:
             self.emit(
                 "ARTIFACT_READY",

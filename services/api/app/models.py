@@ -379,6 +379,8 @@ class ProductionJob(Base):
     site_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     goal: Mapped[str] = mapped_column(Text, nullable=False)
+    is_brand_library: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    brand_name: Mapped[str] = mapped_column(String(120), nullable=False, default="")
     target_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="EXACT_N")
     target_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
     scope: Mapped[str] = mapped_column(String(48), nullable=False, default="NEW_ONLY")

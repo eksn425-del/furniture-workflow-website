@@ -304,3 +304,70 @@ def test_completed_quota_retires_unsubmitted_lock_without_provider_post(tmp_path
     assert retired["state"] == ItemState.CATEGORY_REJECTED.value
     assert retired["rejection_reason"] == "QUOTA_ALREADY_FILLED"
     assert "candidate-2" not in adapter.submitted
+
+
+def test_even_quota_spills_over_when_a_category_is_short(tmp_path: Path) -> None:
+    """硬性均分 + 溢出：某类目缺货填不满份额时，由充足类目溢出补足，最终达到总目标。"""
+    order_id = "order-even-spillover"
+    lock = make_order_policy_lock(
+        source="CGTrader", categories={"Chair": 2, "Table": 2}, exact_n=4, provider="lux3d",
+        ruleset="furniture-workflow-8.7.1", image_policy="clean-single-product",
+        five_year_policy="published-within-five-years", naming_policy="deterministic-product-name.v1",
+        dimension_policy="official-or-dual-agent", registry_identity="registry", registry_version="v2",
+        authorization_mode="EXACT_COUNT_AUTHORIZATION", quality_policy="raw-glb-only",
+    )
+    policy = RuntimePolicy(
+        order_id=order_id, job_id=order_id, target_count=4, progressive_gates=(1, 4),
+        provider="lux3d", order_policy=lock,
+    )
+    pool = CandidatePoolStore(tmp_path / "candidate_pool.json", order_id=order_id)
+    pool.set_order_policy_hash(lock.order_policy_hash, target_count=4, progressive_gates=(1, 4))
+    candidates = [_candidate(order_id, index) for index in range(6)]
+    # Table 只有 1 个候选（缺口 1），Chair 有 5 个（充足）。
+    candidates[0].category_group = "Table"
+    candidates[1].category_group = "Chair"
+    candidates[2].category_group = "Chair"
+    candidates[3].category_group = "Chair"
+    candidates[4].category_group = "Chair"
+    candidates[5].category_group = "Chair"
+    pool.add_candidates(candidates)
+
+    class RecordingAdapter(QualificationAdapter):
+        def __init__(self) -> None:
+            super().__init__("never", "never")
+            self.submitted: list[str] = []
+
+        def run(self, *, stage: str, candidate: CandidateRecord) -> StageOutcome:
+            if stage == "submit":
+                self.submitted.append(candidate.candidate_id)
+            return super().run(stage=stage, candidate=candidate)
+
+    adapter = RecordingAdapter()
+    engine = SkillsWorkflowInterface(policy=policy, pool_path=tmp_path / "candidate_pool.json", adapter=adapter)
+    assert engine.run_until(max_ticks=40) is RuntimeStatus.SUCCEEDED
+    # 溢出后总提交数 = 目标 4（Table 1 + Chair 3），而不是卡死或超额。
+    assert len(adapter.submitted) == 4
+
+
+def test_required_quota_rejects_candidate_outside_locked_categories(tmp_path: Path) -> None:
+    order_id = "order-required-scope"
+    lock = make_order_policy_lock(
+        source="CGTrader", categories={"Chair": 1, "Table": 1}, exact_n=2, provider="lux3d",
+        ruleset="furniture-workflow-8.7.1", image_policy="clean-single-product",
+        five_year_policy="published-within-five-years", naming_policy="deterministic-product-name.v1",
+        dimension_policy="official-or-dual-agent", registry_identity="registry", registry_version="v2",
+        authorization_mode="EXACT_COUNT_AUTHORIZATION", quality_policy="raw-glb-only",
+    )
+    policy = RuntimePolicy(
+        order_id=order_id, job_id=order_id, target_count=2, progressive_gates=(1, 2),
+        provider="lux3d", order_policy=lock,
+    )
+    pool_path = tmp_path / "candidate_pool.json"
+    pool = CandidatePoolStore(pool_path, order_id=order_id)
+    pool.set_order_policy_hash(lock.order_policy_hash, target_count=2, progressive_gates=(1, 2))
+    candidate = _candidate(order_id, 0)
+    candidate.category_group = "Unselected"
+    pool.add_candidates([candidate])
+    pool.transition(candidate.candidate_id, ItemState.MODEL_INPUT_LOCKED, reason="fixture")
+    engine = SkillsWorkflowInterface(policy=policy, pool_path=pool_path, adapter=QualificationAdapter("never", "never"))
+    assert engine.engine._category_has_capacity(engine.engine.pool.records()[0]) is False

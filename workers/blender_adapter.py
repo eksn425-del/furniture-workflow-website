@@ -273,6 +273,45 @@ def plan_dimension_normalization(
             "scale_factor": None,
             "dimension_status": "NOT_MEASURED_NO_MESH",
         }
+    # 单轴锚定模式：官网只提供一条有效尺寸，或仅有 AI 预估高度时，
+    # 等比缩放到该轴，长:宽:高 保持模型自身比例不变（三轴同系数）。
+    if target is None and isinstance(target_dimensions, Mapping):
+        anchors: list[tuple[str, float]] = []
+        for axis in ("width", "depth", "height"):
+            try:
+                value = float(target_dimensions.get(axis))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0 and raw_size.get(axis):
+                anchors.append((axis, value))
+        if anchors:
+            factor_unit = _UNIT_TO_MODEL.get(str(dimension_unit or "").strip().casefold(), 1.0)
+            target_partial = {axis: value for axis, value in anchors}
+            target_model_partial = {axis: value * factor_unit for axis, value in anchors}
+            ratios = [target_model_partial[axis] / raw_size[axis] for axis, _ in anchors]
+            spread = max(ratios) / min(ratios)
+            if spread > 1.25:
+                raise ModelDimensionConflict(
+                    "partial target dimensions require non-uniform deformation "
+                    f"(ratio spread {spread:.3f} > 1.25)"
+                )
+            factor = sum(ratios) / len(ratios)
+            final_size = {axis: raw_size[axis] * factor for axis in raw_size}
+            errors = {
+                axis: abs(final_size[axis] - target_model_partial[axis]) / target_model_partial[axis]
+                for axis, _ in anchors
+            }
+            return {
+                "target_dimensions": target_partial,
+                "target_dimensions_model": target_model_partial,
+                "scale_factor": factor,
+                "dimension_status": "PASS" if max(errors.values()) <= 0.15 else "MODEL_DIMENSION_CONFLICT",
+                "planned_final_dimensions": final_size,
+                "dimension_error": errors,
+                "partial_axes_anchored": [axis for axis, _ in anchors],
+                "single_axis_anchored": anchors[0][0] if len(anchors) == 1 else None,
+                "height_anchored": len(anchors) == 1 and anchors[0][0] == "height",
+            }
     if target is None:
         return {
             "target_dimensions": None,

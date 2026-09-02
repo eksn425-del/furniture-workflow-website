@@ -223,6 +223,8 @@ class ProductionRuntimeService:
             "site_display_name": site.display_name if site else job.site_key,
             "title": job.title,
             "goal": job.goal,
+            "is_brand_library": bool(job.is_brand_library),
+            "brand_name": str(job.brand_name or ""),
             "target_mode": job.target_mode,
             "target_value": job.target_value,
             "category_ids": requested_ids,
@@ -232,6 +234,7 @@ class ProductionRuntimeService:
             "category_allocation": job.category_allocation,
             "allocation_strategy": job.allocation_strategy,
             "spillover": job.spillover,
+            "allow_shortfall_delivery": bool(policy.get("allow_shortfall_delivery", False)),
             "source_type": site.source_kind if site else "UNKNOWN",
             "provider": job.provider,
             "authorization": {

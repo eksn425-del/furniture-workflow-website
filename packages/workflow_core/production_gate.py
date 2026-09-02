@@ -60,16 +60,20 @@ def _dimensions_ok(facts: Mapping[str, Any]) -> bool | None:
     raw = _first(facts, "dimensions", "governed_dimensions", "source_dimensions")
     if not isinstance(raw, Mapping):
         raw = facts
+    # 至少提供一个有效轴即为有尺寸证据：AI 预估只给高度时，宽度/深度由
+    # Blender 等比缩放按模型比例补出，因此高度存在即可通过。
+    seen = False
     for axis in ("width", "depth", "height"):
         value = raw.get(axis)
         if value in (None, ""):
-            return None
+            continue
+        seen = True
         try:
             if float(value) <= 0:
                 return False
         except (TypeError, ValueError):
             return False
-    return True
+    return True if seen else None
 
 
 @dataclass(frozen=True)

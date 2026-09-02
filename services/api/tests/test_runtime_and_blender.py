@@ -85,6 +85,22 @@ def test_glb_bbox_and_dimension_plan_prefer_uniform_scale(tmp_path: Path) -> Non
     assert plan["dimension_status"] == "PASS"
 
 
+def test_dimension_plan_supports_one_official_axis_as_uniform_anchor(tmp_path: Path) -> None:
+    path = tmp_path / "raw.glb"
+    _glb_with_position_bounds(path, (0.0, 0.0, 0.0), (2.0, 4.0, 6.0))
+    plan = plan_dimension_normalization(extract_glb_bbox(path), {"width": 4}, "m")
+    assert plan["scale_factor"] == 2.0
+    assert plan["single_axis_anchored"] == "width"
+    assert plan["planned_final_dimensions"] == {"width": 4.0, "depth": 12.0, "height": 8.0}
+
+
+def test_dimension_plan_rejects_conflicting_partial_official_axes(tmp_path: Path) -> None:
+    path = tmp_path / "raw.glb"
+    _glb_with_position_bounds(path, (0.0, 0.0, 0.0), (2.0, 4.0, 6.0))
+    with pytest.raises(ModelDimensionConflict):
+        plan_dimension_normalization(extract_glb_bbox(path), {"width": 4, "height": 20}, "m")
+
+
 def test_dimension_plan_rejects_obvious_non_uniform_deformation(tmp_path: Path) -> None:
     path = tmp_path / "raw.glb"
     _glb_with_position_bounds(path, (0.0, 0.0, 0.0), (2.0, 6.0, 4.0))

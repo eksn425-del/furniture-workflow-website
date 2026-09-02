@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from packages.workflow_core.naming import compose_official_name, compose_product_name
+from packages.workflow_core.naming import compose_brand_official_name, compose_official_name, compose_product_name
 from packages.workflow_core.production_gate import (
     L2_BROWSER_REQUIRED,
     MEDIA_IDENTITY_MISMATCH,
@@ -100,3 +100,17 @@ def test_all_governed_names_keep_whole_words_and_fifty_character_limit() -> None
     assert not official.endswith(" ")
     assert official.startswith("Room & Board ")
     assert official.endswith(" Bed")
+
+
+def test_brand_official_name_does_not_duplicate_brand_and_keeps_limit() -> None:
+    name = compose_brand_official_name(
+        brand="Interior Define",
+        official_name="Interior Define Sloan Custom Modular Sectional",
+        style="Modern",
+        color="Natural",
+        material="Fabric",
+        product_type="Sectional",
+    )
+    assert name.startswith("Interior Define ")
+    assert name.casefold().count("interior define") == 1
+    assert len(name) <= 50

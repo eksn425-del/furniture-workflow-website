@@ -15,7 +15,7 @@ import os
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
@@ -169,6 +169,8 @@ def _job_dict(job: ProductionJob) -> dict:
         "site_key": job.site_key,
         "site_name": _display_name(job.site_key),
         "goal": job.goal,
+        "is_brand_library": bool(job.is_brand_library),
+        "brand_name": str(job.brand_name or ""),
         "status": job.status,
         "current_stage": job.current_stage,
         "target_mode": job.target_mode,
@@ -483,6 +485,8 @@ def create_control_job(payload: ControlJobCreate, request: Request) -> dict:
             site_key=site.site_key,
             title=payload.title,
             goal=payload.goal,
+            is_brand_library=payload.is_brand_library,
+            brand_name=(payload.brand_name or "").strip(),
             target_mode=payload.target_mode,
             target_value=payload.target_value,
             scope=payload.scope,
@@ -628,9 +632,12 @@ def update_target(job_id: str, payload: ControlJobTargetPatch, request: Request)
         if job is None:
             raise HTTPException(status_code=404, detail="production job not found")
         if payload.action == "ACCEPT_SHORTAGE":
-            job.status = "COMPLETED" if job.delivered_count else "PLAN_READY"
-            job.current_stage = "PRODUCTION_PLAN"
-            job.last_reason = payload.reason or "用户确认按当前合格数量继续"
+            policy = _policy(job)
+            policy["allow_shortfall_delivery"] = True
+            job.policy_json = json.dumps(policy, ensure_ascii=False)
+            job.status = "TARGET_SHORTAGE"
+            job.current_stage = "SHORTAGE"
+            job.last_reason = payload.reason or "用户确认接受当前完成数量并继续交付"
         elif payload.action == "ADD_CATEGORY":
             latest_scan = session.scalar(
                 select(SiteScanRun)
@@ -649,10 +656,14 @@ def update_target(job_id: str, payload: ControlJobTargetPatch, request: Request)
                 if not taxonomy["taxonomy_available"]:
                     raise HTTPException(status_code=409, detail=f"当前类目快照不可用（{taxonomy['taxonomy_state']}），请先完成或恢复最新扫描")
                 raise HTTPException(status_code=422, detail=f"类目不属于当前类目快照：{', '.join(invalid[:5])}")
-            selected_set = set(payload.category_ids)
+            # 子级收窄父级：父级被勾选且其下也有勾选的子级时，只保留子级范围。
+            selected_parent_ids = {
+                by_id[cid].parent_category_id for cid in payload.category_ids
+                if by_id[cid].parent_category_id
+            }
             compacted = [
                 category_id for category_id in payload.category_ids
-                if not (by_id[category_id].parent_category_id and by_id[category_id].parent_category_id in selected_set)
+                if category_id not in selected_parent_ids
             ]
             if not compacted:
                 raise HTTPException(status_code=422, detail="至少选择一个有效类目/范围")
@@ -1244,7 +1255,12 @@ def download_delivery_artifact(artifact_id: str, request: Request) -> Response:
             filename = f"{path.name}.zip"
         else:
             raise HTTPException(status_code=404, detail="delivery artifact file is missing")
-        return Response(content=payload, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+        # 文件名可能含中文/空格（例如带任务名前缀的 zip），Content-Disposition
+        # 头不能直接放非 ASCII，否则会被 Starlette 拒绝并返回 500。这里同时给出
+        # ASCII 兜底 filename 和 RFC 5987 的 filename*（UTF-8 百分号编码）。
+        ascii_filename = filename.encode("ascii", "ignore").decode("ascii").strip() or "download.zip"
+        disposition = f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{quote(filename)}'
+        return Response(content=payload, media_type=media_type, headers={"Content-Disposition": disposition})
     finally:
         session.close()
 
@@ -1370,6 +1386,14 @@ def update_control_job(job_id: str, payload: ControlJobEdit, request: Request) -
             goal = " ".join(str(payload.goal).split())
             if goal:
                 job.goal = goal
+        if payload.target_value is not None or payload.provider is not None:
+            # 生产一旦启动，交付目标与 Provider 必须严格按任务开始时确定的要求执行，
+            # 不允许中途改写目标数量或切换建模提供方，避免与运行中的生产契约偏离。
+            running = session.scalar(
+                select(ProductionRun).where(ProductionRun.job_id == job.job_id, ProductionRun.status == "RUNNING")
+            )
+            if running is not None:
+                raise HTTPException(status_code=409, detail="该任务正在生产中，目标数量与 Provider 不可修改；如需更改请先停止当前生产")
         if payload.target_value is not None:
             job.target_value = payload.target_value
             job.requested_count = payload.target_value

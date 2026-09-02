@@ -229,17 +229,53 @@ class ProductionWorkflowEngine:
             and item.raw_glb_sha256
         )
 
+    def _category_has_remaining_supply(self, category: str) -> bool:
+        return any(
+            self._category_key(item) == category and next_stage_for(item.state) is not None
+            for item in self.pool.records()
+        )
+
+    def _spillover_deficit(self) -> int:
+        """硬性均分下，某类目因缺货而无法填满其份额的缺口总量。
+
+        只有当某类目「仍未达到其份额」且「已没有任何还能继续推进的在途候选」时，
+        才认为它缺货。这个缺口允许由其他超额类目溢出填补，避免因单个类目缺货
+        而让整批卡死在 BOUNDED_TICK_LIMIT。
+        """
+        categories = self.policy.order_policy.categories or {}
+        deficit = 0
+        for category, quota in categories.items():
+            q = int(quota)
+            outstanding = self._category_outstanding(category)
+            if outstanding >= q:
+                continue
+            if self._category_has_remaining_supply(category):
+                continue
+            deficit += q - outstanding
+        return deficit
+
     def _category_has_capacity(self, candidate: CandidateRecord) -> bool:
         if getattr(self.policy.order_policy, "category_quota_mode", "REQUIRED") == "NONE":
             return True
         category = self._category_key(candidate)
         quota = self.policy.order_policy.categories.get(category)
         if quota is None:
+            # A REQUIRED quota lock is also a scope lock.  Candidates whose
+            # category is not one of the approved quota keys must never consume
+            # the global target or a spillover deficit.
             return False
-        return self._category_outstanding(category) < int(quota)
+        if self._category_outstanding(category) < int(quota):
+            return True
+        # 本类目份额已满：仅当其他类目因缺货存在未填满的缺口时才允许溢出，
+        # 否则保持硬性份额（防止一个类目把总目标全部吃掉）。
+        return self._spillover_deficit() > 0
 
     def _retire_overquota_locks(self) -> int:
         if getattr(self.policy.order_policy, "category_quota_mode", "REQUIRED") == "NONE":
+            return 0
+        # 存在缺货缺口时，超额类目的在途候选正是用来溢出填补缺口的，
+        # 此时不回收，避免把可用的溢出候选提前清掉。
+        if self._spillover_deficit() > 0:
             return 0
         retired = 0
         for candidate in self.pool.records():

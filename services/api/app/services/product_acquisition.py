@@ -340,6 +340,17 @@ def _l2_browser_channel() -> str | None:
     return None
 
 
+class _VisibleHandoffRequired(Exception):
+    """无头模式下检测到需要人工处理的访问验证，要求上层改用同一会话的可见窗口重开。"""
+
+    def __init__(self, *, url: str, session_dir, evidence: dict[str, Any]):
+        super().__init__("需要切换到可见浏览器处理访问验证")
+        self.url = url
+        self.session_dir = session_dir
+        self.evidence = evidence
+
+
+
 class NativeBrowserCollector:
     """Visible persistent Playwright context; no stealth, proxy rotation, or bypass.
 
@@ -351,14 +362,18 @@ class NativeBrowserCollector:
         self.session_dir = Path(session_dir).resolve()
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
-    def _open_page(self, playwright, url: str):
-        """启动持久可见会话并导航；返回 (context, page)。"""
+    def _open_page(self, playwright, url: str, *, visible: bool = False):
+        """启动持久浏览器会话并导航；返回 (context, page)。
+
+        visible=False 时在后台无头运行（不打扰）；只有遇到需要人工处理的
+        访问验证时，上层才用 visible=True 重开同一会话的可见窗口。
+        """
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
 
         channel = _l2_browser_channel()
         launch_kwargs = {
-            "headless": False,
+            "headless": not visible,
             "viewport": {"width": 1440, "height": 1000},
         }
         if channel:
@@ -388,16 +403,37 @@ class NativeBrowserCollector:
         page.wait_for_timeout(800)
         return context, page
 
-    def _resolve_challenge(self, page, url: str) -> str | None:
-        """若页面进入人机验证，等待人工接管；返回放行后的 HTML 或 None（无需放行）。"""
+    def _resolve_challenge(self, page, url: str, *, headless: bool) -> str | None:
+        """若页面进入人机验证，等待人工接管；返回放行后的 HTML 或 None（无需放行）。
+
+        无头模式下检测到验证控件时抛出 _VisibleHandoffRequired，让上层改用
+        同一持久会话的可见窗口重开后再等待人工处理。
+        """
         evidence = self._visible_access_evidence(page)
         if evidence["temporary_failure"]:
-            raise BrowserHumanRequired(
-                "页面显示临时技术故障；已保留同一浏览器会话，可稍后恢复重试",
-                url=url, session_dir=self.session_dir, reason_code="TEMPORARY_PAGE_FAILURE", evidence=evidence,
-            )
+            # 临时技术故障：自动重载重试（有界），减少无谓的人工介入；仅持续失败才需人工。
+            from playwright.sync_api import Error as PlaywrightError
+            navigation_timeout = max(8_000, min(45_000, int(os.getenv("WEBSITE_L2_NAVIGATION_TIMEOUT_MS", "15000"))))
+            retries = max(1, min(6, int(os.getenv("WEBSITE_L2_TEMP_FAILURE_RETRIES", "4"))))
+            for _ in range(retries):
+                page.wait_for_timeout(4000)
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=navigation_timeout)
+                except PlaywrightError:
+                    pass
+                page.wait_for_timeout(1500)
+                evidence = self._visible_access_evidence(page)
+                if not evidence["temporary_failure"]:
+                    break
+            if evidence["temporary_failure"]:
+                raise BrowserHumanRequired(
+                    "页面显示临时技术故障；已自动重试仍失败，保留同一浏览器会话可稍后恢复重试",
+                    url=url, session_dir=self.session_dir, reason_code="TEMPORARY_PAGE_FAILURE", evidence=evidence,
+                )
         if not evidence["explicit_challenge_control"] or not evidence["visible_challenge_text"]:
             return None
+        if headless:
+            raise _VisibleHandoffRequired(url=url, session_dir=self.session_dir, evidence=evidence)
         handoff_seconds = max(30, min(900, int(os.getenv("WEBSITE_BROWSER_HANDOFF_SECONDS", "180"))))
         for _ in range(handoff_seconds):
             page.wait_for_timeout(1000)
@@ -411,6 +447,26 @@ class NativeBrowserCollector:
             reason_code="ACCESS_CHALLENGE",
             evidence=evidence,
         )
+
+    def _open_resolved(self, playwright, url: str, *, headless: bool = True):
+        """打开 url 的持久会话并处理访问验证，返回 (context, page, released_html)。
+
+        无头模式下先不打扰地跑；检测到需要人工的验证时，自动关闭无头窗口，
+        改用同一持久会话的可见窗口重开并等待人工处理，随后返回放行后的 HTML。
+        released_html 为 None 表示无需放行，直接读取 page 内容即可。
+        """
+        context, page = self._open_page(playwright, url, visible=not headless)
+        try:
+            released = self._resolve_challenge(page, url, headless=headless)
+            return context, page, released
+        except _VisibleHandoffRequired:
+            try:
+                context.close()
+            except Exception:
+                pass
+            context, page = self._open_page(playwright, url, visible=True)
+            released = self._resolve_challenge(page, url, headless=False)
+            return context, page, released
 
     @staticmethod
     def _visible_access_evidence(page) -> dict[str, Any]:
@@ -450,8 +506,7 @@ class NativeBrowserCollector:
             ) from error
         try:
             with sync_playwright() as playwright:
-                context, page = self._open_page(playwright, url)
-                released = self._resolve_challenge(page, url)
+                context, page, released = self._open_resolved(playwright, url, headless=True)
                 if released is not None:
                     context.close()
                     return released
@@ -493,20 +548,29 @@ class NativeBrowserCollector:
         context = None
         try:
             with sync_playwright() as playwright:
-                context, page = self._open_page(playwright, urls[0])
-                pages: dict[str, str] = {}
-                for index, url in enumerate(urls):
-                    if index:
-                        navigation_timeout = max(8_000, min(45_000, int(os.getenv("WEBSITE_L2_NAVIGATION_TIMEOUT_MS", "15000"))))
+                context, page, released = self._open_resolved(playwright, urls[0], headless=True)
+                pages: dict[str, str] = {urls[0]: released if released is not None else page.content()}
+                headless = True
+                for url in urls[1:]:
+                    navigation_timeout = max(8_000, min(45_000, int(os.getenv("WEBSITE_L2_NAVIGATION_TIMEOUT_MS", "15000"))))
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=navigation_timeout)
+                        page.wait_for_timeout(450)
+                    except PlaywrightError:
+                        # One slow category must not discard the taxonomy
+                        # already collected from the entry page or block all
+                        # remaining bounded probes.
+                        continue
+                    try:
+                        released = self._resolve_challenge(page, url, headless=headless)
+                    except _VisibleHandoffRequired:
+                        # 后续页面遇到需要人工的验证：切换为同一会话的可见窗口继续。
                         try:
-                            page.goto(url, wait_until="domcontentloaded", timeout=navigation_timeout)
-                            page.wait_for_timeout(450)
-                        except PlaywrightError:
-                            # One slow category must not discard the taxonomy
-                            # already collected from the entry page or block all
-                            # remaining bounded probes.
-                            continue
-                    released = self._resolve_challenge(page, url)
+                            context.close()
+                        except Exception:
+                            pass
+                        context, page, released = self._open_resolved(playwright, url, headless=False)
+                        headless = False
                     pages[url] = released if released is not None else page.content()
                 return pages
         except BrowserHumanRequired:
@@ -545,19 +609,19 @@ class NativeBrowserCollector:
             ) from error
         try:
             with sync_playwright() as playwright:
-                context, page = self._open_page(playwright, url)
-                released = self._resolve_challenge(page, url)
-                # 优先在 DOM 中直接寻找 Dimensions 标签并点击展开
-                for label in DIMENSION_TAB_LABELS:
-                    try:
-                        locator = page.get_by_text(label, exact=False).first
-                        if locator.count() == 0:
+                context, page, released = self._open_resolved(playwright, url, headless=True)
+                if released is None:
+                    # 优先在 DOM 中直接寻找 Dimensions 标签并点击展开
+                    for label in DIMENSION_TAB_LABELS:
+                        try:
+                            locator = page.get_by_text(label, exact=False).first
+                            if locator.count() == 0:
+                                continue
+                            locator.click(timeout=3500)
+                            page.wait_for_timeout(800)
+                            break
+                        except Exception:
                             continue
-                        locator.click(timeout=3500)
-                        page.wait_for_timeout(800)
-                        break
-                    except Exception:
-                        continue
                 body = page.content()
                 context.close()
                 visible = re.sub(r"<[^>]+>", " ", body)
@@ -644,10 +708,15 @@ class ProductAcquisitionEngine:
     @staticmethod
     def _compact_scopes(categories: list[dict[str, Any]]) -> list[dict[str, Any]]:
         selected = [dict(item) for item in categories if item.get("selected", True)]
-        selected_ids = {str(item.get("category_id") or "") for item in selected}
+        # 子级收窄父级：父级被勾选且其下也有勾选的子级时，只保留子级范围，
+        # 父级自身不作为范围（父级整棵子树退化为仅勾选的子级）。
+        selected_parent_ids = {
+            str(item.get("parent_category_id") or "") for item in selected
+            if str(item.get("parent_category_id") or "")
+        }
         compacted = [
             item for item in selected
-            if not str(item.get("parent_category_id") or "") in selected_ids
+            if not (str(item.get("category_id") or "") in selected_parent_ids)
         ]
         seen: set[str] = set()
         result = []

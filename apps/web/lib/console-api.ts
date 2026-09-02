@@ -24,6 +24,8 @@ export interface ControlJob {
   site_key: string;
   site_name: string;
   goal: string;
+  is_brand_library: boolean;
+  brand_name: string;
   status: ControlStatus;
   current_stage: string;
   target_mode: "EXACT_N" | "UP_TO_N" | "ALL";
@@ -302,6 +304,8 @@ export interface CreateControlJobInput {
   source_url: string;
   title: string;
   goal: string;
+  is_brand_library?: boolean;
+  brand_name?: string;
   target_mode: "EXACT_N" | "UP_TO_N" | "ALL";
   target_value: number | null;
   scope: "NEW_ONLY" | "TOTAL_INCLUDING_EXISTING";

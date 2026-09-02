@@ -310,6 +310,49 @@ def compose_official_name(
     )
 
 
+def compose_brand_official_name(
+    *,
+    brand: object,
+    official_name: object,
+    style: object = "",
+    color: object = "",
+    material: object = "",
+    product_type: object = "",
+    max_chars: int = MAX_FINAL_NAME_CHARS,
+) -> str:
+    """品牌库命名：品牌前缀 + 官方名 + 风格/颜色/材质/类型。
+
+    有官方名时先提取官方名（产品系列身份），再用四段式（风格/颜色/材质/类型）
+    表达，品牌前缀必填。名称过长时优先移除风格/颜色/材质等可选词，
+    始终保留品牌前缀、官方名与类型。
+    """
+
+    canonical_brand = _canonical_brand(brand, required=True)
+    official = _name_text(official_name)
+    if official.casefold().startswith(f"{canonical_brand} ".casefold()):
+        official = official[len(canonical_brand):].strip()
+    type_text = ""
+    if str(product_type or "").strip():
+        try:
+            verified = standardize_product_type(product_type)
+        except NamingReviewRequired:
+            verified = ""
+        if verified and not _key(official).endswith(_key(verified)):
+            type_text = verified
+    attrs = [str(item).strip() for item in (style, color, material) if str(item or "").strip()]
+    words = [canonical_brand, official] + attrs
+    if type_text:
+        words.append(type_text)
+    candidate = " ".join(words)
+    return shorten_name_to_limit(
+        candidate,
+        max_chars=max_chars,
+        required_prefix=canonical_brand,
+        required_type=type_text,
+        removable_phrases=tuple(attrs) + ("New", "Exclusive", "Collection", "Premium", "Signature", "Limited Edition"),
+    )
+
+
 def _type_candidates(evidence: object) -> list[str]:
     text = _key(evidence)
     if not text:
@@ -466,6 +509,7 @@ __all__ = [
     "TYPE_VOCABULARY",
     "VOCABULARY_PATH",
     "canonicalize_attribute",
+    "compose_brand_official_name",
     "compose_official_name",
     "compose_product_name",
     "shorten_name_to_limit",

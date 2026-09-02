@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import date, datetime
 
@@ -532,6 +532,8 @@ class ControlJobCreate(BaseModel):
     source_url: AnyHttpUrl
     title: str = Field(default="未命名家具采集任务", max_length=200)
     goal: str = Field(default="发现家具产品并生成可交付模型", max_length=2000)
+    is_brand_library: bool = Field(default=False)
+    brand_name: str = Field(default="", max_length=120)
     target_mode: Literal["EXACT_N", "UP_TO_N", "ALL"] = "EXACT_N"
     target_value: int | None = Field(default=1, ge=1, le=5000)
     scope: Literal["NEW_ONLY", "TOTAL_INCLUDING_EXISTING"] = "NEW_ONLY"

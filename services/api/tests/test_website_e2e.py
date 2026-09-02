@@ -137,9 +137,14 @@ def test_add_site_to_delivery_runs_complete_local_workflow(monkeypatch, tmp_path
             assert download.status_code == 200, download.text
             with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
                 names = archive.namelist()
-                assert "manifest.json" in names
-                assert len([name for name in names if name.endswith(".glb")]) == batch["file_count"]
-                batch_manifest = json.loads(archive.read("manifest.json"))
-                assert all(item["target_dimensions"] for item in batch_manifest["items"])
-                assert all(item["dimension_source"] == "OFFICIAL_STRUCTURED" for item in batch_manifest["items"])
-                assert all(item["blender_qa"]["status"] == "PASS" for item in batch_manifest["items"])
+                assert names
+                assert all(name.endswith(".glb") for name in names)
+                assert len(names) == batch["file_count"]
+
+        manifest_artifact = next(item for item in finished["artifacts"] if item["artifact_type"] == "MANIFEST_JSON")
+        manifest_download = client.get(f"/api/v1/control/deliveries/artifacts/{manifest_artifact['artifact_id']}/download")
+        assert manifest_download.status_code == 200, manifest_download.text
+        manifest = manifest_download.json()
+        assert all(item["target_dimensions"] for item in manifest["items"])
+        assert all(item["dimension_source"] == "OFFICIAL_STRUCTURED" for item in manifest["items"])
+        assert all(item["blender_qa"]["status"] == "PASS" for item in manifest["items"])

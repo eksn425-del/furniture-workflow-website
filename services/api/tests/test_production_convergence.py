@@ -340,7 +340,7 @@ def test_marketplace_requires_scope_before_network(tmp_path: Path) -> None:
         engine.discover(1)
 
 
-def test_parent_child_category_dedup(tmp_path: Path) -> None:
+def test_parent_child_category_narrows_to_child(tmp_path: Path) -> None:
     engine = ProductAcquisitionEngine(
         source_url="https://example.test/",
         site_key="example.test",
@@ -353,7 +353,8 @@ def test_parent_child_category_dedup(tmp_path: Path) -> None:
         browser_session_dir=tmp_path / "browser",
         client_factory=lambda **_: SimpleNamespace(),
     )
-    assert [item["category_id"] for item in engine.categories] == ["parent"]
+    # 子级收窄父级：父级和子级同时勾选时只保留子级范围。
+    assert [item["category_id"] for item in engine.categories] == ["child"]
 
 
 def test_no_browser_evidence_dir_required_and_selected_scope_contract(tmp_path: Path) -> None:
