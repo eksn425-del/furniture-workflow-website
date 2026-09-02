@@ -58,7 +58,7 @@ from packages.workflow_core.source_policy import resolve_source_policy
 from packages.workflow_core.statuses import ItemState
 from workers.modeling_provider import Lux3DClient, is_capacity_rejection
 from workers.blender_adapter import BlenderAdapterError, ModelDimensionConflict, resolve_blender_adapter, validate_glb
-from workers.scrape.http_client import NetworkPolicyError, SafeHttpClient
+from workers.scrape.http_client import NetworkPolicyError, RobotsDenied, SafeHttpClient
 
 
 Emit = Callable[[str, str, str, int | None, int | None, dict[str, Any] | None], None]
@@ -92,6 +92,23 @@ def _distribute_evenly(total: int, groups: list[str]) -> dict[str, int]:
         str(group): share + (1 if index < remainder else 0)
         for index, group in enumerate(groups)
     }
+
+
+def _distribute_proportionally(total: int, weights: dict[str, int]) -> dict[str, int]:
+    """Allocate an Exact-N total by reported scope counts with stable ties."""
+
+    total = max(1, int(total))
+    positive = {str(key): max(0, int(value)) for key, value in weights.items()}
+    weight_sum = sum(positive.values())
+    if weight_sum <= 0:
+        return _distribute_evenly(total, list(positive))
+    raw = {key: total * value / weight_sum for key, value in positive.items()}
+    quotas = {key: int(value) for key, value in raw.items()}
+    remainder = total - sum(quotas.values())
+    ranked = sorted(raw, key=lambda key: (-(raw[key] - quotas[key]), list(positive).index(key)))
+    for key in ranked[:remainder]:
+        quotas[key] += 1
+    return quotas
 
 
 def _candidate_progress_signature(records: list[CandidateRecord]) -> tuple[tuple[str, str, str, str, str, str], ...]:
@@ -492,17 +509,27 @@ class WebsiteStageAdapter:
         else:
             # L1/HTML evidence may omit an accordion's Dimensions block.  Give
             # the same bounded L2 session one chance to obtain official values
-            # before accepting any Brain estimate. 若 L2 尺寸核对需要人工（访问
-            # 验证等），不再暂停，直接落到 AI 预估高度回退，保证全自动推进。
+            # before accepting any Brain estimate. A visible challenge is not
+            # evidence that the official dimensions are absent: keep the
+            # candidate resumable instead of silently converting an access
+            # failure into AI_ESTIMATED dimensions.
             browser_dims: dict[str, float] = {}
             browser_unit = ""
             try:
                 session_dir = Path(str(self.acquisition.browser_session_dir))
                 browser_dims, browser_unit = NativeBrowserCollector(session_dir).extract_dimensions(str(candidate.canonical_url))
-            except BrowserHumanRequired:
-                browser_dims, browser_unit = {}, ""
+            except BrowserHumanRequired as error:
+                return StageOutcome(
+                    StageDecision.PENDING,
+                    "DIMENSIONS_BROWSER_HUMAN_REQUIRED",
+                    {
+                        "dimension_access_status": "HUMAN_REQUIRED",
+                        "dimension_access_reason": error.reason_code,
+                        "dimension_access_url": error.url,
+                    },
+                )
             except BrowserRuntimeMissing:
-                browser_dims, browser_unit = {}, ""
+                raise
             if all(browser_dims.get(axis) for axis in axes):
                 values = {axis: browser_dims[axis] for axis in axes}
                 source = "OFFICIAL_PAGE"
@@ -1015,17 +1042,36 @@ class ProductionPipeline:
                 self.pool.add_candidates([_candidate_from_product(self.contract, item) for item in products])
             base = max(1, len(self.pool.records()))
         allocation = str(self.contract.get("category_allocation") or "TOTAL_ACROSS_SELECTED")
+        scope_ids = [str(item.get("category_id") or "").strip() for item in categories]
+        scope_ids = [value for value in scope_ids if value]
         if allocation == "PER_CATEGORY":
             # 每个类目分别满足：用户填的数字是「每个类目各自的数量」，总计 = 数量 × 类目数。
-            groups = [str(item.get("canonical_name") or item.get("category_id")) for item in categories]
-            quotas = {group: base for group in groups}
-            return max(1, base * len(groups)), quotas, "REQUIRED"
+            quotas = {scope_id: base for scope_id in scope_ids}
+            return max(1, base * len(scope_ids)), quotas, "REQUIRED"
         # 所选类目合计 + 平均分配：把总数 N 硬性均分到每个已选类目（总计仍是 N），
         # 而不是像 PER_CATEGORY 那样把 N 当成每个类目的量导致翻倍。
         strategy = str(self.contract.get("allocation_strategy") or "SEQUENTIAL").upper()
         if strategy == "EVEN" and categories:
-            groups = [str(item.get("canonical_name") or item.get("category_id")) for item in categories]
-            quotas = _distribute_evenly(max(1, base), groups)
+            quotas = _distribute_evenly(max(1, base), scope_ids)
+            return max(1, base), quotas, "REQUIRED"
+        if strategy == "PROPORTIONAL" and categories:
+            weights: dict[str, int] = {}
+            for item in categories:
+                scope_id = str(item.get("category_id") or "").strip()
+                value = item.get("count_value")
+                kind = str(item.get("count_kind") or "UNKNOWN").upper()
+                if not scope_id or kind == "UNKNOWN" or not isinstance(value, int) or value < 0:
+                    raise ProductAcquisitionError("CATEGORY_COUNTS_REQUIRED_FOR_PROPORTIONAL")
+                weights[scope_id] = value
+            return max(1, base), _distribute_proportionally(max(1, base), weights), "REQUIRED"
+        if strategy == "CUSTOM" and categories:
+            raw = self.contract.get("category_quotas")
+            custom = raw if isinstance(raw, dict) else {}
+            if set(custom) != set(scope_ids) or any(int(custom.get(scope_id, 0)) < 0 for scope_id in scope_ids):
+                raise ProductAcquisitionError("CUSTOM_CATEGORY_QUOTAS_REQUIRED_BY_SCOPE_ID")
+            quotas = {scope_id: int(custom[scope_id]) for scope_id in scope_ids}
+            if sum(quotas.values()) != max(1, base):
+                raise ProductAcquisitionError("CUSTOM_CATEGORY_QUOTAS_MUST_SUM_TO_TARGET")
             return max(1, base), quotas, "REQUIRED"
         return max(1, base), {}, "NONE"
 
@@ -1096,6 +1142,10 @@ class ProductionPipeline:
         except BrowserRuntimeMissing as error:
             self.emit("JOB_BLOCKED", "L2_BROWSER", str(error), 0, 0, {"blocker": error.code, "reason_code": error.code})
             return 2
+        except NetworkPolicyError as error:
+            reason = "ROBOTS_DENIED" if isinstance(error, RobotsDenied) else type(error).__name__.upper()
+            self.emit("JOB_BLOCKED", "DISCOVERY", str(error), 0, int(self.contract.get("target_value") or 0), {"blocker": reason, "reason_code": reason, "browser_escalation": False})
+            return 2
         except ProductAcquisitionError as error:
             reason = str(error).strip() if str(error).strip().isupper() else error.code
             self.emit("JOB_BLOCKED", "DISCOVERY", str(error), 0, 0, {"blocker": reason, "reason_code": reason})
@@ -1137,6 +1187,7 @@ class ProductionPipeline:
             max_provider_slots=provider_slots,
             max_steps_per_tick=20,
             max_refill_rounds=100,
+            spillover=str(self.contract.get("spillover") or "ASK").upper(),
         )
         adapter = WebsiteStageAdapter(
             contract=self.contract,
@@ -1361,6 +1412,10 @@ class ProductionPipeline:
             return 2
         except BrowserRuntimeMissing as error:
             self.emit("JOB_BLOCKED", "L2_BROWSER", str(error), self.pool.success_count(), target, {"blocker": error.code, "reason_code": error.code, "provider_calls": adapter.provider_posts})
+            return 2
+        except NetworkPolicyError as error:
+            reason = "ROBOTS_DENIED" if isinstance(error, RobotsDenied) else type(error).__name__.upper()
+            self.emit("JOB_BLOCKED", "DISCOVERY", str(error), self.pool.success_count(), target, {"blocker": reason, "reason_code": reason, "browser_escalation": False, "provider_calls": adapter.provider_posts})
             return 2
         except ProductAcquisitionError as error:
             reason = str(error).strip() if str(error).strip().isupper() else error.code

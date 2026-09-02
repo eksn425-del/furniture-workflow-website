@@ -346,6 +346,39 @@ class SiteCategory(Base):
     scope_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="CATEGORY")
 
 
+class SiteCategorySnapshot(Base):
+    """Immutable category rows owned by one taxonomy snapshot.
+
+    ``SiteCategory`` remains the latest-site read model for compatibility, but
+    its rows are intentionally replaced after a successful rescan.  Jobs bind
+    to a snapshot, so they need an immutable copy that survives that refresh.
+    """
+
+    __tablename__ = "site_category_snapshots"
+    __table_args__ = (UniqueConstraint("snapshot_id", "category_id", name="uq_site_category_snapshot_id"),)
+
+    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    category_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    site_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    native_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    canonical_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    count_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    count_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="UNKNOWN")
+    reported_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    discovered_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    eligible_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    confidence: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    parent_category_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    level: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    scope_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="CATEGORY")
+
+
 class SiteScanRun(Base):
     __tablename__ = "site_scan_runs"
 

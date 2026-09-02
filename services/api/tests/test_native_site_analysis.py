@@ -122,6 +122,42 @@ def test_coarsen_does_not_sum_known_children_over_unknown_member() -> None:
     assert merged[0].count_kind == "UNKNOWN"
 
 
+def test_coarsen_retains_all_native_member_scope_urls() -> None:
+    categories = [
+        TaxonomyCategoryContract(
+            category_id="chairs-a",
+            native_name="Dining Chairs",
+            canonical_name="Dining Chairs",
+            path="/living/dining-chairs",
+            source_url="https://example.test/living/dining-chairs",
+            count_value=4,
+            count_kind="EXACT",
+            level=2,
+            parent_path="/living",
+        ),
+        TaxonomyCategoryContract(
+            category_id="chairs-b",
+            native_name="Lounge Chairs",
+            canonical_name="Lounge Chairs",
+            path="/living/lounge-chairs",
+            source_url="https://example.test/living/lounge-chairs",
+            count_value=3,
+            count_kind="EXACT",
+            level=2,
+            parent_path="/living",
+        ),
+    ]
+
+    merged = NativeSiteAnalyzer._coarsen(categories)
+    evidence = [item for item in merged[0].evidence if item.get("role") == "coarse_scope_members"]
+
+    assert evidence
+    assert evidence[0]["urls"] == [
+        "https://example.test/living/dining-chairs",
+        "https://example.test/living/lounge-chairs",
+    ]
+
+
 def test_retryable_server_status_escalates_to_browser_path(tmp_path: Path) -> None:
     class EdgeBlockedClient(FakeSiteClient):
         def get_html(self, _: str) -> str:

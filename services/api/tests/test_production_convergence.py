@@ -20,6 +20,7 @@ from app.models import (
     ProductionRun,
     RuntimeEvent,
     SiteCategory,
+    SiteCategorySnapshot,
     SiteEntryURL,
     SiteRegistryRecord,
     SiteScanRun,
@@ -30,6 +31,7 @@ from app.schemas import ControlJobApproval, ControlJobStart, LocalAgentProductRe
 from app.services.brain_provider import BrainSettings, WebsiteBrainProvider
 from app.services.product_acquisition import (
     AcquiredProduct,
+    BrowserHumanRequired,
     ProductAcquisitionEngine,
     ProductAcquisitionError,
     ProductSupplyExhausted,
@@ -39,9 +41,10 @@ from app.services.production_runtime import ProductionRuntimeService
 from app.services import production_runtime as production_runtime_module
 from app.services.site_scan_runtime import SiteScanRuntimeService
 from packages.workflow_core.statuses import ItemState
+from furniture_workflow_engine import StageDecision
 from packages.workflow_core.candidate_pool import CandidatePoolStore, CandidateRecord
 from workers.blender_adapter import validate_glb
-from workers.production_pipeline import ProductionPipeline
+from workers.production_pipeline import ProductionPipeline, WebsiteStageAdapter
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + (b"production-fixture" * 128)
@@ -220,6 +223,95 @@ def _run_pipeline(
         provider_client=provider,
     )
     return pipeline, events
+
+
+def test_dimension_browser_challenge_does_not_fall_back_to_ai_estimate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An official-dimension access failure stays resumable, never becomes a guess."""
+
+    contract = _contract(tmp_path, job_id="job-dimension-challenge", target=1)
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    pool = CandidatePoolStore(
+        tmp_path / "pool.json",
+        order_id=contract["job_id"],
+        job_id=contract["job_id"],
+    )
+    candidate = CandidateRecord(
+        candidate_id="candidate-dimension-challenge",
+        order_id=contract["job_id"],
+        job_id=contract["job_id"],
+        record_id="record-dimension-challenge",
+        source="example.test",
+        source_product_id="sku-dimension-challenge",
+        canonical_url="https://example.test/products/chair-1",
+        preview_id="chair-1",
+        preview_url="https://example.test/media/chair-1.png",
+        capture_sha256="capture-dimension-challenge",
+        image_sha256="image-dimension-challenge",
+        category_group="Chairs",
+        lineage={
+            "source_dimensions": {},
+            "brain_product_decision": {
+                "height": 31,
+                "dimension_source": "AI_ESTIMATED",
+            },
+        },
+    )
+
+    def raise_challenge(*_: object, **__: object) -> tuple[dict[str, float], str]:
+        raise BrowserHumanRequired(
+            "official dimensions are temporarily unavailable",
+            url=candidate.canonical_url,
+            session_dir=tmp_path / "browser",
+            reason_code="TEMPORARY_PAGE_FAILURE",
+        )
+
+    monkeypatch.setattr(
+        "workers.production_pipeline.NativeBrowserCollector.extract_dimensions",
+        raise_challenge,
+    )
+    adapter = WebsiteStageAdapter(
+        contract=contract,
+        database=database,
+        pool=pool,
+        acquisition=SimpleNamespace(browser_session_dir=tmp_path / "browser"),
+        workspace=tmp_path / "workspace",
+        brain=SimpleNamespace(review_provider="LOCAL_AGENT"),
+        provider_client=None,
+        blender_adapter=None,
+        media_client_factory=None,
+        emit=lambda *_: None,
+    )
+    try:
+        outcome = adapter._stage_dimension(candidate)
+        assert outcome.decision is StageDecision.PENDING
+        assert outcome.reason == "DIMENSIONS_BROWSER_HUMAN_REQUIRED"
+        assert outcome.evidence["dimension_access_reason"] == "TEMPORARY_PAGE_FAILURE"
+        assert candidate.lineage.get("dimension_estimation") is not True
+    finally:
+        database.dispose()
+
+
+def test_category_quota_strategies_use_stable_scope_ids(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = _contract(tmp_path, job_id="job-quota-strategies", target=4)
+    contract["category_ids"] = ["cat-a", "cat-b"]
+    contract["categories"] = [
+        {"category_id": "cat-a", "canonical_name": "Chairs", "count_value": 9, "count_kind": "EXACT"},
+        {"category_id": "cat-b", "canonical_name": "Tables", "count_value": 3, "count_kind": "EXACT"},
+    ]
+    contract["allocation_strategy"] = "PROPORTIONAL"
+    pipeline, _ = _run_pipeline(monkeypatch, tmp_path, contract=contract, products=[])
+    target, quotas, quota_mode = pipeline._target_and_quotas()
+    assert (target, quotas, quota_mode) == (4, {"cat-a": 3, "cat-b": 1}, "REQUIRED")
+
+    contract["allocation_strategy"] = "CUSTOM"
+    contract["category_quotas"] = {"cat-a": 1, "cat-b": 3}
+    assert pipeline._target_and_quotas() == (4, {"cat-a": 1, "cat-b": 3}, "REQUIRED")
+    contract["category_quotas"] = {"Chairs": 4}
+    with pytest.raises(ProductAcquisitionError, match="CUSTOM_CATEGORY_QUOTAS_REQUIRED_BY_SCOPE_ID"):
+        pipeline._target_and_quotas()
 
 
 def _job(job_id: str, *, provider: str = "OFF", policy: dict | None = None) -> ProductionJob:
@@ -697,6 +789,69 @@ def test_job_snapshot_binding_never_falls_back_to_newer_taxonomy(tmp_path: Path)
         assert _job_categories(session, job) == []
     finally:
         session.close()
+        database.dispose()
+
+
+def test_job_snapshot_binding_survives_site_rescan(tmp_path: Path) -> None:
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(SiteRegistryRecord(site_key="example.test", domain="example.test", display_name="Acme"))
+        job = _job("job-snapshot-rescan", policy={"category_ids": ["cat-chairs"]})
+        session.add(job)
+        session.add(SiteScanRun(scan_id="scan-old", site_key="example.test", source_url="https://example.test/", status="ANALYZING", live=True, job_id=job.job_id))
+        session.commit()
+    finally:
+        session.close()
+
+    runtime = SiteScanRuntimeService(database, tmp_path / "output", object())
+    old_receipt = {
+        "status": "READY", "verified": True, "taxonomy_level": "L1", "source_type": "DIRECT_BRAND", "source_scope": "SITE",
+        "categories": [{
+            "category_id": "cat-chairs", "path": "/chairs", "native_name": "Chairs", "canonical_name": "Chairs",
+            "source_url": "https://example.test/chairs", "count_value": 12, "count_kind": "EXACT", "confidence": 0.95,
+            "level": 1, "evidence": [{"role": "visible_count", "value": 12}],
+        }],
+    }
+    new_receipt = {
+        "status": "READY", "verified": True, "taxonomy_level": "L1", "source_type": "DIRECT_BRAND", "source_scope": "SITE",
+        "categories": [{
+            "category_id": "cat-chairs", "path": "/chairs", "native_name": "Chairs", "canonical_name": "Chairs",
+            "source_url": "https://example.test/chairs", "count_value": 99, "count_kind": "EXACT", "confidence": 0.95,
+            "level": 1, "evidence": [{"role": "visible_count", "value": 99}],
+        }],
+    }
+    try:
+        runtime._persist("scan-old", old_receipt, tmp_path / "old")
+        session = database.session_factory()
+        try:
+            job = session.get(ProductionJob, "job-snapshot-rescan")
+            assert job is not None
+            old_categories = _job_categories(session, job)
+            assert old_categories and old_categories[0].count_value == 12
+            snapshot_id = json.loads(job.policy_json)["category_snapshot_id"]
+            assert session.scalar(select(SiteCategorySnapshot).where(SiteCategorySnapshot.snapshot_id == snapshot_id)) is not None
+            session.add(SiteScanRun(scan_id="scan-new", site_key="example.test", source_url="https://example.test/", status="ANALYZING", live=True))
+            session.commit()
+        finally:
+            session.close()
+        runtime._persist("scan-new", new_receipt, tmp_path / "new")
+        session = database.session_factory()
+        try:
+            job = session.get(ProductionJob, "job-snapshot-rescan")
+            assert job is not None
+            assert _job_categories(session, job)[0].count_value == 12
+            current = session.scalar(select(SiteCategory).where(SiteCategory.site_key == "example.test", SiteCategory.path == "/chairs"))
+            assert current is not None and current.count_value == 99
+            contract_root = tmp_path / "contract"
+            contract_root.mkdir(parents=True, exist_ok=True)
+            contract = ProductionRuntimeService(database, tmp_path / "output")._contract(session, job, contract_root)[2]
+            assert contract["categories"][0]["count_value"] == 12
+        finally:
+            session.close()
+    finally:
+        runtime.shutdown()
         database.dispose()
 
 

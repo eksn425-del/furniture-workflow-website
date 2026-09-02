@@ -18,6 +18,7 @@ from app.models import (
     ProductionJob,
     ProductionJobEvent,
     SiteCategory,
+    SiteCategorySnapshot,
     SiteEntryURL,
     SiteProfile,
     SiteRegistryRecord,
@@ -259,6 +260,32 @@ class SiteScanRuntimeService:
             for category, item in categories:
                 parent_path = str(item.get("parent_path") or "")
                 category.parent_category_id = by_path.get(parent_path) if parent_path else None
+            # Keep a snapshot-owned copy before the mutable latest-site rows
+            # are refreshed below.  A running/paused Job must continue to use
+            # the taxonomy it selected even after a later rescan.
+            for category, item in categories:
+                session.add(SiteCategorySnapshot(
+                    snapshot_id=snapshot_id,
+                    category_id=category.category_id,
+                    site_key=category.site_key,
+                    native_name=category.native_name,
+                    canonical_name=category.canonical_name,
+                    path=category.path,
+                    source_url=category.source_url,
+                    count_value=category.count_value,
+                    count_kind=category.count_kind,
+                    reported_count=category.reported_count,
+                    discovered_count=category.discovered_count,
+                    eligible_count=category.eligible_count,
+                    confidence=category.confidence,
+                    evidence_json=category.evidence_json,
+                    verified_at=category.verified_at,
+                    selected=bool(item.get("selected", category.selected)),
+                    last_scanned_at=category.last_scanned_at,
+                    parent_category_id=category.parent_category_id,
+                    level=category.level,
+                    scope_kind=category.scope_kind,
+                ))
             snapshot = SiteTaxonomySnapshot(
                 snapshot_id=snapshot_id,
                 site_key=site.site_key,

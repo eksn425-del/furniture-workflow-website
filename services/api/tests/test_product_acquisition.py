@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from app.services.product_acquisition import ProductAcquisitionEngine, ProductSupplyExhausted, _parse_dimension_text
-from workers.scrape.http_client import HttpStatusError
+from workers.scrape.http_client import HttpStatusError, RobotsDenied
 
 
 MAGENTO_SHELL = '<html><body><div id="root" data-media-backend="https://media.example.test"></div><script src="/client.abc123.js"></script></body></html>'
@@ -218,3 +218,105 @@ def test_method_or_edge_access_status_escalates_selected_scope_to_l2(tmp_path: P
 
     assert "chair-one" in html
     assert acquisition == "L2_BROWSER"
+
+
+def test_generic_html_cursor_advances_to_next_page_and_checkpoints_exhaustion(tmp_path: Path) -> None:
+    detail_template = """
+    <h1>{name}</h1>
+    <script type="application/ld+json">
+    {{"@type":"Product","name":"{name}","sku":"{sku}","url":"/products/{slug}","image":"/media/{slug}.png"}}
+    </script><p>24 W x 26 D x 31 H in</p>
+    """
+
+    class Client:
+        def __init__(self, **_: object) -> None:
+            self.urls: list[str] = []
+
+        def get_html(self, url: str) -> str:
+            self.urls.append(url)
+            if "/products/" in url:
+                slug = url.rstrip("/").rsplit("/", 1)[-1]
+                return detail_template.format(name=slug.title(), sku=slug.upper(), slug=slug)
+            if "page=2" in url:
+                return '<nav class="pagination"><a href="/collections/chairs?page=1">1</a><span aria-current="page">2</span><a href="/products/chair-two">Chair Two</a></nav>'
+            return '<nav class="pagination"><span aria-current="page">1</span><a rel="next" href="/collections/chairs?page=2">Next</a><a href="/products/chair-one">Chair One</a></nav>'
+
+    client = Client()
+    engine = ProductAcquisitionEngine(
+        source_url="https://shop.example/collections/chairs",
+        site_key="shop.example",
+        source_type="DIRECT_BRAND",
+        categories=[{
+            "category_id": "cat-chairs",
+            "canonical_name": "Chairs",
+            "source_url": "https://shop.example/collections/chairs",
+            "selected": True,
+        }],
+        workspace=tmp_path,
+        browser_session_dir=tmp_path / "browser",
+        client_factory=lambda **_: client,
+    )
+
+    products = engine.discover(2)
+
+    assert [item.source_name for item in products] == ["Chair-One", "Chair-Two"]
+    checkpoint = engine._read()
+    cursor = next(iter(checkpoint["scope_cursors"].values()))
+    assert cursor["visited"] is True
+    assert cursor["exhausted"] is True
+    assert cursor["pages_fetched"] == 2
+    assert any("page=2" in url for url in client.urls)
+    assert "https://shop.example/collections/chairs" in checkpoint["visited_scopes"]
+    assert "https://shop.example/collections/chairs" in checkpoint["exhausted_scopes"]
+
+
+def test_robots_denial_never_upgrades_to_browser(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class Client:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_html(self, _: str) -> str:
+            raise RobotsDenied("robots.txt disallows URL")
+
+    def fail_browser(*_: object, **__: object) -> str:
+        raise AssertionError("robots denial must not invoke L2 browser")
+
+    monkeypatch.setattr("app.services.product_acquisition.NativeBrowserCollector.get_html", fail_browser)
+    engine = ProductAcquisitionEngine(
+        source_url="https://shop.example/collections/chairs",
+        site_key="shop.example",
+        source_type="DIRECT_BRAND",
+        categories=[{"category_id": "chairs", "canonical_name": "Chairs", "source_url": "https://shop.example/collections/chairs"}],
+        workspace=tmp_path,
+        browser_session_dir=tmp_path / "browser",
+        client_factory=lambda **_: Client(),
+    )
+
+    with pytest.raises(RobotsDenied):
+        engine.discover(1)
+
+
+def test_products_without_machine_cursor_remain_resumable_not_exhausted() -> None:
+    html = '<nav class="pagination"><span aria-current="page">1</span><a href="/products/chair-one">Chair One</a><button aria-label="Next page">Next</button></nav>'
+
+    next_url, explicit_end = ProductAcquisitionEngine._pagination_cursor(
+        "https://shop.example/collections/chairs",
+        "https://shop.example/collections/chairs",
+        html,
+    )
+
+    assert next_url is None
+    assert explicit_end is False
+
+
+def test_disabled_next_control_is_an_explicit_end() -> None:
+    html = '<nav class="pagination"><span aria-current="page">2</span><a href="?page=1">1</a><button aria-label="Next page" disabled>Next</button></nav>'
+
+    next_url, explicit_end = ProductAcquisitionEngine._pagination_cursor(
+        "https://shop.example/collections/chairs",
+        "https://shop.example/collections/chairs?page=2",
+        html,
+    )
+
+    assert next_url is None
+    assert explicit_end is True

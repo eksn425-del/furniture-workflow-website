@@ -541,7 +541,18 @@ class ControlJobCreate(BaseModel):
     allocation_strategy: Literal["SEQUENTIAL", "EVEN", "PROPORTIONAL", "CUSTOM"] = "SEQUENTIAL"
     spillover: Literal["ASK", "AUTO_IF_EXPLICIT", "STOP"] = "ASK"
     category_ids: list[str] = Field(default_factory=list, max_length=100)
+    # CUSTOM quotas are keyed by immutable category_id values, never by the
+    # display/canonical name (which may be renamed on a later scan).
+    category_quotas: dict[str, int] = Field(default_factory=dict)
     provider: Literal["OFF", "lux3d", "tripo", "hunyuan"] = "OFF"
+
+    @field_validator("category_quotas")
+    @classmethod
+    def validate_category_quotas(cls, value: dict[str, int]) -> dict[str, int]:
+        normalized = {str(key).strip(): int(quota) for key, quota in value.items() if str(key).strip()}
+        if any(quota < 0 for quota in normalized.values()):
+            raise ValueError("category quotas cannot be negative")
+        return normalized
 
     @field_validator("title", "goal")
     @classmethod
@@ -588,6 +599,20 @@ class ControlJobEdit(BaseModel):
     goal: str | None = Field(default=None, max_length=2000)
     target_value: int | None = Field(default=None, ge=1, le=5000)
     provider: Literal["OFF", "lux3d", "tripo", "hunyuan"] | None = Field(default=None)
+    category_allocation: Literal["PER_CATEGORY", "TOTAL_ACROSS_SELECTED"] | None = None
+    allocation_strategy: Literal["SEQUENTIAL", "EVEN", "PROPORTIONAL", "CUSTOM"] | None = None
+    spillover: Literal["ASK", "AUTO_IF_EXPLICIT", "STOP"] | None = None
+    category_quotas: dict[str, int] | None = None
+
+    @field_validator("category_quotas")
+    @classmethod
+    def validate_edit_category_quotas(cls, value: dict[str, int] | None) -> dict[str, int] | None:
+        if value is None:
+            return None
+        normalized = {str(key).strip(): int(quota) for key, quota in value.items() if str(key).strip()}
+        if any(quota < 0 for quota in normalized.values()):
+            raise ValueError("category quotas cannot be negative")
+        return normalized
 
 
 class ControlJobStart(BaseModel):

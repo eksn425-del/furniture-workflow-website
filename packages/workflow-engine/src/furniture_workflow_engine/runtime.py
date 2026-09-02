@@ -101,6 +101,10 @@ class RuntimePolicy:
     max_provider_slots: int = 5
     max_steps_per_tick: int = 20
     max_refill_rounds: int = 100
+    # Legacy direct engine callers did not pass a spillover policy and relied
+    # on the historical bounded spillover behavior.  Website contracts always
+    # pass their explicit UI choice (ASK/STOP/AUTO_IF_EXPLICIT).
+    spillover: str = "AUTO_IF_EXPLICIT"
 
     def __post_init__(self) -> None:
         gates = tuple(int(value) for value in self.progressive_gates)
@@ -201,6 +205,12 @@ class ProductionWorkflowEngine:
         )
 
     def _category_key(self, candidate: CandidateRecord) -> str:
+        # Production quota locks are keyed by immutable taxonomy scope IDs.
+        # Keep the display group as a compatibility fallback for older test
+        # fixtures and legacy pools that predate scope IDs.
+        stable_scope = str(candidate.lineage.get("category_id") or "").strip()
+        if stable_scope and stable_scope in self.policy.order_policy.categories:
+            return stable_scope
         value = str(candidate.category_group or "").strip()
         if value:
             return value
@@ -268,14 +278,14 @@ class ProductionWorkflowEngine:
             return True
         # 本类目份额已满：仅当其他类目因缺货存在未填满的缺口时才允许溢出，
         # 否则保持硬性份额（防止一个类目把总目标全部吃掉）。
-        return self._spillover_deficit() > 0
+        return str(self.policy.spillover or "ASK").upper() == "AUTO_IF_EXPLICIT" and self._spillover_deficit() > 0
 
     def _retire_overquota_locks(self) -> int:
         if getattr(self.policy.order_policy, "category_quota_mode", "REQUIRED") == "NONE":
             return 0
         # 存在缺货缺口时，超额类目的在途候选正是用来溢出填补缺口的，
         # 此时不回收，避免把可用的溢出候选提前清掉。
-        if self._spillover_deficit() > 0:
+        if str(self.policy.spillover or "ASK").upper() == "AUTO_IF_EXPLICIT" and self._spillover_deficit() > 0:
             return 0
         retired = 0
         for candidate in self.pool.records():

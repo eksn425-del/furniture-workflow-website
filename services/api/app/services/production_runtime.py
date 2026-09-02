@@ -33,8 +33,10 @@ from app.models import (
     ProviderSafetyCheck,
     RuntimeEvent,
     SiteCategory,
+    SiteCategorySnapshot,
     SiteEntryURL,
     SiteRegistryRecord,
+    SiteTaxonomySnapshot,
     utc_now,
 )
 
@@ -171,26 +173,80 @@ class ProductionRuntimeService:
         events_path = workspace / "runtime_events.jsonl"
         policy = _payload(job.policy_json)
         requested_ids = [str(value) for value in policy.get("category_ids") or [] if value]
-        category_query = select(SiteCategory).where(
-            SiteCategory.site_key == job.site_key,
-            SiteCategory.category_id.in_(requested_ids),
-        ) if requested_ids else select(SiteCategory).where(SiteCategory.site_key == job.site_key).where(False)
         snapshot_id = str(policy.get("category_snapshot_id") or "").strip()
+        category_rows: list[object] = []
         if snapshot_id:
-            category_query = category_query.where(SiteCategory.snapshot_id == snapshot_id)
-        category_rows = list(session.scalars(category_query))
-        category_by_id = {row.category_id: row for row in category_rows}
+            frozen_query = select(SiteCategorySnapshot).where(SiteCategorySnapshot.snapshot_id == snapshot_id)
+            if requested_ids:
+                frozen_query = frozen_query.where(SiteCategorySnapshot.category_id.in_(requested_ids))
+            category_rows = list(session.scalars(frozen_query.order_by(SiteCategorySnapshot.path)))
+        if not category_rows and not snapshot_id:
+            category_query = select(SiteCategory).where(
+                SiteCategory.site_key == job.site_key,
+                SiteCategory.category_id.in_(requested_ids),
+            ) if requested_ids else select(SiteCategory).where(SiteCategory.site_key == job.site_key).where(False)
+            category_rows = list(session.scalars(category_query))
+        if not category_rows and snapshot_id:
+            # Older databases may not have immutable rows.  The full receipt
+            # is still durable, but current SiteCategory rows must never be
+            # used as a silent substitute for this Job's selected snapshot.
+            snapshot = session.get(SiteTaxonomySnapshot, snapshot_id)
+            try:
+                receipt = json.loads(snapshot.evidence_json or "{}") if snapshot else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                receipt = {}
+            raw_categories = receipt.get("categories") if isinstance(receipt, dict) else []
+            category_rows = [
+                item for item in raw_categories
+                if isinstance(item, dict)
+                and (not requested_ids or str(item.get("category_id") or "") in requested_ids)
+            ]
+        category_by_id = {
+            (str(row.get("category_id") or "") if isinstance(row, dict) else row.category_id): row
+            for row in category_rows
+        }
         categories = []
         for category_id in requested_ids:
             row = category_by_id.get(category_id)
             if row is None:
                 continue
+            if isinstance(row, dict):
+                evidence = row.get("evidence") if isinstance(row.get("evidence"), list) else []
+                scope_urls = [str(row.get("source_url") or "")]
+                for entry in evidence:
+                    if isinstance(entry, dict) and entry.get("role") == "coarse_scope_members" and isinstance(entry.get("urls"), list):
+                        scope_urls.extend(str(value) for value in entry["urls"] if str(value) not in scope_urls)
+                categories.append({
+                    "category_id": category_id,
+                    "canonical_name": str(row.get("canonical_name") or row.get("native_name") or ""),
+                    "native_name": str(row.get("native_name") or ""),
+                    "path": str(row.get("path") or ""),
+                    "source_url": str(row.get("source_url") or job.source_url),
+                    "scope_urls": [value for value in scope_urls if value],
+                    "parent_category_id": row.get("parent_category_id"),
+                    "level": int(row.get("level") or 1),
+                    "scope_kind": str(receipt.get("source_scope") or "CATEGORY") if isinstance(receipt, dict) else "CATEGORY",
+                    "count_value": row.get("count_value"),
+                    "count_kind": str(row.get("count_kind") or "UNKNOWN"),
+                    "selected": True,
+                })
+                continue
+            try:
+                parsed_evidence = json.loads(row.evidence_json or "[]")
+                evidence = parsed_evidence if isinstance(parsed_evidence, list) else []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                evidence = []
+            scope_urls = [row.source_url]
+            for entry in evidence:
+                if isinstance(entry, dict) and entry.get("role") == "coarse_scope_members" and isinstance(entry.get("urls"), list):
+                    scope_urls.extend(str(value) for value in entry["urls"] if str(value) not in scope_urls)
             categories.append({
                 "category_id": row.category_id,
                 "canonical_name": row.canonical_name,
                 "native_name": row.native_name,
                 "path": row.path,
                 "source_url": row.source_url,
+                "scope_urls": [value for value in scope_urls if value],
                 "parent_category_id": row.parent_category_id,
                 "level": row.level,
                 "scope_kind": row.scope_kind,
@@ -234,6 +290,7 @@ class ProductionRuntimeService:
             "category_allocation": job.category_allocation,
             "allocation_strategy": job.allocation_strategy,
             "spillover": job.spillover,
+            "category_quotas": policy.get("category_quotas") or {},
             "allow_shortfall_delivery": bool(policy.get("allow_shortfall_delivery", False)),
             "source_type": site.source_kind if site else "UNKNOWN",
             "provider": job.provider,

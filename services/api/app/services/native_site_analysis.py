@@ -954,9 +954,28 @@ class NativeSiteAnalyzer:
             rep = max(members, key=lambda m: m.count_value or 0)
             total = sum(m.count_value or 0 for m in members)
             evidence = list(rep.evidence)
+            scope_urls: list[str] = []
             for other in members:
+                if other.source_url and other.source_url not in scope_urls:
+                    scope_urls.append(other.source_url)
+                for entry in other.evidence:
+                    if not isinstance(entry, dict) or entry.get("role") != "coarse_scope_members":
+                        continue
+                    values = entry.get("urls")
+                    if isinstance(values, list):
+                        for value in values:
+                            value = str(value).strip()
+                            if value and value not in scope_urls:
+                                scope_urls.append(value)
                 if other is not rep:
                     evidence.extend(other.evidence)
+            evidence.append({
+                "role": "coarse_scope_members",
+                "parent_path": parent,
+                "coarse_group": name,
+                "urls": scope_urls,
+                "category_ids": [member.category_id for member in members],
+            })
             coarse = rep.model_copy(deep=True)
             coarse.canonical_name = CATEGORY_COARSE_LABELS.get(name, name.title())
             # A direct category URL is an operator-selected scope.  Preserve

@@ -35,6 +35,7 @@ from app.models import (
     ProviderSafetyCheck,
     ReviewQueueItem,
     SiteCategory,
+    SiteCategorySnapshot,
     SiteProfile,
     SiteRegistryRecord,
     SiteScanRun,
@@ -179,6 +180,7 @@ def _job_dict(job: ProductionJob) -> dict:
         "category_allocation": job.category_allocation,
         "allocation_strategy": job.allocation_strategy,
         "spillover": job.spillover,
+        "category_quotas": _policy(job).get("category_quotas") or {},
         "requested_count": job.requested_count,
         "counts": {
             "reported_count": job.reported_count,
@@ -206,6 +208,19 @@ def _category_dict(category: SiteCategory) -> dict:
     segments = [part for part in category.path.split("/") if part]
     level = int(category.level or (2 if len(segments) >= 2 else 1))
     parent_path = "/" + segments[0] if level == 2 else None
+    evidence = json.loads(category.evidence_json) if category.evidence_json else []
+    scope_urls: list[str] = []
+    if category.source_url:
+        scope_urls.append(category.source_url)
+    for entry in evidence if isinstance(evidence, list) else []:
+        if not isinstance(entry, dict) or entry.get("role") != "coarse_scope_members":
+            continue
+        values = entry.get("urls")
+        if isinstance(values, list):
+            for value in values:
+                value = str(value).strip()
+                if value and value not in scope_urls:
+                    scope_urls.append(value)
     return {
         "category_id": category.category_id,
         "site_key": category.site_key,
@@ -216,7 +231,8 @@ def _category_dict(category: SiteCategory) -> dict:
         "count_value": category.count_value,
         "count_kind": category.count_kind,
         "confidence": category.confidence,
-        "evidence": json.loads(category.evidence_json) if category.evidence_json else [],
+        "evidence": evidence,
+        "scope_urls": scope_urls,
         "verified_at": category.verified_at.isoformat() if category.verified_at else None,
         "reported_count": category.reported_count,
         "discovered_count": category.discovered_count,
@@ -247,14 +263,79 @@ def _job_categories(session, job: ProductionJob, *, latest_scan: SiteScanRun | N
     snapshot_id = str(policy.get("category_snapshot_id") or "").strip()
     requested_ids = [str(value) for value in policy.get("category_ids") or [] if value]
     if snapshot_id:
-        query = select(SiteCategory).where(SiteCategory.snapshot_id == snapshot_id)
+        query = select(SiteCategorySnapshot).where(SiteCategorySnapshot.snapshot_id == snapshot_id)
         if requested_ids:
-            query = query.where(SiteCategory.category_id.in_(requested_ids))
-        rows = list(session.scalars(query.order_by(SiteCategory.path)))
+            query = query.where(SiteCategorySnapshot.category_id.in_(requested_ids))
+        frozen_rows = list(session.scalars(query.order_by(SiteCategorySnapshot.path)))
+        if frozen_rows:
+            return [SiteCategory(
+                category_id=row.category_id,
+                site_key=row.site_key,
+                snapshot_id=row.snapshot_id,
+                native_name=row.native_name,
+                canonical_name=row.canonical_name,
+                path=row.path,
+                source_url=row.source_url,
+                count_value=row.count_value,
+                count_kind=row.count_kind,
+                reported_count=row.reported_count,
+                discovered_count=row.discovered_count,
+                eligible_count=row.eligible_count,
+                confidence=row.confidence,
+                evidence_json=row.evidence_json,
+                verified_at=row.verified_at,
+                selected=row.selected,
+                last_scanned_at=row.last_scanned_at,
+                parent_category_id=row.parent_category_id,
+                level=row.level,
+                scope_kind=row.scope_kind,
+            ) for row in frozen_rows]
+        # Databases created before the immutable table was introduced still
+        # have the complete receipt on SiteTaxonomySnapshot.  Reconstruct a
+        # transient row from that receipt rather than falling through to the
+        # current site taxonomy (which would silently change Job scope).
+        snapshot = session.get(SiteTaxonomySnapshot, snapshot_id)
+        try:
+            receipt = json.loads(snapshot.evidence_json or "{}") if snapshot else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            receipt = {}
+        receipt_categories = receipt.get("categories") if isinstance(receipt, dict) else []
+        output: list[SiteCategory] = []
+        for item in receipt_categories if isinstance(receipt_categories, list) else []:
+            if not isinstance(item, dict):
+                continue
+            category_id = str(item.get("category_id") or "")
+            if requested_ids and category_id not in requested_ids:
+                continue
+            path = str(item.get("path") or "").strip()
+            if not category_id or not path:
+                continue
+            count_value = item.get("count_value") if isinstance(item.get("count_value"), int) else None
+            output.append(SiteCategory(
+                category_id=category_id,
+                site_key=job.site_key,
+                snapshot_id=snapshot_id,
+                native_name=str(item.get("native_name") or path),
+                canonical_name=str(item.get("canonical_name") or item.get("native_name") or path),
+                path=path,
+                source_url=str(item.get("source_url") or job.source_url),
+                count_value=count_value,
+                count_kind=str(item.get("count_kind") or "UNKNOWN"),
+                reported_count=count_value or 0,
+                discovered_count=int(item.get("discovered_count") or 0),
+                eligible_count=int(item.get("eligible_count") or 0),
+                confidence=float(item.get("confidence") or 0),
+                evidence_json=json.dumps(item.get("evidence") or [], ensure_ascii=False),
+                verified_at=None,
+                selected=bool(item.get("selected", True)),
+                last_scanned_at=None,
+                parent_category_id=None,
+                level=int(item.get("level") or 1),
+                scope_kind=str(receipt.get("source_scope") or "CATEGORY") if isinstance(receipt, dict) else "CATEGORY",
+            ))
         # A Job bound to a snapshot must never silently switch to a newer
-        # taxonomy if the bound rows are missing.  Returning an empty set lets
-        # the caller surface the broken binding and request a new selection.
-        return rows
+        # taxonomy if the bound rows are missing.
+        return sorted(output, key=lambda row: row.path)
     current = _current_site_categories(session, job.site_key, latest_scan=latest_scan)
     if requested_ids:
         by_id = {row.category_id: row for row in current}
@@ -476,6 +557,7 @@ def create_control_job(payload: ControlJobCreate, request: Request) -> dict:
             "allocation_strategy": payload.allocation_strategy,
             "spillover": payload.spillover,
             "category_ids": payload.category_ids,
+            "category_quotas": payload.category_quotas,
             "provider": payload.provider,
             "provider_calls": 0,
         }
@@ -1386,7 +1468,7 @@ def update_control_job(job_id: str, payload: ControlJobEdit, request: Request) -
             goal = " ".join(str(payload.goal).split())
             if goal:
                 job.goal = goal
-        if payload.target_value is not None or payload.provider is not None:
+        if payload.target_value is not None or payload.provider is not None or payload.category_allocation is not None or payload.allocation_strategy is not None or payload.spillover is not None or payload.category_quotas is not None:
             # 生产一旦启动，交付目标与 Provider 必须严格按任务开始时确定的要求执行，
             # 不允许中途改写目标数量或切换建模提供方，避免与运行中的生产契约偏离。
             running = session.scalar(
@@ -1403,11 +1485,32 @@ def update_control_job(job_id: str, payload: ControlJobEdit, request: Request) -
             job.status = "POLICY_READY"
             job.current_stage = "PROVIDER_SAFETY_GATE"
             job.last_reason = f"Provider 已切换为 {payload.provider}，需重新审批后启动生产"
+        policy = _policy(job)
+        if payload.category_allocation is not None:
+            job.category_allocation = payload.category_allocation
+            policy["category_allocation"] = payload.category_allocation
+        if payload.allocation_strategy is not None:
+            job.allocation_strategy = payload.allocation_strategy
+            policy["allocation_strategy"] = payload.allocation_strategy
+        if payload.spillover is not None:
+            job.spillover = payload.spillover
+            policy["spillover"] = payload.spillover
+        if payload.category_quotas is not None:
+            policy["category_quotas"] = {str(key): int(value) for key, value in payload.category_quotas.items() if str(key).strip()}
+        if any(value is not None for value in (payload.category_allocation, payload.allocation_strategy, payload.spillover, payload.category_quotas)):
+            job.policy_json = json.dumps(policy, ensure_ascii=False)
+            if job.status not in {"RUNNING", "PROVIDER_RUNNING"}:
+                job.status = "POLICY_READY"
+                job.current_stage = "TARGET_POLICY"
         _event(session, job, "JOB_EDITED", job.status, "操作员编辑了任务信息", {
             "title": payload.title is not None,
             "goal": payload.goal is not None,
             "target_value": payload.target_value is not None,
             "provider": payload.provider is not None,
+            "category_allocation": payload.category_allocation is not None,
+            "allocation_strategy": payload.allocation_strategy is not None,
+            "spillover": payload.spillover is not None,
+            "category_quotas": payload.category_quotas is not None,
         })
         _audit(session, "EDIT_JOB", "production_job", job.job_id, actor="operator")
         session.commit()

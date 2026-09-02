@@ -15,7 +15,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from workers.scrape.http_client import (
     AccessControlDetected,
@@ -92,6 +92,7 @@ HEIGHT_DIAMETER_RE = re.compile(
 DIMENSION_TAB_LABELS = ("dimensions", "尺寸", "specifications", "规格")
 DIMENSION_UNIT_RE = re.compile(r"(in|inch|cm|mm)", re.I)
 MAGENTO_PWA_CLIENT_RE = re.compile(r"(?:^|[\"'])/client\.[^\"']+\.js", re.I)
+MAX_ACQUISITION_PAGES = 100
 
 
 class ProductAcquisitionError(RuntimeError):
@@ -718,28 +719,144 @@ class ProductAcquisitionEngine:
             item for item in selected
             if not (str(item.get("category_id") or "") in selected_parent_ids)
         ]
-        seen: set[str] = set()
-        result = []
+        # A coarse UI row may represent several native child scopes.  Keep
+        # those member URLs so selecting the coarse row does not silently
+        # reduce production scope to whichever child happened to be chosen as
+        # the representative.
+        result: list[dict[str, Any]] = []
+        by_url: dict[str, dict[str, Any]] = {}
         for item in compacted:
             url = str(item.get("source_url") or "").strip()
-            if not url or url in seen:
+            if not url:
                 continue
-            seen.add(url)
-            result.append(item)
+            evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+            member_urls: list[str] = []
+            raw_scope_urls = item.get("scope_urls")
+            if isinstance(raw_scope_urls, list):
+                member_urls.extend(str(value).strip() for value in raw_scope_urls if str(value).strip())
+            for entry in evidence:
+                if not isinstance(entry, dict) or entry.get("role") != "coarse_scope_members":
+                    continue
+                values = entry.get("urls")
+                if isinstance(values, list):
+                    member_urls.extend(str(value).strip() for value in values if str(value).strip())
+            all_urls: list[str] = []
+            for value in [url, *member_urls]:
+                if value and value not in all_urls:
+                    all_urls.append(value)
+            item["scope_urls"] = all_urls
+            existing = by_url.get(url)
+            if existing is None:
+                by_url[url] = item
+                result.append(item)
+                continue
+            merged = list(existing.get("scope_urls") or [])
+            for value in all_urls:
+                if value not in merged:
+                    merged.append(value)
+            existing["scope_urls"] = merged
         return result
+
+    def _scope_entries(self) -> list[dict[str, Any]]:
+        scopes = self.categories or [{
+            "category_id": "scope_source",
+            "canonical_name": "Source Scope",
+            "source_url": self.source_url,
+            "scope_urls": [self.source_url],
+        }]
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for index, scope in enumerate(scopes):
+            category_id = str(scope.get("category_id") or f"scope_{index}")
+            raw_urls = scope.get("scope_urls") if isinstance(scope.get("scope_urls"), list) else []
+            values = [str(scope.get("source_url") or "").strip(), *[str(value).strip() for value in raw_urls]]
+            for value in values:
+                if not value:
+                    continue
+                url = _canonical_url(value)
+                key = f"{category_id}|{url}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append({
+                    "scope_key": key,
+                    "category_id": category_id,
+                    "canonical_name": str(scope.get("canonical_name") or scope.get("native_name") or "Source Scope"),
+                    "native_name": str(scope.get("native_name") or ""),
+                    "source_url": url,
+                })
+        return entries
+
+    @staticmethod
+    def _cursor_key(entry: dict[str, Any]) -> str:
+        return str(entry.get("scope_key") or entry.get("source_url") or "scope_source")
+
+    def _ensure_scope_cursors(self, payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        cursors = payload.setdefault("scope_cursors", {})
+        if not isinstance(cursors, dict):
+            cursors = {}
+            payload["scope_cursors"] = cursors
+        for entry in self._scope_entries():
+            key = self._cursor_key(entry)
+            cursor = cursors.get(key)
+            if not isinstance(cursor, dict):
+                cursor = {
+                    "scope_key": key,
+                    "category_id": entry["category_id"],
+                    "canonical_name": entry["canonical_name"],
+                    "source_url": entry["source_url"],
+                    "next_url": entry["source_url"],
+                    "seen_page_urls": [],
+                    "pages_fetched": 0,
+                    "visited": False,
+                    "exhausted": False,
+                    "pagination_status": "NOT_STARTED",
+                    "strategy": "UNRESOLVED",
+                }
+                cursors[key] = cursor
+            else:
+                cursor.setdefault("scope_key", key)
+                cursor.setdefault("category_id", entry["category_id"])
+                cursor.setdefault("canonical_name", entry["canonical_name"])
+                cursor.setdefault("source_url", entry["source_url"])
+                cursor.setdefault("next_url", entry["source_url"] if not cursor.get("visited") else None)
+                cursor.setdefault("seen_page_urls", [])
+                cursor.setdefault("pages_fetched", 0)
+                cursor.setdefault("visited", False)
+                cursor.setdefault("exhausted", False)
+                cursor.setdefault("pagination_status", "NOT_STARTED")
+                cursor.setdefault("strategy", "UNRESOLVED")
+        return cursors
 
     def _read(self) -> dict[str, Any]:
         if not self.checkpoint_path.is_file():
             return {
-                "schema_version": "product-acquisition.v1",
+                "schema_version": "product-acquisition.v2",
                 "source_url": self.source_url,
                 "fetched_scopes": [],
+                "visited_scopes": [],
+                "exhausted_scopes": [],
+                "scope_cursors": {},
                 "products": {},
                 "emitted": [],
             }
         payload = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
-        if payload.get("schema_version") != "product-acquisition.v1":
+        version = str(payload.get("schema_version") or "")
+        if version == "product-acquisition.v1":
+            # v1 recorded only ``fetched_scopes``.  Those entries are legacy
+            # visits, not proof that the public scope was exhausted.
+            payload["schema_version"] = "product-acquisition.v2"
+            payload.setdefault("visited_scopes", list(payload.get("fetched_scopes") or []))
+            payload.setdefault("exhausted_scopes", [])
+            payload.setdefault("scope_cursors", {})
+        if payload.get("schema_version") != "product-acquisition.v2":
             raise ProductAcquisitionError("unsupported acquisition checkpoint")
+        payload.setdefault("fetched_scopes", [])
+        payload.setdefault("visited_scopes", [])
+        payload.setdefault("exhausted_scopes", [])
+        payload.setdefault("scope_cursors", {})
+        payload.setdefault("products", {})
+        payload.setdefault("emitted", [])
         return payload
 
     def _write(self, payload: dict[str, Any]) -> None:
@@ -750,8 +867,12 @@ class ProductAcquisitionEngine:
     def _get_html(self, url: str) -> tuple[str, str]:
         try:
             return self.client.get_html(url), "L0_L1_HTTP"
-        except (AccessControlDetected, RobotsDenied):
+        except AccessControlDetected:
             return NativeBrowserCollector(self.browser_session_dir).get_html(url), "L2_BROWSER"
+        except RobotsDenied:
+            # A declared robots denial is a source-policy boundary, not a
+            # browser challenge.  Do not upgrade it to a stronger fetch mode.
+            raise
         except HttpStatusError as error:
             # 反爬站点对机器人 UA 常直接回 403/429/5xx（而不是正常验证页），
             # 这类访问控制状态升级到可见浏览器（真实指纹 + 人工验证），而不是直接判失败。
@@ -771,10 +892,19 @@ class ProductAcquisitionEngine:
         products = payload.setdefault("products", {})
         available = [value for key, value in products.items() if key not in emitted]
         if len(available) < needed:
-            self._discover_more(payload, limit=max(needed * 3, 12))
-            products = payload["products"]
-            available = [value for key, value in products.items() if key not in emitted]
+            # ``limit`` is a discovery budget, not a claim about the total
+            # supply.  Grow it from the current checkpoint so a later refill
+            # can advance its cursor after earlier products were emitted.
+            self._discover_more(payload, limit=len(products) + max(needed * 3, 12))
+        products = payload["products"]
+        available = [value for key, value in products.items() if key not in emitted]
         selected = available[:needed]
+        if len(selected) < needed and str(payload.get("discovery_status") or "").upper() == "PAGINATION_UNVERIFIED":
+            # Do not hand a partial batch to the Exact-N engine and let it
+            # misreport the missing tail as genuine supply shortage.  The
+            # checkpoint still contains any already captured products, while
+            # the caller receives a resumable discovery blocker.
+            raise ProductAcquisitionError("PAGINATION_UNVERIFIED")
         if not selected:
             raise ProductSupplyExhausted("selected scopes have no remaining unique public products")
         for item in selected:
@@ -783,63 +913,243 @@ class ProductAcquisitionEngine:
         self._write(payload)
         return [AcquiredProduct(**{key: value for key, value in item.items() if key != "identity_key"}) for item in selected]
 
+    @staticmethod
+    def _pagination_cursor(base_url: str, current_url: str, page_html: str) -> tuple[str | None, bool]:
+        """Return a trustworthy next-page URL and an explicit-end signal.
+
+        The generic path only follows explicit rel/label/data attributes or a
+        same-path numeric page link.  It never invents a search URL or follows
+        arbitrary navigation links.  A disabled next/load-more control is an
+        explicit terminal signal; a visible pagination label without a
+        machine-readable cursor is not proof of exhaustion.
+        """
+
+        host = (urlsplit(base_url).hostname or "").casefold()
+        current = urlsplit(current_url)
+        current_page = 1
+        current_query = dict(parse_qsl(current.query, keep_blank_values=True))
+        for key in ("page", "p", "page_num", "pageNumber"):
+            value = current_query.get(key)
+            if value and str(value).isdigit():
+                current_page = int(value)
+                break
+
+        def attrs(raw: str) -> dict[str, str]:
+            return {
+                key.casefold(): html_lib.unescape(value or "")
+                for key, value in re.findall(r"([\w:-]+)\s*=\s*['\"]([^'\"]*)['\"]", raw, re.I)
+            }
+
+        pagination_hint = bool(re.search(r"pagination|pager|page-number|load[- ]?more|next|下一页|更多", page_html, re.I))
+        explicit_end = False
+        numeric_page_seen = False
+        numeric_candidates: list[tuple[int, str]] = []
+        # ``<link rel="next" href="…">`` is self-closing and therefore is
+        # not covered by the anchor-content expression below.
+        for raw in re.findall(r"<(?:link|a|button)\b[^>]*>", page_html, re.I):
+            attributes = attrs(raw)
+            rel = attributes.get("rel", "").casefold()
+            href = attributes.get("href") or attributes.get("data-next-url")
+            if href and "next" in rel:
+                absolute = _canonical_url(urljoin(base_url, href))
+                if (urlsplit(absolute).hostname or "").casefold() == host:
+                    return absolute, False
+        for match in re.finditer(r"<(?:a|link|button)\b([^>]*)>(.*?)</(?:a|link|button)>", page_html, re.I | re.S):
+            attributes = attrs(match.group(1))
+            label = " ".join(re.sub(r"<[^>]+>", " ", match.group(2)).split())
+            href = attributes.get("href") or attributes.get("data-href") or attributes.get("data-next-url")
+            rel = attributes.get("rel", "").casefold()
+            signal = " ".join((rel, attributes.get("aria-label", ""), attributes.get("title", ""), label)).casefold()
+            is_next_control = bool(re.search(r"\bnext\b|next page|下一页|更多|load more", signal, re.I))
+            if is_next_control and (
+                "disabled" in attributes
+                or attributes.get("aria-disabled", "").casefold() == "true"
+                or attributes.get("data-disabled", "").casefold() == "true"
+            ):
+                explicit_end = True
+            if href:
+                absolute = _canonical_url(urljoin(base_url, href))
+                if (urlsplit(absolute).hostname or "").casefold() != host:
+                    continue
+                if "next" in rel or is_next_control:
+                    return absolute, False
+                parsed = urlsplit(absolute)
+                query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                for key in ("page", "p", "page_num", "pageNumber"):
+                    value = query.get(key)
+                    if value and str(value).isdigit():
+                        numeric_page_seen = True
+                        if int(value) > current_page and parsed.path.rstrip("/") == current.path.rstrip("/"):
+                            numeric_candidates.append((int(value), absolute))
+                        break
+            if attributes.get("data-next-page", "").isdigit():
+                next_page = int(attributes["data-next-page"])
+                if next_page > current_page:
+                    query = list(parse_qsl(current.query, keep_blank_values=True))
+                    replaced = False
+                    for index, (key, value) in enumerate(query):
+                        if key in {"page", "p", "page_num", "pageNumber"}:
+                            query[index] = (key, str(next_page))
+                            replaced = True
+                    if not replaced:
+                        query.append(("page", str(next_page)))
+                    return urlunsplit((current.scheme, current.netloc, current.path, urlencode(query), "")), False
+        if numeric_candidates:
+            return min(numeric_candidates, key=lambda item: item[0])[1], False
+        if pagination_hint and numeric_page_seen:
+            explicit_end = True
+        return None, explicit_end
+
+    def _store_product(self, payload: dict[str, Any], product: AcquiredProduct) -> None:
+        serialized = asdict(product)
+        serialized["identity_key"] = product.identity_key
+        payload.setdefault("products", {}).setdefault(product.identity_key, serialized)
+        capture_path = self.capture_root / f"{product.capture_sha256}.json"
+        if not capture_path.exists():
+            capture_path.write_text(json.dumps(serialized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
     def _discover_more(self, payload: dict[str, Any], *, limit: int) -> None:
-        fetched = {str(value) for value in payload.get("fetched_scopes") or []}
-        scopes = self.categories or [{
-            "category_id": "scope_source",
-            "canonical_name": "Source Scope",
-            "source_url": self.source_url,
-        }]
-        for scope in scopes:
-            scope_url = _canonical_url(str(scope.get("source_url") or self.source_url))
-            if scope_url in fetched:
-                continue
-            html, acquisition = self._get_html(scope_url)
-            if _is_magento_pwa_shell(html):
+        cursors = self._ensure_scope_cursors(payload)
+        products = payload.setdefault("products", {})
+        payload.setdefault("visited_scopes", [])
+        payload.setdefault("exhausted_scopes", [])
+        while len(products) < limit:
+            candidates = [
+                cursor for cursor in cursors.values()
+                if isinstance(cursor, dict)
+                and not bool(cursor.get("exhausted"))
+                and ((str(cursor.get("strategy") or "") == "MAGENTO_GRAPHQL" and cursor.get("next_page"))
+                     or (str(cursor.get("strategy") or "") != "MAGENTO_GRAPHQL" and cursor.get("next_url")))
+                and int(cursor.get("pages_fetched") or 0) < MAX_ACQUISITION_PAGES
+            ]
+            if not candidates:
+                break
+            cursor = candidates[0]
+            scope_url = _canonical_url(str(cursor.get("source_url") or self.source_url))
+            scope = {
+                "category_id": str(cursor.get("category_id") or "scope_source"),
+                "canonical_name": str(cursor.get("canonical_name") or "Source Scope"),
+                "native_name": str(cursor.get("native_name") or ""),
+                "source_url": scope_url,
+            }
+            strategy = str(cursor.get("strategy") or "UNRESOLVED")
+            current_page_url = scope_url
+            if strategy == "MAGENTO_GRAPHQL":
+                current_page = int(cursor.get("next_page") or 1)
                 try:
-                    self._discover_magento_products(payload, scope, scope_url, limit=limit)
+                    metadata = self._discover_magento_products(
+                        payload, scope, scope_url, limit=limit,
+                        current_page=current_page,
+                        page_size=int(cursor.get("page_size") or min(max(limit, 1), 48)),
+                    )
                 except (HttpStatusError, NetworkPolicyError, RequestBudgetExceeded, RobotsDenied) as error:
                     raise ProductAcquisitionError(
                         f"MAGENTO_GRAPHQL_DISCOVERY_FAILED:{type(error).__name__}"
                     ) from error
-                fetched.add(scope_url)
-                payload["fetched_scopes"] = sorted(fetched)
-                self._write(payload)
-                if len(payload["products"]) >= limit:
-                    break
-                continue
-            links = self._product_links(scope_url, html)
-            if not links and not PRODUCT_PATH.search(urlsplit(scope_url).path):
-                # L0/L1 may receive only a storefront shell while the visible
-                # product grid is populated by JavaScript. Escalate one
-                # bounded scope to the same persistent headed L2 session
-                # before declaring the selected category exhausted.
-                html = NativeBrowserCollector(self.browser_session_dir).get_html(scope_url)
-                acquisition = "L2_BROWSER"
-                links = self._product_links(scope_url, html)
-            if not links:
-                page_product = self._product_from_html(scope_url, html, scope, acquisition)
-                if page_product is not None and self._is_product_detail_url(scope_url, page_product):
-                    links = [scope_url]
-            for product_url in links[:limit]:
-                try:
-                    product_html, detail_mode = (html, acquisition) if product_url == scope_url else self._get_html(product_url)
-                except (HttpStatusError, NetworkPolicyError, RequestBudgetExceeded):
+                item_count = int(metadata.get("item_count") or 0)
+                page_size = int(metadata.get("page_size") or cursor.get("page_size") or 1)
+                total_count = metadata.get("total_count")
+                total_pages = metadata.get("total_pages")
+                cursor["page_size"] = page_size
+                cursor["total_count"] = total_count
+                cursor["total_pages"] = total_pages
+                cursor["next_page"] = current_page + 1
+                if item_count == 0 or (isinstance(total_pages, int) and current_page >= total_pages) or (total_count is None and item_count < page_size):
+                    cursor["exhausted"] = True
+                    cursor["pagination_status"] = "EXPLICIT_END"
+                    cursor["next_page"] = None
+                cursor["strategy"] = "MAGENTO_GRAPHQL"
+                cursor["pages_fetched"] = int(cursor.get("pages_fetched") or 0) + 1
+                cursor["visited"] = True
+                cursor.setdefault("seen_page_urls", []).append(f"{scope_url}#graphql-page-{current_page}")
+            else:
+                current_page_url = _canonical_url(str(cursor.get("next_url") or scope_url))
+                seen_pages = [str(value) for value in cursor.get("seen_page_urls") or []]
+                if current_page_url in seen_pages:
+                    cursor["next_url"] = None
+                    cursor["exhausted"] = True
+                    cursor["pagination_status"] = "REPEATED_CURSOR"
                     continue
-                product = self._product_from_html(product_url, product_html, scope, detail_mode)
-                if product is None or not self._is_product_detail_url(product_url, product):
-                    continue
-                serialized = asdict(product)
-                serialized["identity_key"] = product.identity_key
-                payload["products"].setdefault(product.identity_key, serialized)
-                capture_path = self.capture_root / f"{product.capture_sha256}.json"
-                if not capture_path.exists():
-                    capture_path.write_text(json.dumps(serialized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            fetched.add(scope_url)
-            payload["fetched_scopes"] = sorted(fetched)
+                html, acquisition = self._get_html(current_page_url)
+                if _is_magento_pwa_shell(html):
+                    cursor["strategy"] = "MAGENTO_GRAPHQL"
+                    try:
+                        metadata = self._discover_magento_products(
+                            payload, scope, scope_url, limit=limit,
+                            current_page=1,
+                            page_size=min(max(limit, 1), 48),
+                        )
+                    except (HttpStatusError, NetworkPolicyError, RequestBudgetExceeded, RobotsDenied) as error:
+                        raise ProductAcquisitionError(
+                            f"MAGENTO_GRAPHQL_DISCOVERY_FAILED:{type(error).__name__}"
+                        ) from error
+                    item_count = int(metadata.get("item_count") or 0)
+                    page_size = int(metadata.get("page_size") or min(max(limit, 1), 48))
+                    total_count = metadata.get("total_count")
+                    total_pages = metadata.get("total_pages")
+                    cursor.update({"page_size": page_size, "total_count": total_count, "total_pages": total_pages, "next_page": 2})
+                    if item_count == 0 or (isinstance(total_pages, int) and total_pages <= 1) or (total_count is None and item_count < page_size):
+                        cursor["exhausted"] = True
+                        cursor["pagination_status"] = "EXPLICIT_END"
+                        cursor["next_page"] = None
+                    cursor["pages_fetched"] = int(cursor.get("pages_fetched") or 0) + 1
+                    cursor["visited"] = True
+                    cursor.setdefault("seen_page_urls", []).append(f"{scope_url}#graphql-page-1")
+                else:
+                    links = self._product_links(current_page_url, html)
+                    if not links and not PRODUCT_PATH.search(urlsplit(current_page_url).path):
+                        # A JS shell is the one bounded reason to use the same
+                        # persistent Website L2 browser session.
+                        html = NativeBrowserCollector(self.browser_session_dir).get_html(current_page_url)
+                        acquisition = "L2_BROWSER"
+                        links = self._product_links(current_page_url, html)
+                    if not links:
+                        page_product = self._product_from_html(current_page_url, html, scope, acquisition)
+                        if page_product is not None and self._is_product_detail_url(current_page_url, page_product):
+                            links = [current_page_url]
+                    for product_url in links[:max(limit, 1)]:
+                        try:
+                            product_html, detail_mode = (html, acquisition) if product_url == current_page_url else self._get_html(product_url)
+                        except (HttpStatusError, NetworkPolicyError, RequestBudgetExceeded):
+                            continue
+                        product = self._product_from_html(product_url, product_html, scope, detail_mode)
+                        if product is None or not self._is_product_detail_url(product_url, product):
+                            continue
+                        self._store_product(payload, product)
+                    next_url, explicit_end = self._pagination_cursor(current_page_url, current_page_url, html)
+                    cursor["strategy"] = "HTML_LINK_OR_QUERY"
+                    cursor["next_url"] = next_url
+                    cursor["pagination_status"] = "NEXT_CURSOR" if next_url else "EXPLICIT_END" if not links or explicit_end else "VISITED_NO_CURSOR"
+                    # A page with no products is an explicit end.  A page with
+                    # products but no verifiable continuation remains visited
+                    # and resumable in state, rather than being mislabeled as
+                    # exhausted (which used to cause false TARGET_SHORTAGE).
+                    cursor["exhausted"] = not links or bool(next_url) is False and bool(explicit_end)
+                    cursor["pages_fetched"] = int(cursor.get("pages_fetched") or 0) + 1
+                    cursor["visited"] = True
+                    cursor.setdefault("seen_page_urls", []).append(current_page_url)
+            visited = {str(value) for value in payload.get("visited_scopes") or []}
+            visited.add(scope_url)
+            payload["visited_scopes"] = sorted(visited)
+            payload["fetched_scopes"] = sorted(visited)  # v1-compatible read model
+            exhausted = {str(value) for value in payload.get("exhausted_scopes") or []}
+            if cursor.get("exhausted"):
+                exhausted.add(scope_url)
+            else:
+                exhausted.discard(scope_url)
+            payload["exhausted_scopes"] = sorted(exhausted)
             self._write(payload)
-            if len(payload["products"]) >= limit:
-                break
+
+        # Preserve the distinction in the checkpoint for callers and the UI;
+        # a visited/no-cursor scope is deliberately not put in exhausted_scopes.
+        if len(products) < limit and any(
+            isinstance(cursor, dict) and cursor.get("visited") and not cursor.get("exhausted")
+            for cursor in cursors.values()
+        ):
+            payload["discovery_status"] = "PAGINATION_UNVERIFIED"
+        elif not any(isinstance(cursor, dict) and not cursor.get("exhausted") for cursor in cursors.values()):
+            payload["discovery_status"] = "EXHAUSTED"
+        self._write(payload)
 
     def _discover_magento_products(
         self,
@@ -848,7 +1158,9 @@ class ProductAcquisitionEngine:
         scope_url: str,
         *,
         limit: int,
-    ) -> None:
+        current_page: int = 1,
+        page_size: int | None = None,
+    ) -> dict[str, Any]:
         """Read products for one selected Magento category through public GraphQL.
 
         Magento PWA category pages render a small client shell and do not expose
@@ -888,25 +1200,28 @@ class ProductAcquisitionEngine:
         data = resolved.get("data") if isinstance(resolved, dict) else None
         route = data.get("urlResolver") if isinstance(data, dict) else None
         if not isinstance(route, dict) or str(route.get("type") or "").upper() != "CATEGORY":
-            return
+            return {"item_count": 0, "total_count": None, "total_pages": 0, "page_size": page_size or 1}
         category_id = str(route.get("id") or "").strip()
         if not category_id.isdigit():
-            return
+            return {"item_count": 0, "total_count": None, "total_pages": 0, "page_size": page_size or 1}
 
-        page_size = max(1, min(int(limit), 48))
+        page_size = max(1, min(int(page_size or limit), 48))
+        current_page = max(1, int(current_page))
         products_response = post({
             "query": (
-                "query ProductsByCategory($id: String!, $pageSize: Int!) { "
-                "products(filter: {category_id: {eq: $id}}, pageSize: $pageSize, currentPage: 1) { "
+                "query ProductsByCategory($id: String!, $pageSize: Int!, $currentPage: Int!) { "
+                "products(filter: {category_id: {eq: $id}}, pageSize: $pageSize, currentPage: $currentPage) { "
                 "items { uid sku name url_key url_suffix image { url } small_image { url } "
-                "url_rewrites { url } description { html } short_description { html } } } }"
+                "url_rewrites { url } description { html } short_description { html } } "
+                "total_count page_info { current_page page_size total_pages } } }"
             ),
-            "variables": {"id": category_id, "pageSize": page_size},
+            "variables": {"id": category_id, "pageSize": page_size, "currentPage": current_page},
         })
         product_data = products_response.get("data") if isinstance(products_response, dict) else None
         products = product_data.get("products") if isinstance(product_data, dict) else None
         items = products.get("items") if isinstance(products, dict) else None
-        for item in items if isinstance(items, list) else []:
+        item_values = items if isinstance(items, list) else []
+        for item in item_values:
             if not isinstance(item, dict):
                 continue
             product = self._product_from_magento_item(
@@ -915,12 +1230,21 @@ class ProductAcquisitionEngine:
             )
             if product is None:
                 continue
-            serialized = asdict(product)
-            serialized["identity_key"] = product.identity_key
-            payload["products"].setdefault(product.identity_key, serialized)
-            capture_path = self.capture_root / f"{product.capture_sha256}.json"
-            if not capture_path.exists():
-                capture_path.write_text(json.dumps(serialized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self._store_product(payload, product)
+        total_count = products.get("total_count") if isinstance(products, dict) else None
+        if not isinstance(total_count, int) or total_count < 0:
+            total_count = None
+        page_info = products.get("page_info") if isinstance(products, dict) else None
+        total_pages = page_info.get("total_pages") if isinstance(page_info, dict) else None
+        if not isinstance(total_pages, int) or total_pages < 0:
+            total_pages = ((total_count + page_size - 1) // page_size) if total_count is not None else None
+        return {
+            "item_count": len(item_values),
+            "total_count": total_count,
+            "total_pages": total_pages,
+            "page_size": page_size,
+            "current_page": current_page,
+        }
 
     @staticmethod
     def _magento_product_url(item: dict[str, Any], scope_url: str) -> str:

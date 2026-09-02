@@ -34,6 +34,7 @@ export interface ControlJob {
   category_allocation: "PER_CATEGORY" | "TOTAL_ACROSS_SELECTED";
   allocation_strategy: "SEQUENTIAL" | "EVEN" | "PROPORTIONAL" | "CUSTOM";
   spillover: "ASK" | "AUTO_IF_EXPLICIT" | "STOP";
+  category_quotas?: Record<string, number>;
   requested_count: number;
   counts: {
     reported_count: number;
@@ -312,6 +313,7 @@ export interface CreateControlJobInput {
   category_allocation: "PER_CATEGORY" | "TOTAL_ACROSS_SELECTED";
   allocation_strategy: "SEQUENTIAL" | "EVEN" | "PROPORTIONAL" | "CUSTOM";
   spillover: "ASK" | "AUTO_IF_EXPLICIT" | "STOP";
+  category_quotas?: Record<string, number>;
   category_ids: string[];
   provider: "OFF" | "lux3d" | "tripo" | "hunyuan";
 }
@@ -506,7 +508,7 @@ export function deleteControlJob(jobId: string): Promise<{ deleted: boolean; job
   return request(`/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
 }
 
-export function updateControlJob(jobId: string, input: { title?: string; goal?: string; target_value?: number; provider?: string }): Promise<{ job: ControlJob }> {
+export function updateControlJob(jobId: string, input: { title?: string; goal?: string; target_value?: number; provider?: string; category_allocation?: "PER_CATEGORY" | "TOTAL_ACROSS_SELECTED"; allocation_strategy?: "SEQUENTIAL" | "EVEN" | "PROPORTIONAL" | "CUSTOM"; spillover?: "ASK" | "AUTO_IF_EXPLICIT" | "STOP"; category_quotas?: Record<string, number> }): Promise<{ job: ControlJob }> {
   return request(`/jobs/${encodeURIComponent(jobId)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },

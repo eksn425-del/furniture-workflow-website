@@ -371,3 +371,37 @@ def test_required_quota_rejects_candidate_outside_locked_categories(tmp_path: Pa
     pool.transition(candidate.candidate_id, ItemState.MODEL_INPUT_LOCKED, reason="fixture")
     engine = SkillsWorkflowInterface(policy=policy, pool_path=pool_path, adapter=QualificationAdapter("never", "never"))
     assert engine.engine._category_has_capacity(engine.engine.pool.records()[0]) is False
+
+
+@pytest.mark.parametrize("spillover, expected", [("ASK", False), ("STOP", False), ("AUTO_IF_EXPLICIT", True)])
+def test_spillover_modes_have_distinct_quota_behavior(tmp_path: Path, spillover: str, expected: bool) -> None:
+    order_id = f"order-spillover-{spillover.casefold()}"
+    lock = make_order_policy_lock(
+        source="CGTrader", categories={"Chair": 1, "Table": 1}, exact_n=2, provider="lux3d",
+        ruleset="furniture-workflow-8.7.1", image_policy="clean-single-product",
+        five_year_policy="published-within-five-years", naming_policy="deterministic-product-name.v1",
+        dimension_policy="official-or-dual-agent", registry_identity="registry", registry_version="v2",
+        authorization_mode="EXACT_COUNT_AUTHORIZATION", quality_policy="raw-glb-only",
+    )
+    policy = RuntimePolicy(
+        order_id=order_id, job_id=order_id, target_count=2, progressive_gates=(1, 2),
+        provider="lux3d", order_policy=lock, spillover=spillover,
+    )
+    pool_path = tmp_path / f"{spillover}.json"
+    pool = CandidatePoolStore(pool_path, order_id=order_id)
+    pool.set_order_policy_hash(lock.order_policy_hash, target_count=2, progressive_gates=(1, 2))
+    candidates = [_candidate(order_id, 0), _candidate(order_id, 1)]
+    candidates[0].category_group = "Chair"
+    candidates[1].category_group = "Chair"
+    pool.add_candidates(candidates)
+    pool.transition("candidate-0", ItemState.COMPLETED, reason="fixture")
+    pool.mark_raw_glb("candidate-0", raw_glb_path="candidate-0.glb", raw_glb_sha256="0" * 64, valid=True)
+    pool.transition("candidate-1", ItemState.MODEL_INPUT_LOCKED, reason="fixture")
+
+    engine = SkillsWorkflowInterface(
+        policy=policy,
+        pool_path=pool_path,
+        adapter=QualificationAdapter("never", "never"),
+    )
+
+    assert engine.engine._category_has_capacity(engine.engine.pool.records()[1]) is expected
