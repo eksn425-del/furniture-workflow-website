@@ -8,7 +8,7 @@ import re
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -19,14 +19,24 @@ from app.services.brain_provider import (
     BrainNotConfigured,
     WebsiteBrainProvider,
 )
-from app.services.native_contracts import BrainTaxonomyResponse, TaxonomyCategoryContract, TaxonomyReceipt
+from app.services.native_contracts import BrainTaxonomyResponse, SiteProfileContract, TaxonomyCategoryContract, TaxonomyReceipt
 from app.services.product_acquisition import (
     BrowserAccessDenied,
     BrowserHumanRequired,
     BrowserRuntimeMissing,
     BrowserTemporaryFailure,
     NativeBrowserCollector,
+    ProductAcquisitionEngine,
     classify_source_type,
+    _parse_dimension_text,
+    rank_product_images,
+)
+from app.services.site_profile import build_site_profile, profile_drift_reasons, profile_is_reusable, validate_site_profile
+from app.services.strategy_catalog import (
+    STRATEGY_CATALOG,
+    default_strategy_plan,
+    strategy_catalog_payload,
+    validate_strategy_plan,
 )
 
 import requests
@@ -504,6 +514,107 @@ _AGENT_TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
         "function": {
+            "name": "discover_products",
+            "description": "Inspect one same-site category page for bounded public product URLs; never broad-crawl beyond the supplied page.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "same-site category page URL"}, "limit": {"type": "integer", "minimum": 1, "maximum": 24}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_product",
+            "description": "Inspect one public product detail page for identity, PDP text, and structured evidence.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "same-site product detail URL"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_pagination",
+            "description": "Inspect a category page for an explicit, same-site continuation cursor or a verified end.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "same-site category page URL"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_product_images",
+            "description": "List and rank public product image candidates; clean product media wins and lifestyle/swatch media is marked rejected.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "same-site product detail URL"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_dimensions",
+            "description": "Read public PDP/specification dimension text without estimating missing axes.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "same-site product detail URL"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_strategy",
+            "description": "Validate a strategy selection against the reviewed Website Strategy Catalog; never execute invented code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "taxonomy_strategy": {"type": "string"},
+                    "product_discovery_strategy": {"type": "string"},
+                    "pagination_strategy": {"type": "string"},
+                    "pdp_strategy": {"type": "string"},
+                    "image_strategy": {"type": "string"},
+                    "dimension_strategy": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish_site_profile",
+            "description": "Validate and return a safe SiteProfile v1 with selected reviewed strategies and public evidence.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "platform": {"type": "string"},
+                    "source_type": {"type": "string"},
+                    "taxonomy_strategy": {"type": "string"},
+                    "product_discovery_strategy": {"type": "string"},
+                    "pagination_strategy": {"type": "string"},
+                    "pdp_strategy": {"type": "string"},
+                    "image_strategy": {"type": "string"},
+                    "dimension_strategy": {"type": "string"},
+                    "confidence": {"type": "number"},
+                    "evidence": {"type": "object"},
+                },
+                "required": ["taxonomy_strategy", "product_discovery_strategy", "pagination_strategy", "pdp_strategy", "image_strategy", "dimension_strategy"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "escalate_browser",
             "description": "Request that this page be re-fetched in a visible persistent browser session (L2). Not a CAPTCHA claim.",
             "parameters": {
@@ -550,10 +661,18 @@ _AGENT_TOOLS: list[dict[str, object]] = [
 class NativeSiteAnalyzer:
     """Safe, bounded L0/L1 taxonomy analyzer owned by Website."""
 
-    def __init__(self, output_root: Path, brain: WebsiteBrainProvider | None = None, *, client_factory: Callable[..., SafeHttpClient] | None = None) -> None:
+    def __init__(
+        self,
+        output_root: Path,
+        brain: WebsiteBrainProvider | None = None,
+        *,
+        client_factory: Callable[..., SafeHttpClient] | None = None,
+        profile: Mapping[str, Any] | None = None,
+    ) -> None:
         self.output_root = Path(output_root).resolve()
         self.brain = brain or WebsiteBrainProvider()
         self.client_factory = client_factory or SafeHttpClient
+        self.profile = dict(profile) if isinstance(profile, Mapping) else None
 
     def _access_decision(self, source_url: str, *, stage: str, reason_code: str, evidence: dict[str, object] | None = None) -> tuple[str, dict[str, str], dict[str, object]]:
         payload = {"stage": stage, "reason_code": reason_code, **(evidence or {})}
@@ -635,7 +754,15 @@ class NativeSiteAnalyzer:
             result.update({"status": "FAILED", "network_called": True, "next_action": "保留证据并检查站点公开可访问性", "blocker": {"code": type(error).__name__.upper(), "message": str(error)[:500]}})
         return result
 
-    def analyze(self, url: str, *, live: bool, output_dir: Path | None = None, fixture: Path | None = None) -> dict[str, object]:
+    def analyze(
+        self,
+        url: str,
+        *,
+        live: bool,
+        output_dir: Path | None = None,
+        fixture: Path | None = None,
+        profile: Mapping[str, Any] | None = None,
+    ) -> dict[str, object]:
         normalized = normalize_site_url(url)
         site_key = site_key_for(normalized)
         root = Path(output_dir or (self.output_root / "_control" / "site_analysis" / site_key / f"scan_{uuid4().hex}")).resolve()
@@ -733,7 +860,35 @@ class NativeSiteAnalyzer:
                 status = "BRAIN_NOT_CONFIGURED"
             elif not categories:
                 status = "BROWSER_REQUIRED"
-            receipt = self._receipt(normalized, site_key, live=True, status=status, categories=categories, evidence={"l0": signals, "http": client.telemetry(), "sitemaps": sitemap_urls, "sitemap_hits": len(sitemap_hits), "magento_graphql_taxonomy": magento_taxonomy_evidence, "magento_graphql_counts": magento_count_evidence}, brain=brain_metadata, blocker=None if status == "READY" else {"code": str(status), "message": self._blocker_message(str(status))}, source_type=source_type)
+            platform = str(signals.get("platform") or "UNKNOWN")
+            existing_profile = profile if isinstance(profile, Mapping) else self.profile
+            profile_reusable = profile_is_reusable(existing_profile, site_key=site_key, platform=platform) if existing_profile else False
+            profile_drift = profile_drift_reasons(existing_profile, site_key=site_key, platform=platform) if isinstance(existing_profile, Mapping) else []
+            if profile_drift == ["PROFILE_MARKED_STALE"] and profile_reusable:
+                profile_reusable = False
+            profile_payload = brain_metadata.get("site_profile") if isinstance(brain_metadata.get("site_profile"), dict) else None
+            if profile_payload is None and profile_reusable and not profile_drift:
+                profile_payload = dict(existing_profile) if isinstance(existing_profile, Mapping) else None
+            if profile_payload is None:
+                profile_payload = build_site_profile(
+                    site_key=site_key,
+                    source_url=normalized,
+                    source_type=source_type,
+                    platform=platform,
+                    plan=default_strategy_plan(platform),
+                    evidence={"signals": signals, "taxonomy_count": len(categories), "public_http": client.telemetry()},
+                    status="VALIDATED" if status == "READY" and str(brain_metadata.get("status") or "") == "AGENT_READY" else "DRAFT",
+                    confidence=max((item.confidence for item in categories), default=0.0),
+                    previous=existing_profile if isinstance(existing_profile, Mapping) else None,
+                )
+            if profile_drift:
+                profile_payload["status"] = "STALE"
+            brain_metadata["site_profile_reused"] = profile_reusable and not profile_drift
+            if profile_drift:
+                brain_metadata["site_profile_drift"] = profile_drift
+            scan_evidence = {"l0": signals, "http": client.telemetry(), "sitemaps": sitemap_urls, "sitemap_hits": len(sitemap_hits), "magento_graphql_taxonomy": magento_taxonomy_evidence, "magento_graphql_counts": magento_count_evidence}
+            agent_trace = brain_metadata if str(brain_metadata.get("status") or "").startswith("AGENT") else brain_metadata.get("agent_loop") if isinstance(brain_metadata.get("agent_loop"), dict) else {}
+            receipt = self._receipt(normalized, site_key, live=True, status=status, categories=categories, evidence=scan_evidence, brain=brain_metadata, site_profile=profile_payload, agent_trace=agent_trace, blocker=None if status == "READY" else {"code": str(status), "message": self._blocker_message(str(status))}, source_type=source_type)
         except RobotsDenied as error:
             receipt = self._receipt(normalized, site_key, live=True, status="ROBOTS_DENIED", categories=[], evidence={"network_called": True}, blocker={"code": "ROBOTS_DENIED", "message": str(error)})
         except AccessControlDetected as error:
@@ -1013,17 +1168,54 @@ class NativeSiteAnalyzer:
             category.evidence.append({"role": "bounded_product_link_sample", "value": product_links, "source_url": category.source_url})
             category.confidence = max(category.confidence, 0.7)
 
-    def _agent_tool_executor(self, client: SafeHttpClient, source_url: str, *, count_results: dict[str, dict[str, object]] | None = None) -> Callable[[str, dict[str, object]], dict[str, object]]:
+    def _agent_tool_executor(
+        self,
+        client: SafeHttpClient,
+        source_url: str,
+        *,
+        count_results: dict[str, dict[str, object]] | None = None,
+        strategy_results: dict[str, object] | None = None,
+        profile_result: dict[str, object] | None = None,
+    ) -> Callable[[str, dict[str, object]], dict[str, object]]:
         def execute(name: str, args: dict[str, object]) -> dict[str, object]:
             try:
-                return self._agent_dispatch(name, args, client, source_url, count_results=count_results)
+                return self._agent_dispatch(
+                    name,
+                    args,
+                    client,
+                    source_url,
+                    count_results=count_results,
+                    strategy_results=strategy_results,
+                    profile_result=profile_result,
+                )
             except RequestBudgetExceeded as error:
                 raise AgentToolError("REQUEST_BUDGET_EXCEEDED", str(error)) from error
             except (RobotsDenied, AccessControlDetected, HttpStatusError, NetworkPolicyError) as error:
                 raise AgentToolError(type(error).__name__, str(error)[:300]) from error
         return execute
 
-    def _agent_dispatch(self, name: str, args: dict[str, object], client: SafeHttpClient, source_url: str, *, count_results: dict[str, dict[str, object]] | None = None) -> dict[str, object]:
+    def _agent_dispatch(
+        self,
+        name: str,
+        args: dict[str, object],
+        client: SafeHttpClient,
+        source_url: str,
+        *,
+        count_results: dict[str, dict[str, object]] | None = None,
+        strategy_results: dict[str, object] | None = None,
+        profile_result: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        if name not in {"validate_strategy", "finish_site_profile"}:
+            raw_url = str(args.get("url") or (source_url if name == "list_categories" else "")).strip()
+            if not raw_url:
+                raise AgentToolError("BAD_ARGS", f"{name} requires url")
+            try:
+                target_url = normalize_site_url(urljoin(source_url, raw_url))
+            except ValueError as error:
+                raise AgentToolError("BAD_ARGS", str(error)) from error
+            if site_key_for(target_url) != site_key_for(source_url):
+                raise AgentToolError("OUT_OF_SCOPE_URL", "agent tools may only access the requested same-site host")
+            args = {**args, "url": target_url}
         if name == "browse":
             url = str(args.get("url") or "").strip()
             if not url:
@@ -1050,7 +1242,10 @@ class NativeSiteAnalyzer:
                 raise AgentToolError("BAD_ARGS", "list_categories requires url")
             html = client.get_html(url)
             cats, _ = self._l0_l1(url, html)
-            return {"url": url, "categories": [c.model_dump(mode="json") for c in cats[:30]]}
+            outcome = {"url": url, "categories": [c.model_dump(mode="json") for c in cats[:30]], "strategy": "NAV_TREE", "bounded": True}
+            if strategy_results is not None:
+                strategy_results["taxonomy_strategy"] = "NAV_TREE"
+            return outcome
         if name == "get_count":
             url = str(args.get("url") or "").strip()
             if not url:
@@ -1072,6 +1267,140 @@ class NativeSiteAnalyzer:
                 # 里复述 get_count 结果也不丢失（配合 _merge_brain 规则数量回填）。
                 count_results[url.rstrip("/").casefold()] = outcome
             return outcome
+        if name == "discover_products":
+            url = str(args.get("url") or "").strip()
+            if not url:
+                raise AgentToolError("BAD_ARGS", "discover_products requires url")
+            try:
+                limit = max(1, min(24, int(args.get("limit") or 12)))
+            except (TypeError, ValueError):
+                raise AgentToolError("BAD_ARGS", "discover_products limit must be an integer") from None
+            html = client.get_html(url)
+            links = ProductAcquisitionEngine._product_links(url, html)
+            strategy = "JSON_LD_PRODUCTS" if any(
+                str(item.get("@type") or "").casefold() == "product" and item.get("url")
+                for item in _json_ld_values(html)
+            ) else "GENERIC_PRODUCT_CARDS"
+            outcome = {"url": url, "strategy": strategy, "products": links[:limit], "product_count": len(links[:limit]), "bounded": True}
+            if strategy_results is not None:
+                strategy_results["product_discovery_strategy"] = strategy
+            return outcome
+        if name == "inspect_product":
+            url = str(args.get("url") or "").strip()
+            if not url:
+                raise AgentToolError("BAD_ARGS", "inspect_product requires url")
+            html = client.get_html(url)
+            products = [item for item in _json_ld_values(html) if str(item.get("@type") or "").casefold() == "product"]
+            visible = " ".join(re.sub(r"<[^>]+>", " ", html_lib.unescape(html)).split())
+            dimensions, unit = _parse_dimension_text(visible)
+            outcome = {
+                "url": url,
+                "pdp_strategy": "JSON_LD_PRODUCT" if products else "VISIBLE_PDP_TEXT",
+                "product_count": len(products),
+                "has_product_identity": bool(products),
+                "name": str(products[0].get("name") or "")[:240] if products else _first_text(html, (r"<h1[^>]*>(.*?)</h1>",))[:240],
+                "dimensions": dimensions,
+                "dimension_unit": unit,
+                "text_snippet": visible[:1200],
+            }
+            if strategy_results is not None:
+                strategy_results["pdp_strategy"] = outcome["pdp_strategy"]
+            return outcome
+        if name == "inspect_pagination":
+            url = str(args.get("url") or "").strip()
+            if not url:
+                raise AgentToolError("BAD_ARGS", "inspect_pagination requires url")
+            html = client.get_html(url)
+            next_url, explicit_end = ProductAcquisitionEngine._pagination_cursor(url, url, html)
+            if next_url:
+                if re.search(r"<link[^>]+rel=[\"']next", html, re.I):
+                    strategy = "REL_NEXT"
+                elif re.search(r"(?:load[- ]?more|next page|下一页)", html, re.I):
+                    strategy = "NEXT_LINK"
+                else:
+                    strategy = "PAGE_PARAM"
+            else:
+                strategy = "NO_VERIFIED_CONTINUATION"
+            outcome = {"url": url, "next_url": next_url, "explicit_end": bool(explicit_end), "strategy": strategy, "bounded": True}
+            if strategy_results is not None:
+                strategy_results["pagination_strategy"] = strategy
+            return outcome
+        if name == "list_product_images":
+            url = str(args.get("url") or "").strip()
+            if not url:
+                raise AgentToolError("BAD_ARGS", "list_product_images requires url")
+            html = client.get_html(url)
+            products = [item for item in _json_ld_values(html) if str(item.get("@type") or "").casefold() == "product"]
+            product = products[0] if products else {}
+            selection = rank_product_images(product, page_html=html, page_url=url)
+            chosen = next((item for item in selection if item.get("accepted")), None)
+            outcome = {
+                "url": url,
+                "image_strategy": "JSON_LD_IMAGE" if chosen and chosen.get("role") == "JSON_LD_IMAGE" else "PRODUCT_GALLERY" if chosen else "OG_IMAGE" if selection else "BROWSER_GALLERY",
+                "selected": chosen,
+                "candidates": selection,
+                "strict_clean_default": True,
+            }
+            if strategy_results is not None:
+                strategy_results["image_strategy"] = outcome["image_strategy"]
+            return outcome
+        if name == "inspect_dimensions":
+            url = str(args.get("url") or "").strip()
+            if not url:
+                raise AgentToolError("BAD_ARGS", "inspect_dimensions requires url")
+            html = client.get_html(url)
+            visible = " ".join(re.sub(r"<[^>]+>", " ", html_lib.unescape(html)).split())
+            dimensions, unit = _parse_dimension_text(visible)
+            state = "OFFICIAL_FOUND" if dimensions else "OFFICIAL_LOOKUP_INCOMPLETE"
+            outcome = {"url": url, "dimensions": dimensions, "dimension_unit": unit, "dimension_lookup_state": state, "strategy": "PDP_DIMENSION_TEXT" if dimensions else "SPECIFICATION_PANEL"}
+            if strategy_results is not None:
+                strategy_results["dimension_strategy"] = outcome["strategy"]
+            return outcome
+        if name == "validate_strategy":
+            valid, errors = validate_strategy_plan(args)
+            if strategy_results is not None:
+                strategy_results["strategy_validated"] = valid
+            return {"valid": valid, "errors": errors, "catalog": strategy_catalog_payload()}
+        if name == "finish_site_profile":
+            platform = str(args.get("platform") or "UNKNOWN").strip().upper()
+            source_type = str(args.get("source_type") or classify_source_type(source_url)).strip().upper()
+            plan_payload = {field: args.get(field) for field in (
+                "taxonomy_strategy", "product_discovery_strategy", "pagination_strategy",
+                "pdp_strategy", "image_strategy", "dimension_strategy",
+            )}
+            valid, errors = validate_strategy_plan(plan_payload)
+            if not valid:
+                raise AgentToolError("UNSUPPORTED_STRATEGY_REQUIRED", ",".join(errors))
+            verification = {
+                field: strategy_results.get(field) == selected
+                for field, selected in plan_payload.items()
+            } if strategy_results is not None else {field: False for field in plan_payload}
+            verification["strategy_catalog_valid"] = bool(strategy_results and strategy_results.get("strategy_validated") is True)
+            fully_verified = valid and all(verification.values())
+            try:
+                profile = build_site_profile(
+                    site_key=site_key_for(source_url),
+                    source_url=source_url,
+                    source_type=source_type,
+                    platform=platform,
+                    plan=plan_payload,
+                    # A profile becomes reusable only after each selected
+                    # strategy has produced bounded evidence in this agent
+                    # run; a direct finish call remains a safe DRAFT.
+                    status="VALIDATED" if fully_verified else "DRAFT",
+                    confidence=float(args.get("confidence") or 0.0),
+                    evidence={
+                        **(args.get("evidence") if isinstance(args.get("evidence"), dict) else {}),
+                        "bounded_verification": verification,
+                    },
+                )
+                validated = validate_site_profile(profile, allow_draft=not fully_verified).model_dump(mode="json")
+            except (TypeError, ValueError) as error:
+                raise AgentToolError("SITE_PROFILE_INVALID", str(error)[:300]) from error
+            if profile_result is not None:
+                profile_result.clear()
+                profile_result.update(validated)
+            return validated
         if name == "escalate_browser":
             return {"status": "BROWSER_REQUIRED", "url": str(args.get("url") or ""), "reason": "agent requested visible browser escalation; not treated as a CAPTCHA claim"}
         raise AgentToolError("UNKNOWN_TOOL", f"unknown agent tool {name!r}")
@@ -1114,6 +1443,9 @@ class NativeSiteAnalyzer:
             return None, {"status": "BRAIN_NOT_CONFIGURED", "provider_posts": self.brain.post_count}
         remaining_unknown = [item.path for item in categories if item.count_kind == "UNKNOWN"]
         count_results: dict[str, dict[str, object]] = {}
+        strategy_results: dict[str, object] = {}
+        profile_result: dict[str, object] = {}
+        default_plan = default_strategy_plan(str(signals.get("platform") or "UNKNOWN")).as_dict()
         input_payload: dict[str, object] = {
             "source_url": source_url,
             "task": "Produce the authoritative two-level furniture taxonomy with per-category counts.",
@@ -1122,10 +1454,14 @@ class NativeSiteAnalyzer:
             "navigation_tree": signals.get("navigation_tree") or [],
             "categories": [item.model_dump() for item in categories[:30]],
             "remaining_unknown_counts": remaining_unknown[:40],
+            "strategy_catalog": strategy_catalog_payload(),
+            "default_strategy_plan": default_plan,
         }
         system_prompt = (
             "You are an autonomous furniture-site taxonomy analyst for a compliant product-mapping workflow. "
-            "Use browse / list_categories / get_count to explore the public site. Produce a clean two-level "
+            "Use the bounded browse, category, product, image, pagination, and dimension tools to explore the public site. "
+            "Select only strategies from the supplied Strategy Catalog and call finish_site_profile when the public evidence supports a reusable profile. "
+            "Produce a clean two-level "
             "furniture taxonomy: level=1 departments (Seating / Tables / Beds / Rugs / Lighting ...) and level=2 "
             "their child categories (Chairs / Sofas ...). Every level=2 category must set parent_path to its "
             "department. Fill count_value / count_kind (EXACT / ESTIMATED) for as many categories as possible, "
@@ -1139,7 +1475,13 @@ class NativeSiteAnalyzer:
                 system_prompt=system_prompt,
                 input_payload=input_payload,
                 tools=_AGENT_TOOLS,
-                tool_executor=self._agent_tool_executor(client, source_url, count_results=count_results),
+                tool_executor=self._agent_tool_executor(
+                    client,
+                    source_url,
+                    count_results=count_results,
+                    strategy_results=strategy_results,
+                    profile_result=profile_result,
+                ),
                 options=AgentLoopOptions(
                     response_schema=BrainTaxonomyResponse,
                     finish_tool_name="finish",
@@ -1153,13 +1495,37 @@ class NativeSiteAnalyzer:
         receipt = {
             "status": "AGENT_READY" if result.validated is not None else result.stopped_reason,
             "stopped_reason": result.stopped_reason,
+            "stop_code": result.stop_code or result.stopped_reason,
             "turns": result.turns,
             "tool_calls": [
-                {"name": call.get("name"), "arguments": call.get("arguments"), "result_status": call.get("result_status")}
+                {
+                    "name": call.get("name"),
+                    "arguments": call.get("arguments"),
+                    "result_status": call.get("result_status"),
+                    "error_code": call.get("error_code"),
+                    "result_summary": call.get("result_summary"),
+                }
                 for call in result.tool_calls
             ],
             "provider_posts": result.provider_posts,
+            "agent_run_id": f"agent_{uuid4().hex}",
+            "task": "taxonomy_and_site_profile",
+            "selected_strategies": {**default_plan, **strategy_results},
+            "input_evidence_sha256": hashlib.sha256(json.dumps(input_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
         }
+        stop_code = str(result.stop_code or result.stopped_reason)
+        receipt["recovery_action"] = (
+            "RETRY_SAME_STRATEGY" if stop_code in {"AGENT_FINISH_SCHEMA_INVALID", "STOPPED"}
+            else "TRY_ALTERNATIVE_STRATEGY" if stop_code in {"MAX_STEPS", "TOOL_BUDGET_EXHAUSTED"}
+            else "UNSUPPORTED_STRATEGY_REQUIRED" if "UNSUPPORTED_STRATEGY" in stop_code
+            else "ACCESS_CHANGE_REQUIRED" if stop_code in {"ROBOTS_DENIED", "ACCESS_CONTROL_DETECTED", "HTTP_403", "HTTP_429"}
+            else "STOP" if stop_code in {"BRAIN_ERROR", "BRAIN_NOT_CONFIGURED"}
+            else "STOP"
+        )
+        if profile_result:
+            receipt["site_profile"] = profile_result
+        if result.validated is not None:
+            receipt["output_evidence_sha256"] = hashlib.sha256(json.dumps(result.validated.model_dump(mode="json"), ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         if result.validated is not None:
             return result.validated, receipt
         # 大脑 agent 未收敛：回退到一次性 reason_taxonomy，再失败则走规则兜底（保证摸底有产出）。
@@ -1659,10 +2025,60 @@ class NativeSiteAnalyzer:
         return self._receipt(source_url, site_key, live=False, status="DEMO_FIXTURE_ONLY", categories=categories, evidence={"source": "explicit_test_fixture", "network_called": False}, blocker={"code": "DEMO_FIXTURE_ONLY", "message": "仅测试 fixture；不是线上验证结果。"}, fixture_only=True)
 
     @staticmethod
-    def _receipt(source_url: str, site_key: str, *, live: bool, status: str, categories: list[TaxonomyCategoryContract], evidence: dict[str, object], blocker: dict[str, str] | None = None, brain: dict[str, object] | None = None, fixture_only: bool = False, source_type: str = "UNKNOWN") -> dict[str, object]:
+    def _receipt(
+        source_url: str,
+        site_key: str,
+        *,
+        live: bool,
+        status: str,
+        categories: list[TaxonomyCategoryContract],
+        evidence: dict[str, object],
+        blocker: dict[str, str] | None = None,
+        brain: dict[str, object] | None = None,
+        fixture_only: bool = False,
+        source_type: str = "UNKNOWN",
+        site_profile: Mapping[str, Any] | None = None,
+        agent_trace: Mapping[str, Any] | None = None,
+    ) -> dict[str, object]:
         taxonomy_level = "L2" if any(item.level == 2 for item in categories) else ("L1" if categories else "L0")
         source_scope = "MARKETPLACE_SCOPE" if source_type == "MARKETPLACE" else "SEARCH" if source_type == "SEARCH_RESULT" else "CATEGORY" if source_type == "SCOPED_CATEGORY" else "SITE"
-        receipt = TaxonomyReceipt(site_key=site_key, source_url=source_url, live=live, status=status, verified=bool(live and status == "READY"), fixture_only=fixture_only, taxonomy_level=taxonomy_level, source_type=source_type, source_scope=source_scope, categories=categories, evidence=evidence, blocker=blocker, brain=brain or {}, profile_version=f"website-native-{status.casefold()}", captured_at=datetime.now(UTC))
+        profile_payload = dict(site_profile) if isinstance(site_profile, Mapping) else None
+        if profile_payload is None and source_url:
+            # Keep every receipt self-describing, including blocked/offline
+            # scans.  A blocked profile is never marked reusable/validated.
+            profile_status = "DRAFT" if status in {"READY", "PARTIAL", "BRAIN_NOT_CONFIGURED"} else "BLOCKED"
+            try:
+                profile_payload = build_site_profile(
+                    site_key=site_key,
+                    source_url=source_url,
+                    source_type=source_type,
+                    platform=str((evidence.get("l0") or {}).get("platform") if isinstance(evidence.get("l0"), dict) else "UNKNOWN"),
+                    plan=default_strategy_plan(str((evidence.get("l0") or {}).get("platform") if isinstance(evidence.get("l0"), dict) else "UNKNOWN")),
+                    evidence={"receipt_status": status, "public_evidence": evidence},
+                    status=profile_status,
+                    confidence=0.0,
+                )
+            except (TypeError, ValueError):
+                profile_payload = None
+        receipt = TaxonomyReceipt(
+            site_key=site_key,
+            source_url=source_url,
+            live=live,
+            status=status,
+            verified=bool(live and status == "READY"),
+            fixture_only=fixture_only,
+            taxonomy_level=taxonomy_level,
+            source_type=source_type,
+            source_scope=source_scope,
+            categories=categories,
+            evidence=evidence,
+            blocker=blocker,
+            brain=brain or {},
+            site_profile=profile_payload,
+            agent_trace=dict(agent_trace or {}),
+            profile_version=(str(profile_payload.get("profile_version")) if isinstance(profile_payload, dict) else f"website-native-{status.casefold()}"),
+            captured_at=datetime.now(UTC),
+        )
         return receipt.model_dump(mode="json")
 
     @staticmethod

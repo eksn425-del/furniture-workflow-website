@@ -175,6 +175,7 @@ class AgentLoopResult:
     tool_calls: list[dict[str, object]]
     provider_posts: int
     stopped_reason: str  # FINISH / SCHEMA / MAX_STEPS / BUDGET / TERMINAL_TOOL / BRAIN_NOT_CONFIGURED / BRAIN_ERROR
+    stop_code: str = ""
 
 
 class WebsiteBrainProvider:
@@ -535,7 +536,7 @@ class WebsiteBrainProvider:
             or not self.settings.configured
             or not self.settings.agent_enabled
         ):
-            return AgentLoopResult(None, 0, [], self.post_count, "BRAIN_NOT_CONFIGURED")
+            return AgentLoopResult(None, 0, [], self.post_count, "BRAIN_NOT_CONFIGURED", "BRAIN_NOT_CONFIGURED")
         messages: list[dict[str, object]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(input_payload, ensure_ascii=False, sort_keys=True)},
@@ -548,9 +549,9 @@ class WebsiteBrainProvider:
             try:
                 message, _ = self._chat_once(messages=messages, tools=tools, input_payload=input_payload)
             except BrainNotConfigured:
-                return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BRAIN_NOT_CONFIGURED")
+                return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BRAIN_NOT_CONFIGURED", "BRAIN_NOT_CONFIGURED")
             except BrainError:
-                return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BRAIN_ERROR")
+                return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BRAIN_ERROR", "BRAIN_ERROR")
             calls = message.get("tool_calls") or []
             if calls:
                 for tc in calls:
@@ -563,22 +564,28 @@ class WebsiteBrainProvider:
                         args = {}
                     if name == options.finish_tool_name:
                         validated = self._finish_payload(args, options.response_schema)
-                        return AgentLoopResult(validated, turns, tool_calls_log, self.post_count, "FINISH" if validated is not None else "SCHEMA")
+                        return AgentLoopResult(validated, turns, tool_calls_log, self.post_count, "FINISH" if validated is not None else "SCHEMA", "" if validated is not None else "AGENT_FINISH_SCHEMA_INVALID")
                     if tool_budget <= 0:
-                        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BUDGET")
+                        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BUDGET", "TOOL_BUDGET_EXHAUSTED")
                     tool_budget -= 1
                     try:
                         result = tool_executor(name, args)
                         result_status = "OK"
                         content = json.dumps(result, ensure_ascii=False, default=str)
+                        result_summary = {
+                            "keys": sorted(str(key) for key in result)[:32] if isinstance(result, dict) else [],
+                            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                        }
                     except AgentToolError as err:
-                        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "TERMINAL_TOOL")
+                        tool_calls_log.append({"name": name, "arguments": args, "result_status": "TERMINAL", "error_code": err.code})
+                        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "TERMINAL_TOOL", err.code)
                     except Exception as exc:  # noqa: BLE001 - executor bugs must not kill the scan
                         result_status = "EXEC_ERROR"
                         content = json.dumps({"error": "EXEC_ERROR", "message": str(exc)[:300]}, ensure_ascii=False, default=str)
+                        result_summary = {"keys": ["error", "message"], "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": content})
-                    tool_calls_log.append({"name": name, "arguments": args, "result_status": result_status})
+                    tool_calls_log.append({"name": name, "arguments": args, "result_status": result_status, "result_summary": result_summary})
                 continue
             # No tool calls: model answered directly. Validate content as the schema if possible.
             content = message.get("content")
@@ -588,8 +595,10 @@ class WebsiteBrainProvider:
                 )
                 if validated is not None:
                     return AgentLoopResult(validated, turns, tool_calls_log, self.post_count, "SCHEMA")
-            return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "MAX_STEPS" if turns >= options.max_steps else "STOPPED")
-        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BUDGET" if tool_budget <= 0 else "MAX_STEPS")
+            reason = "MAX_STEPS" if turns >= options.max_steps else "STOPPED"
+            return AgentLoopResult(None, turns, tool_calls_log, self.post_count, reason, reason)
+        reason = "BUDGET" if tool_budget <= 0 else "MAX_STEPS"
+        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, reason, "TOOL_BUDGET_EXHAUSTED" if reason == "BUDGET" else reason)
 
     @staticmethod
     def _finish_payload(args: dict[str, object], schema: type[BaseModel] | None, *, from_content: bool = False) -> BaseModel | None:

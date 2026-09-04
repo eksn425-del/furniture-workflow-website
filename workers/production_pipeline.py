@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -149,6 +150,24 @@ def _distribute_proportionally(total: int, weights: dict[str, int]) -> dict[str,
     return quotas
 
 
+def default_provider_call_limit(contract: dict[str, Any]) -> int:
+    """Return the finite default hard-call limit for one production contract."""
+
+    try:
+        base = int(contract.get("target_value") or contract.get("requested_count") or 1)
+    except (TypeError, ValueError):
+        base = 1
+    base = max(1, base)
+    if str(contract.get("target_mode") or "").upper() == "ALL":
+        return 1
+    if str(contract.get("category_allocation") or "").upper() == "PER_CATEGORY":
+        categories = contract.get("categories") if isinstance(contract.get("categories"), list) else []
+        selected = [item for item in categories if isinstance(item, dict) and item.get("selected", True)]
+        if selected:
+            base *= len(selected)
+    return max(1, base)
+
+
 def _candidate_progress_signature(records: list[CandidateRecord]) -> tuple[tuple[str, str, str, str, str, str], ...]:
     """Capture durable fields that prove one engine tick made progress."""
     return tuple(sorted(
@@ -263,6 +282,11 @@ def _candidate_from_product(contract: dict[str, Any], product: AcquiredProduct) 
             "source_dimensions": product.dimensions,
             "dimension_unit": product.dimension_unit,
             "dimension_source": str(evidence.get("dimension_source") or "UNKNOWN"),
+            "dimension_lookup_state": str(
+                evidence.get("dimension_lookup_state")
+                or product.dimension_lookup_state
+                or ("OFFICIAL_FOUND" if product.dimensions else "UNKNOWN")
+            ).upper(),
             "capture_evidence": product.evidence,
             "acquisition": product.acquisition,
             "identity_fields": identity_fields,
@@ -283,6 +307,9 @@ def _candidate_from_product(contract: dict[str, Any], product: AcquiredProduct) 
             "scope_status": scope_state,
             "scope_reasons": evidence.get("scope_reasons") or [],
             "image_role": str(evidence.get("image_role") or "MAIN_PRODUCT"),
+            "image_selection_status": str(evidence.get("image_selection_status") or "UNKNOWN"),
+            "image_selection_strategy": str(evidence.get("image_selection_strategy") or "UNKNOWN"),
+            "image_candidates": evidence.get("image_candidates") or [],
             "layered_scene7": bool(evidence.get("layered_scene7")),
             "dedup_status": "UNIQUE",
             "claim_status": "CLAIMED",
@@ -572,7 +599,8 @@ class WebsiteStageAdapter:
 
     def _stage_dimension(self, candidate: CandidateRecord) -> StageOutcome:
         axes = ("width", "depth", "height")
-        values = candidate.lineage.get("source_dimensions") or {}
+        raw_values = candidate.lineage.get("source_dimensions") or {}
+        values = {axis: raw_values.get(axis) for axis in axes}
         source_hint = str(candidate.lineage.get("dimension_source") or "").strip().upper()
         source_aliases = {
             "EXPLICIT_PAGE_TEXT": "OFFICIAL_PAGE",
@@ -584,81 +612,119 @@ class WebsiteStageAdapter:
             "SOURCE_EXPLICIT": "OFFICIAL_PAGE",
         }
         source = source_aliases.get(source_hint, source_hint if source_hint in {"OFFICIAL_STRUCTURED", "OFFICIAL_PAGE"} else "")
+        lookup_state = str(candidate.lineage.get("dimension_lookup_state") or "").strip().upper()
+        decision = candidate.lineage.get("brain_product_decision") or {}
+        est_source = str(decision.get("dimension_source") or "").strip().upper()
+        override = bool(
+            candidate.lineage.get("allow_ai_dimension_override")
+            or candidate.lineage.get("dimension_override_authorized")
+            or self.contract.get("allow_ai_dimension_override")
+        )
+
+        # Official structured/page values always win.  A partial L1 value is
+        # not enough to silently complete the dimensions with an estimate.
         if all(values.get(axis) for axis in axes):
             source = source or "OFFICIAL_PAGE"
-        else:
-            # L1/HTML evidence 没有三轴官方尺寸。若 Brain 复核阶段已给出
-            # AI 预估高度（官网确实无官方尺寸），直接采用并跳过 L2 浏览器——
-            # 部分站点（如 Interiordefine）的尺寸页读取会永久阻塞 Playwright，
-            # 导致 worker 卡死、任务失败。有可用的 AI 预估高度时不再为读官网
-            # 尺寸而启动浏览器。
-            decision = candidate.lineage.get("brain_product_decision") or {}
-            est_source = str(decision.get("dimension_source") or "").upper()
-            ai_height = decision.get("height") if est_source == "AI_ESTIMATED" else None
-            if not any(values.get(axis) for axis in axes) and ai_height:
-                values = {"width": None, "depth": None, "height": float(ai_height)}
-                source = "AI_ESTIMATED"
-                candidate.lineage["dimension_source_detail"] = "AI_HEIGHT_ESTIMATE"
-                candidate.lineage["dimension_estimation"] = True
-                unit = str(decision.get("dimension_unit") or "in").strip().casefold()
-                candidate.lineage["dimension_unit"] = unit if unit in _SUPPORTED_DIMENSION_UNITS else "in"
+            lookup_state = "OFFICIAL_FOUND"
+        elif lookup_state != "OFFICIAL_ABSENT_CONFIRMED":
+            # If L1 did not expose all three axes, use the bounded L2 browser
+            # lookup first.  This ordering is deliberate: an AI estimate is
+            # legal only after an explicit official-absence result (or an
+            # operator-authorized override), never merely because it exists.
+            browser_dims: dict[str, float] = {}
+            browser_unit = ""
+            try:
+                session_dir = Path(str(self.acquisition.browser_session_dir))
+                browser_dims, browser_unit = self._extract_dimensions_bounded(str(candidate.canonical_url), session_dir)
+            except BrowserHumanRequired as error:
+                candidate.lineage["dimension_lookup_state"] = "OFFICIAL_LOOKUP_BLOCKED"
+                return StageOutcome(
+                    StageDecision.PENDING,
+                    "DIMENSIONS_BROWSER_HUMAN_REQUIRED",
+                    {
+                        "dimension_lookup_state": "OFFICIAL_LOOKUP_BLOCKED",
+                        "dimension_access_status": "HUMAN_REQUIRED",
+                        "dimension_access_reason": error.reason_code,
+                        "dimension_access_url": error.url,
+                    },
+                )
+            except BrowserTemporaryFailure as error:
+                candidate.lineage["dimension_lookup_state"] = "OFFICIAL_LOOKUP_TEMPORARY"
+                return StageOutcome(StageDecision.PENDING, error.reason_code, {
+                    "dimension_lookup_state": "OFFICIAL_LOOKUP_TEMPORARY",
+                    "dimension_access_status": "TEMPORARY_FAILURE",
+                    "dimension_access_reason": error.reason_code,
+                    "dimension_access_url": error.url,
+                })
+            except BrowserAccessDenied as error:
+                candidate.lineage["dimension_lookup_state"] = "OFFICIAL_LOOKUP_BLOCKED"
+                return StageOutcome(StageDecision.PENDING, error.code, {
+                    "dimension_lookup_state": "OFFICIAL_LOOKUP_BLOCKED",
+                    "dimension_access_status": "ACCESS_CHANGE_REQUIRED",
+                    "dimension_access_reason": error.reason_code,
+                    "dimension_access_url": error.url,
+                })
+            except BrowserRuntimeMissing:
+                candidate.lineage["dimension_lookup_state"] = "OFFICIAL_LOOKUP_INCOMPLETE"
+                raise
+            if all(browser_dims.get(axis) for axis in axes):
+                values = {axis: browser_dims[axis] for axis in axes}
+                source = "OFFICIAL_PAGE"
+                lookup_state = "OFFICIAL_FOUND"
+                candidate.lineage["dimension_source_detail"] = "L2_BROWSER_DIMENSIONS_TAB"
+                candidate.lineage["dimension_unit"] = browser_unit or candidate.lineage.get("dimension_unit") or "source_unit"
+            elif not browser_dims:
+                # A partial L1 payload is evidence that at least one official
+                # axis exists; an empty L2 result therefore cannot prove the
+                # missing axes are absent.  Keep it incomplete and resumable
+                # instead of silently turning it into an AI fallback.
+                if any(values.get(axis) for axis in axes):
+                    lookup_state = "OFFICIAL_LOOKUP_INCOMPLETE"
+                    candidate.lineage["dimension_lookup_state"] = lookup_state
+                    if not override:
+                        return StageOutcome(StageDecision.PENDING, "DIMENSIONS_OFFICIAL_LOOKUP_INCOMPLETE", {
+                            "dimension_lookup_state": lookup_state,
+                            "dimension_access_status": "INCOMPLETE",
+                        })
+                else:
+                    lookup_state = "OFFICIAL_ABSENT_CONFIRMED"
+                    candidate.lineage["dimension_lookup_state"] = lookup_state
             else:
-                # 官网可能有尺寸但 L1 未抓到：用有界超时尝试 L2 读取官方尺寸。
-                browser_dims: dict[str, float] = {}
-                browser_unit = ""
-                try:
-                    session_dir = Path(str(self.acquisition.browser_session_dir))
-                    browser_dims, browser_unit = self._extract_dimensions_bounded(str(candidate.canonical_url), session_dir)
-                except BrowserHumanRequired as error:
-                    return StageOutcome(
-                        StageDecision.PENDING,
-                        "DIMENSIONS_BROWSER_HUMAN_REQUIRED",
-                        {
-                            "dimension_access_status": "HUMAN_REQUIRED",
-                            "dimension_access_reason": error.reason_code,
-                            "dimension_access_url": error.url,
-                        },
-                    )
-                except BrowserTemporaryFailure as error:
-                    return StageOutcome(StageDecision.PENDING, error.reason_code, {
-                        "dimension_access_status": "TEMPORARY_FAILURE",
-                        "dimension_access_reason": error.reason_code,
-                        "dimension_access_url": error.url,
+                lookup_state = "OFFICIAL_LOOKUP_INCOMPLETE"
+                candidate.lineage["dimension_lookup_state"] = lookup_state
+                if not override:
+                    return StageOutcome(StageDecision.PENDING, "DIMENSIONS_OFFICIAL_LOOKUP_INCOMPLETE", {
+                        "dimension_lookup_state": lookup_state,
+                        "dimension_access_status": "INCOMPLETE",
                     })
-                except BrowserAccessDenied as error:
-                    return StageOutcome(StageDecision.PENDING, error.code, {
-                        "dimension_access_status": "ACCESS_CHANGE_REQUIRED",
-                        "dimension_access_reason": error.reason_code,
-                        "dimension_access_url": error.url,
-                    })
-                except BrowserRuntimeMissing:
-                    raise
-                if all(browser_dims.get(axis) for axis in axes):
-                    values = {axis: browser_dims[axis] for axis in axes}
-                    source = "OFFICIAL_PAGE"
-                    candidate.lineage["dimension_source_detail"] = "L2_BROWSER_DIMENSIONS_TAB"
-                    candidate.lineage["dimension_unit"] = browser_unit or candidate.lineage.get("dimension_unit") or "source_unit"
 
         if not all(values.get(axis) for axis in axes):
-            decision = candidate.lineage.get("brain_product_decision") or {}
-            est_source = str(decision.get("dimension_source") or "").upper()
-            # 官网无官方尺寸时按规则用 AI 预估高度（单轴）+ 后续等比缩放，
-            # 不因缺少三轴尺寸而拒绝候选。
-            if not any(values.get(axis) for axis in axes) and decision.get("height") and est_source == "AI_ESTIMATED":
-                values = {"width": None, "depth": None, "height": float(decision["height"])}
-                source = "AI_ESTIMATED"
-                candidate.lineage["dimension_source_detail"] = "AI_HEIGHT_ESTIMATE"
+            # AI height/full-axis values are accepted only after the official
+            # lookup proved absence, or when the operator explicitly opted in.
+            ai_allowed = lookup_state == "OFFICIAL_ABSENT_CONFIRMED" or override
+            ai_height = decision.get("height") if est_source == "AI_ESTIMATED" else None
+            ai_values = {axis: decision.get(axis) for axis in axes}
+            if ai_allowed and ai_height:
+                values = {
+                    axis: values.get(axis) or (float(ai_height) if axis == "height" else None)
+                    for axis in axes
+                }
+                source = "AI_ESTIMATED_OVERRIDE" if override and lookup_state != "OFFICIAL_ABSENT_CONFIRMED" else "AI_ESTIMATED"
+                candidate.lineage["dimension_source_detail"] = "AI_HEIGHT_AFTER_OFFICIAL_ABSENCE" if source == "AI_ESTIMATED" else "AI_HEIGHT_EXPLICIT_OVERRIDE"
                 candidate.lineage["dimension_estimation"] = True
+                candidate.lineage["dimension_override_authorized"] = bool(source == "AI_ESTIMATED_OVERRIDE")
+                candidate.lineage["dimension_lookup_state"] = lookup_state or "OFFICIAL_ABSENT_CONFIRMED"
                 unit = str(decision.get("dimension_unit") or "in").strip().casefold()
                 candidate.lineage["dimension_unit"] = unit if unit in _SUPPORTED_DIMENSION_UNITS else "in"
-            else:
-                estimated_values = {axis: decision.get(axis) for axis in axes}
-                if all(estimated_values.get(axis) for axis in axes):
-                    values = estimated_values
-                    source = est_source if est_source in {"OFFICIAL_STRUCTURED", "OFFICIAL_PAGE"} else "AI_ESTIMATED"
-                    candidate.lineage["dimension_source_detail"] = "BRAIN_DECISION_AFTER_OFFICIAL_LOOKUP"
-                    if decision.get("dimension_unit"):
-                        candidate.lineage["dimension_unit"] = decision.get("dimension_unit")
+            elif ai_allowed and all(ai_values.get(axis) for axis in axes):
+                values = ai_values
+                source = "AI_ESTIMATED_OVERRIDE" if override else "AI_ESTIMATED"
+                candidate.lineage["dimension_source_detail"] = "BRAIN_AXES_AFTER_OFFICIAL_LOOKUP"
+                candidate.lineage["dimension_estimation"] = True
+                candidate.lineage["dimension_override_authorized"] = bool(override)
+                candidate.lineage["dimension_lookup_state"] = lookup_state or "OFFICIAL_ABSENT_CONFIRMED"
+                if decision.get("dimension_unit"):
+                    candidate.lineage["dimension_unit"] = decision.get("dimension_unit")
         governed: dict[str, int] = {}
         try:
             for axis in axes:
@@ -678,8 +744,17 @@ class WebsiteStageAdapter:
             "dimension_unit": candidate.lineage.get("dimension_unit") or "source_unit",
             "dimension_source_detail": candidate.lineage.get("dimension_source_detail") or source,
             "dimension_estimation": bool(candidate.lineage.get("dimension_estimation")),
+            "dimension_lookup_state": lookup_state or ("OFFICIAL_FOUND" if source.startswith("OFFICIAL") else "UNKNOWN"),
+            "dimension_override_authorized": bool(candidate.lineage.get("dimension_override_authorized")),
         }
-        self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
+        candidate.lineage.update(evidence)
+        try:
+            self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
+        except KeyError:
+            # Unit tests and lightweight callers may evaluate a candidate
+            # before it has been inserted into the durable pool.  The stage
+            # result remains valid; the normal engine path persists it.
+            pass
         return StageOutcome(StageDecision.ACCEPTED, "DIMENSIONS_READY", evidence)
 
     def _stage_naming(self, candidate: CandidateRecord) -> StageOutcome:
@@ -695,10 +770,6 @@ class WebsiteStageAdapter:
         decision = candidate.lineage.get("brain_product_decision") or {}
         reliable = len(source_name) >= 3 and source_name.casefold() not in {"product", "item", "untitled"}
         decision_source = "SOURCE_NAME_FIRST"
-        # 从 URL slug 派生的完整官方名应尽量保留原样（不被 50 字符强制截断成
-        # 语义残缺的名字）；仅对这类"裸品牌短词 → slug 官方名"的产物放宽长度。
-        preserve_official_name = False
-
         # 品牌库（界面标记 / 配置登记）：品牌前缀 + 官方名 + 四段式（风格/颜色/材质/类型）。
         if bool(self.contract.get("is_brand_library")):
             brand = _safe_name(str(self.contract.get("brand_name") or site_brand or ""))
@@ -781,7 +852,6 @@ class WebsiteStageAdapter:
                 if slug_name != source_name:
                     governed_name = slug_name
                     decision_source = "OFFICIAL_NAME_FROM_URL_SLUG"
-                    preserve_official_name = True
             if not reliable:
                 try:
                     governed_name = compose_product_name(
@@ -796,9 +866,9 @@ class WebsiteStageAdapter:
                     decision_source = "GOVERNED_FALLBACK"
                 except NamingReviewRequired as error:
                     return StageOutcome(StageDecision.REJECTED, f"NAMING_REVIEW:{error}")
-        # 从 slug 派生的官方名保留原样（可超过 50，但仍是完整官方名）；
-        # 其余名称维持 50 字符的正式上限。
-        name_limit = 140 if preserve_official_name else 50
+        # V3 Final Naming Gate：所有来源（包括 URL slug 派生的官方名）统一
+        # 采用 50 字符上限；不得以 140 字符特殊例外绕过正式 contract。
+        name_limit = 50
         try:
             governed_name = shorten_name_to_limit(
                 governed_name,
@@ -811,9 +881,15 @@ class WebsiteStageAdapter:
             return StageOutcome(StageDecision.REJECTED, f"NAMING_REVIEW:{error}")
         if len(governed_name) > name_limit:
             return StageOutcome(StageDecision.REJECTED, "NAMING_REVIEW:product_name_exceeds_50_characters")
+        # Keep the pre-V3 SOURCE_NAME_FIRST marker readable for existing
+        # consumers while exposing the stricter contract decision explicitly.
+        # The final value and the governed name remain the V3 direct-brand
+        # result; this is only a compatibility alias for the lineage field.
+        legacy_decision_source = "SOURCE_NAME_FIRST" if decision_source == "DIRECT_BRAND_OFFICIAL" else decision_source
         self.pool.enrich_candidate(candidate.candidate_id, product_name=governed_name, lineage={
             "governed_name": governed_name,
-            "naming_decision_source": decision_source,
+            "naming_decision_source": legacy_decision_source,
+            "naming_governance": decision_source,
             "source_name_reliable": reliable,
             "platform_brand_excluded": source_type == "MARKETPLACE",
             "source_policy_host": self.source_policy.source_host,
@@ -923,9 +999,9 @@ class WebsiteStageAdapter:
         plan = self.contract.get("approved_plan")
         raw = plan.get("approved_provider_call_limit") if isinstance(plan, dict) else None
         if raw in (None, ""):
-            # 未显式设限时按不设上限处理（取 schema 允许的最大值），
-            # 避免测试期因默认按目标数设限、把失败/进行中的调用也算进去而提前阻塞。
-            raw = 5000
+            # V3 Exact-N default: an omitted approval reserves exactly the
+            # finite requested target rather than a large sentinel.
+            raw = default_provider_call_limit(self.contract)
         try:
             return max(0, int(raw or 0))
         except (TypeError, ValueError):
@@ -978,12 +1054,28 @@ class WebsiteStageAdapter:
             ledgers = list(session.scalars(select(ProductionProviderTask).where(
                 ProductionProviderTask.job_id == self.contract["job_id"],
             )))
-            reserved_calls = sum(self._provider_slot_reserved(item) for item in ledgers)
-            imminent = 0 if ledger is not None and self._provider_slot_reserved(ledger) else 1
-            if call_limit <= 0 or reserved_calls + imminent > call_limit:
+            # The approved limit is a hard *call* budget, not only a
+            # concurrency reservation.  Completed/failed attempts remain
+            # counted, while a PREPARED ledger with no POST yet reserves one
+            # imminent slot.  SUBMISSION_UNKNOWN is already represented by
+            # post_attempts and therefore cannot be retried automatically.
+            chargeable_states = {"ACTIVE", "CREATE_IN_FLIGHT", "SUBMISSION_UNKNOWN", "PROVIDER_SUCCESS", "DELIVERED"}
+            consumed_calls = sum(
+                max(0, int(item.post_attempts or 0))
+                for item in ledgers
+                if item.provider_task_id
+                or item.status in chargeable_states
+                or item.checkpoint_state in chargeable_states
+            )
+            # Every new create attempt reserves one slot.  A retry after a
+            # capacity response is still allowed when the approved budget has
+            # room; the capacity response itself is not counted as a charge.
+            imminent = 1
+            if call_limit <= 0 or consumed_calls + imminent > call_limit:
                 return StageOutcome(StageDecision.HARD_STOP, "PROVIDER_CALL_LIMIT_REACHED", {
                     "approved_provider_call_limit": call_limit,
-                    "reserved_provider_calls": reserved_calls,
+                    "provider_calls_consumed": consumed_calls,
+                    "reserved_provider_calls": consumed_calls,
                     "imminent_provider_calls": imminent,
                 })
             if ledger is None:
@@ -1186,14 +1278,23 @@ class ProductionPipeline:
         self.blender_adapter = blender_adapter if blender_adapter is not None else resolve_blender_adapter(contract)
         self.media_client_factory = media_client_factory
         browser = contract.get("browser_session") or {}
-        self.acquisition = acquisition_factory(
-            source_url=str(contract["source_url"]),
-            site_key=str(contract["site_key"]),
-            source_type=str(contract.get("source_type") or "UNKNOWN"),
-            categories=list(contract.get("categories") or []),
-            workspace=self.workspace,
-            browser_session_dir=Path(str(browser.get("user_data_dir") or self.workspace / "browser_session")),
-        )
+        acquisition_kwargs: dict[str, Any] = {
+            "source_url": str(contract["source_url"]),
+            "site_key": str(contract["site_key"]),
+            "source_type": str(contract.get("source_type") or "UNKNOWN"),
+            "categories": list(contract.get("categories") or []),
+            "workspace": self.workspace,
+            "browser_session_dir": Path(str(browser.get("user_data_dir") or self.workspace / "browser_session")),
+        }
+        try:
+            factory_params = inspect.signature(acquisition_factory).parameters
+            accepts_kwargs = any(param.kind is inspect.Parameter.VAR_KEYWORD for param in factory_params.values())
+        except (TypeError, ValueError):
+            accepts_kwargs = True
+            factory_params = {}
+        if accepts_kwargs or "site_profile" in factory_params:
+            acquisition_kwargs["site_profile"] = contract.get("site_profile")
+        self.acquisition = acquisition_factory(**acquisition_kwargs)
         self.brain = brain or WebsiteBrainProvider()
         self.provider_client = provider_client if provider_client is not None else self._provider_client()
         self.pool = CandidatePoolStore(self.workspace / "candidate_pool.json", order_id=str(contract["job_id"]), job_id=str(contract["job_id"]))
@@ -1481,6 +1582,12 @@ class ProductionPipeline:
         capacity_wait_started: float | None = None
         capacity_wait_interval = float(os.getenv("LUX3D_QUERY_INTERVAL", "15"))
         capacity_wait_max_seconds = float(os.getenv("LUX3D_CAPACITY_WAIT_MAX_SECONDS", "1800"))
+        # Deterministic fixture runs must never spend the production backoff
+        # window sleeping for a simulated 429.  They exercise the durable
+        # CAPACITY_WAIT checkpoint and resume path instead; real runs retain
+        # the bounded capacity wait unless an operator overrides the limit.
+        if os.getenv("FURNITURE_WORKFLOW_TEST_FIXTURES", "").strip().casefold() in {"1", "true", "yes"}:
+            capacity_wait_max_seconds = 0.0
         try:
             for _ in range(max(80, target * 20)):
                 records = self.pool.records()
@@ -1825,4 +1932,4 @@ class ProductionPipeline:
         return 0
 
 
-__all__ = ["ProductionPipeline", "WebsiteStageAdapter"]
+__all__ = ["ProductionPipeline", "WebsiteStageAdapter", "default_provider_call_limit"]

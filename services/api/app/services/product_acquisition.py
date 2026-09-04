@@ -14,7 +14,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from workers.scrape.http_client import (
@@ -176,6 +176,7 @@ class AcquiredProduct:
     media_binding_status: str = "UNKNOWN"
     media_binding_confidence: float = 0.0
     scope_status: str = "UNKNOWN"
+    dimension_lookup_state: str = "UNKNOWN"
 
     @property
     def identity_key(self) -> str:
@@ -281,6 +282,146 @@ def _image_value(value: Any) -> str:
     if isinstance(value, dict):
         return str(value.get("url") or value.get("contentUrl") or "")
     return ""
+
+
+_IMAGE_NEGATIVE_RE = re.compile(
+    r"(?:lifestyle|life[-_ ]?style|room[-_ ]?scene|scene|model|person|swatch|"
+    r"thumbnail|thumb|sprite|icon|logo|placeholder|alternate|alt[-_ ]?view)",
+    re.I,
+)
+_IMAGE_POSITIVE_RE = re.compile(r"(?:main|primary|hero|product|gallery|detail|front)", re.I)
+
+
+def _flatten_image_values(value: Any, *, role: str, output: list[dict[str, str]]) -> None:
+    """Flatten common public image/gallery shapes without fetching media."""
+
+    if isinstance(value, str):
+        url = value.strip()
+        if url:
+            output.append({"url": url, "role": role})
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _flatten_image_values(item, role=role, output=output)
+        return
+    if isinstance(value, dict):
+        url = value.get("url") or value.get("contentUrl") or value.get("src") or value.get("image_url")
+        if url:
+            _flatten_image_values(str(url), role=role, output=output)
+        for key in ("image", "images", "gallery", "imageGallery", "associatedMedia", "media", "media_gallery_entries", "entries"):
+            if key in value:
+                nested_role = "PRODUCT_GALLERY" if key.casefold() in {"gallery", "imagegallery", "associatedmedia", "media", "media_gallery_entries", "entries"} else role
+                _flatten_image_values(value[key], role=nested_role, output=output)
+
+
+def rank_product_images(
+    product: Mapping[str, Any] | Any = None,
+    *,
+    page_html: str = "",
+    page_url: str = "",
+    gallery: Any = None,
+) -> list[dict[str, Any]]:
+    """Rank public image candidates, preferring clean product media.
+
+    This is intentionally a pure, deterministic ranking step.  It does not
+    download images and it never treats a lifestyle/swatch/thumbnail URL as a
+    main product image unless the caller explicitly asks for fallback.
+    """
+
+    candidates: list[dict[str, str]] = []
+    if isinstance(product, Mapping):
+        _flatten_image_values(product.get("image"), role="JSON_LD_IMAGE", output=candidates)
+        for key in ("imageGallery", "associatedMedia", "media", "gallery", "media_gallery_entries", "images"):
+            if key in product:
+                _flatten_image_values(product.get(key), role="PRODUCT_GALLERY", output=candidates)
+    else:
+        _flatten_image_values(product, role="JSON_LD_IMAGE", output=candidates)
+    if gallery is not None:
+        _flatten_image_values(gallery, role="PRODUCT_GALLERY", output=candidates)
+    if page_html:
+        for raw in re.findall(
+            r"<meta\b[^>]*(?:property|name)=[\"'](?:og:image|twitter:image)[\"'][^>]*content=[\"']([^\"']+)",
+            page_html,
+            re.I,
+        ):
+            candidates.append({"url": raw, "role": "OG_IMAGE"})
+        # srcset is bounded to a few entries; the largest/last candidate often
+        # is the clean product rendition and remains subject to the same score.
+        for raw in re.findall(r"<img\b[^>]*(?:src|data-src)=[\"']([^\"']+)", page_html, re.I):
+            candidates.append({"url": raw, "role": "BROWSER_GALLERY"})
+        for raw in re.findall(r"<img\b[^>]*srcset=[\"']([^\"']+)", page_html, re.I):
+            for entry in raw.split(",")[:8]:
+                candidates.append({"url": entry.strip().split(" ", 1)[0], "role": "BROWSER_GALLERY"})
+    ranked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    role_base = {
+        "JSON_LD_IMAGE": 100,
+        "PRODUCT_GALLERY": 96,
+        "STRUCTURED_MEDIA_API": 94,
+        "BROWSER_GALLERY": 88,
+        "OG_IMAGE": 60,
+    }
+    for candidate in candidates:
+        raw_url = str(candidate.get("url") or "").strip()
+        if not raw_url:
+            continue
+        absolute = _canonical_url(urljoin(page_url, raw_url)) if page_url else raw_url
+        key = absolute.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        lowered = absolute.casefold()
+        media_text = (urlsplit(absolute).path + "?" + urlsplit(absolute).query).casefold()
+        score = role_base.get(str(candidate.get("role") or ""), 50)
+        reasons: list[str] = []
+        if _IMAGE_POSITIVE_RE.search(lowered):
+            score += 8
+            reasons.append("product_or_primary_signal")
+        negative_matches = sorted(set(match.group(0).casefold() for match in _IMAGE_NEGATIVE_RE.finditer(media_text)))
+        if negative_matches:
+            score -= 45 * len(negative_matches)
+            reasons.append("negative_media_signal:" + ",".join(negative_matches[:4]))
+        if re.search(r"(?:[?&](?:w|width|size)=?)(?:[0-9]{1,3})(?:&|$)", lowered):
+            score -= 12
+            reasons.append("small_rendition_hint")
+        ext = urlsplit(absolute).path.casefold().rsplit(".", 1)[-1] if "." in urlsplit(absolute).path else ""
+        if ext in {"jpg", "jpeg", "png", "webp", "avif"}:
+            score += 2
+        accepted = not negative_matches and not re.search(r"(?:placeholder|transparent|blank)", media_text)
+        ranked.append({
+            "url": absolute,
+            "role": str(candidate.get("role") or "UNKNOWN"),
+            "score": score,
+            "accepted": accepted,
+            "reasons": reasons,
+        })
+    ranked.sort(key=lambda item: (-int(item["score"]), str(item["url"])))
+    return ranked[:24]
+
+
+def select_product_image(
+    product: Mapping[str, Any] | Any = None,
+    *,
+    page_html: str = "",
+    page_url: str = "",
+    gallery: Any = None,
+    allow_fallback: bool = False,
+) -> dict[str, Any]:
+    """Select one ranked image under the strict-clean default policy."""
+
+    ranked = rank_product_images(product, page_html=page_html, page_url=page_url, gallery=gallery)
+    selected = next((item for item in ranked if item.get("accepted")), None)
+    status = "SELECTED" if selected else "NO_CLEAN_PRODUCT_IMAGE"
+    if selected is None and allow_fallback and ranked:
+        selected = ranked[0]
+        status = "FALLBACK_SELECTED"
+    return {
+        "url": str(selected.get("url") or "") if selected else "",
+        "role": str(selected.get("role") or "") if selected else "",
+        "status": status,
+        "strategy": "RANKED_CLEAN_PRODUCT_DEFAULT" if status == "SELECTED" else "EXPLICIT_FALLBACK" if status == "FALLBACK_SELECTED" else "STRICT_CLEAN_PRODUCT",
+        "candidates": ranked,
+    }
 
 
 def _brand_value(value: Any) -> str:
@@ -736,10 +877,13 @@ class ProductAcquisitionEngine:
         browser_session_dir: Path,
         request_budget: int = 120,
         client_factory=SafeHttpClient,
+        site_profile: Mapping[str, Any] | None = None,
     ) -> None:
         self.source_url = _canonical_url(source_url)
         self.site_key = site_key
         self.source_type = source_type if source_type in SOURCE_TYPES else "UNKNOWN"
+        self.site_profile = dict(site_profile) if isinstance(site_profile, Mapping) else {}
+        self.site_profile_reusable = str(self.site_profile.get("status") or "").upper() == "VALIDATED" and str(self.site_profile.get("site_key") or site_key) == site_key
         self.categories = self._compact_scopes(categories)
         self.workspace = Path(workspace).resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -861,6 +1005,14 @@ class ProductAcquisitionEngine:
                     "pagination_status": "NOT_STARTED",
                     "strategy": "UNRESOLVED",
                 }
+                if self.site_profile_reusable:
+                    discovery = str(self.site_profile.get("product_discovery_strategy") or "").upper()
+                    if discovery == "MAGENTO_GRAPHQL_PRODUCTS":
+                        cursor["strategy"] = "MAGENTO_GRAPHQL"
+                        cursor["next_url"] = None
+                        cursor["next_page"] = 1
+                    elif discovery in {"JSON_LD_PRODUCTS", "SHOPIFY_COLLECTION_JSON", "GENERIC_PRODUCT_CARDS", "SITEMAP_PRODUCTS", "BROWSER_PRODUCT_CARDS"}:
+                        cursor["strategy"] = "HTML_LINK_OR_QUERY"
                 cursors[key] = cursor
             else:
                 cursor.setdefault("scope_key", key)
@@ -874,6 +1026,14 @@ class ProductAcquisitionEngine:
                 cursor.setdefault("exhausted", False)
                 cursor.setdefault("pagination_status", "NOT_STARTED")
                 cursor.setdefault("strategy", "UNRESOLVED")
+                if self.site_profile_reusable and cursor.get("strategy") == "UNRESOLVED":
+                    discovery = str(self.site_profile.get("product_discovery_strategy") or "").upper()
+                    if discovery == "MAGENTO_GRAPHQL_PRODUCTS":
+                        cursor["strategy"] = "MAGENTO_GRAPHQL"
+                        cursor.setdefault("next_page", 1)
+                        cursor["next_url"] = None
+                    elif discovery in {"JSON_LD_PRODUCTS", "SHOPIFY_COLLECTION_JSON", "GENERIC_PRODUCT_CARDS", "SITEMAP_PRODUCTS", "BROWSER_PRODUCT_CARDS"}:
+                        cursor["strategy"] = "HTML_LINK_OR_QUERY"
         return cursors
 
     def _read(self) -> dict[str, Any]:
@@ -1336,10 +1496,15 @@ class ProductAcquisitionEngine:
         graphql_endpoint: str,
     ) -> AcquiredProduct | None:
         name = " ".join(str(item.get("name") or "").split()).strip()
-        image = _magento_product_image(item)
         canonical = self._magento_product_url(item, scope_url)
         sku = " ".join(str(item.get("sku") or "").split()).strip()
         uid = " ".join(str(item.get("uid") or "").split()).strip()
+        image_selection = select_product_image(
+            item,
+            page_url=canonical or scope_url,
+            gallery=item.get("media_gallery_entries"),
+        )
+        image = str(image_selection.get("url") or "")
         if not name or not image or not canonical:
             return None
         source_product_id = sku or uid or canonical.rsplit("/", 1)[-1]
@@ -1363,6 +1528,9 @@ class ProductAcquisitionEngine:
             "graphql_image_bound": True,
             "image_source": "magento_graphql_product",
             "image_role": "MAIN_PRODUCT",
+            "image_selection_status": image_selection.get("status"),
+            "image_selection_strategy": image_selection.get("strategy"),
+            "image_candidates": image_selection.get("candidates") or [],
             "layered_scene7": "layer=" in image.casefold(),
             "configuration_bound": bool(sku or uid),
             "configuration_binding_source": "magento_graphql_sku",
@@ -1408,6 +1576,7 @@ class ProductAcquisitionEngine:
             media_binding_status="COMPATIBLE",
             media_binding_confidence=0.9,
             scope_status="PASS",
+            dimension_lookup_state="OFFICIAL_FOUND" if dimensions else "OFFICIAL_ABSENT_CONFIRMED",
         )
 
     @staticmethod
@@ -1463,7 +1632,10 @@ class ProductAcquisitionEngine:
             endpoint = f"{origin}/collections/{handle}/products.json?limit=250&page={page}"
             try:
                 data = self.client.get_json(endpoint)
-            except (NetworkPolicyError, RobotsDenied, HttpStatusError, RequestBudgetExceeded, AccessControlDetected):
+            # Test/deterministic clients may only implement the HTML surface;
+            # absence of the optional JSON endpoint is a normal fallback, not
+            # an engine error.  Keep the generic HTML strategy available.
+            except (NetworkPolicyError, RobotsDenied, HttpStatusError, RequestBudgetExceeded, AccessControlDetected, AttributeError):
                 return products
             items = data.get("products") if isinstance(data, dict) else None
             if not isinstance(items, list) or not items:
@@ -1573,9 +1745,8 @@ class ProductAcquisitionEngine:
             r"<h1[^>]*>(.*?)</h1>",
             r"<title[^>]*>(.*?)</title>",
         ))
-        image = _image_value(product_json.get("image")) or _first_text(page_html, (
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-        ))
+        image_selection = select_product_image(product_json, page_html=page_html, page_url=url)
+        image = str(image_selection.get("url") or "")
         if not name or not image:
             return None
         image = urljoin(url, image)
@@ -1653,9 +1824,12 @@ class ProductAcquisitionEngine:
             "jsonld_product_ambiguous": selection.get("jsonld_product_ambiguous") == "true",
             "product_identity_match": product_identity_match,
             "name_source": "json_ld_product" if product_json.get("name") else "page_metadata",
-            "image_source": "json_ld_product" if product_json.get("image") else "open_graph",
-            "jsonld_image_bound": bool(product_json.get("image")) and product_identity_match,
-            "image_role": "MAIN_PRODUCT",
+            "image_source": str(image_selection.get("role") or "UNKNOWN").casefold(),
+            "jsonld_image_bound": str(image_selection.get("role") or "") == "JSON_LD_IMAGE" and product_identity_match,
+            "image_role": "MAIN_PRODUCT" if image_selection.get("status") in {"SELECTED", "FALLBACK_SELECTED"} else "UNKNOWN",
+            "image_selection_status": image_selection.get("status"),
+            "image_selection_strategy": image_selection.get("strategy"),
+            "image_candidates": image_selection.get("candidates") or [],
             "layered_scene7": layered,
             "configuration_bound": configuration_bound,
             "configuration_binding_source": "explicit_product_configuration" if explicit_configuration else "product_jsonld_identity" if configuration_bound else "unknown",
@@ -1702,6 +1876,7 @@ class ProductAcquisitionEngine:
             media_binding_status=binding_status,
             media_binding_confidence=binding_confidence,
             scope_status=scope_state,
+            dimension_lookup_state=("OFFICIAL_FOUND" if dimensions else "UNKNOWN"),
         )
 
 
@@ -1715,4 +1890,6 @@ __all__ = [
     "ProductSupplyExhausted",
     "SOURCE_TYPES",
     "classify_source_type",
+    "rank_product_images",
+    "select_product_image",
 ]

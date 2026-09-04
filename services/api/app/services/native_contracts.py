@@ -9,6 +9,25 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 CountKind = Literal["EXACT", "ESTIMATED", "UNKNOWN"]
 
+TaxonomyStrategy = Literal[
+    "NAV_TREE", "JSON_LD_COLLECTION", "SITEMAP", "MAGENTO_GRAPHQL",
+    "SHOPIFY_NAV", "GENERIC_CATEGORY_LINKS", "BROWSER_NAV",
+]
+ProductDiscoveryStrategy = Literal[
+    "JSON_LD_PRODUCTS", "SHOPIFY_COLLECTION_JSON", "MAGENTO_GRAPHQL_PRODUCTS",
+    "GENERIC_PRODUCT_CARDS", "SITEMAP_PRODUCTS", "BROWSER_PRODUCT_CARDS",
+]
+PaginationStrategy = Literal[
+    "REL_NEXT", "NEXT_LINK", "PAGE_PARAM", "MAGENTO_CURRENT_PAGE",
+    "SHOPIFY_PAGE", "LOAD_MORE", "BOUNDED_SCROLL", "NO_VERIFIED_CONTINUATION",
+]
+PDPStrategy = Literal["JSON_LD_PRODUCT", "VISIBLE_PDP_TEXT", "STRUCTURED_PUBLIC_API", "BROWSER_PDP"]
+ImageStrategy = Literal["JSON_LD_IMAGE", "OG_IMAGE", "PRODUCT_GALLERY", "STRUCTURED_MEDIA_API", "BROWSER_GALLERY"]
+DimensionStrategy = Literal[
+    "STRUCTURED_DIMENSIONS", "PDP_DIMENSION_TEXT", "SPECIFICATION_PANEL",
+    "PUBLIC_API_DIMENSIONS", "BROWSER_DIMENSION_PANEL",
+]
+
 
 class TaxonomyCategoryContract(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -125,6 +144,8 @@ class TaxonomyReceipt(BaseModel):
     evidence: dict[str, object] = Field(default_factory=dict)
     blocker: dict[str, str] | None = None
     brain: dict[str, object] = Field(default_factory=dict)
+    site_profile: dict[str, object] | None = None
+    agent_trace: dict[str, object] = Field(default_factory=dict)
     profile_version: str = "native-unverified"
     captured_at: datetime
 
@@ -137,6 +158,8 @@ class AgentToolCall(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     arguments: dict[str, object] = Field(default_factory=dict)
     result_status: str = "OK"
+    error_code: str | None = None
+    result_summary: dict[str, object] | None = None
 
 
 class BrainAgentReceipt(BaseModel):
@@ -146,7 +169,48 @@ class BrainAgentReceipt(BaseModel):
 
     status: str = "AGENT_READY"
     stopped_reason: str = "FINISH"
+    stop_code: str = ""
     turns: int = 0
     tool_calls: list[AgentToolCall] = Field(default_factory=list)
     provider_posts: int = 0
+    agent_run_id: str = ""
+    task: str = ""
+    selected_strategies: dict[str, str] = Field(default_factory=dict)
+
+
+class SiteProfileContract(BaseModel):
+    """Safe, durable site intelligence profile (schema v1).
+
+    This model is separate from the SQLAlchemy ``SiteProfile`` row: the row
+    stores this JSON contract while this model validates the boundary.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    schema_version: Literal["website-site-profile.v1"] = "website-site-profile.v1"
+    site_key: str = Field(min_length=1, max_length=255)
+    source_url: str = Field(default="", max_length=2000)
+    source_type: str = Field(default="UNKNOWN", min_length=1, max_length=64)
+    platform: str = Field(default="UNKNOWN", min_length=1, max_length=64)
+    taxonomy_strategy: TaxonomyStrategy
+    product_discovery_strategy: ProductDiscoveryStrategy
+    pagination_strategy: PaginationStrategy
+    pdp_strategy: PDPStrategy
+    image_strategy: ImageStrategy
+    dimension_strategy: DimensionStrategy
+    public_url_patterns: list[str] = Field(default_factory=list, max_length=16)
+    safe_public_hints: list[str] = Field(default_factory=list, max_length=32)
+    strategy_parameters: dict[str, object] = Field(default_factory=dict)
+    status: Literal["DRAFT", "VALIDATED", "STALE", "BLOCKED"] = "DRAFT"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence: dict[str, object] = Field(default_factory=dict)
+    created_at: datetime
+    validated_at: datetime | None = None
+    last_success_at: datetime | None = None
+    last_failure_at: datetime | None = None
+    profile_version: str = Field(min_length=1, max_length=128)
+
+
+# Versioned alias used by the integration surface.
+SiteProfileV1 = SiteProfileContract
 

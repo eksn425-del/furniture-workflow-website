@@ -35,6 +35,7 @@ from app.models import (
     SiteCategory,
     SiteCategorySnapshot,
     SiteEntryURL,
+    SiteProfile,
     SiteRegistryRecord,
     SiteTaxonomySnapshot,
     utc_now,
@@ -306,6 +307,15 @@ class ProductionRuntimeService:
             session.add(browser_session)
             session.flush()
         site = session.get(SiteRegistryRecord, job.site_key)
+        site_profile: dict[str, Any] | None = None
+        profile_row = session.get(SiteProfile, job.site_key)
+        if profile_row is not None and profile_row.profile_json:
+            try:
+                parsed_profile = json.loads(profile_row.profile_json)
+                if isinstance(parsed_profile, dict):
+                    site_profile = parsed_profile
+            except (TypeError, ValueError, json.JSONDecodeError):
+                site_profile = None
         contract = {
             "schema_version": "job-contract.v3",
             "job_id": job.job_id,
@@ -328,6 +338,7 @@ class ProductionRuntimeService:
             "category_quotas": policy.get("category_quotas") or {},
             "allow_shortfall_delivery": bool(policy.get("allow_shortfall_delivery", False)),
             "source_type": site.source_kind if site else "UNKNOWN",
+            "site_profile": site_profile,
             "provider": job.provider,
             "authorization": {
                 "approve_paid_generation": job.provider.upper() != "OFF" and job.provider_safety == "PRODUCTION_READY",

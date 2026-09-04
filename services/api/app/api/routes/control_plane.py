@@ -47,6 +47,8 @@ from app.schemas import CompanyTestSiteRequest, ControlJobApproval, ControlJobCr
 from app.services.brain_provider import BrainError, BrainNotConfigured
 from app.services.native_contracts import BrainProductDecision
 from app.services.runtime_diagnostics import collect_runtime_diagnostics
+from app.services.strategy_catalog import strategy_catalog_payload
+from app.services.site_profile import validate_site_profile
 from packages.workflow_core.candidate_pool import CandidatePoolError, CandidatePoolStore
 from packages.workflow_core.statuses import ItemState
 
@@ -110,6 +112,13 @@ def _candidate_pool_summary(path: str) -> dict:
 
 
 router = APIRouter(prefix="/control", tags=["control-plane"])
+
+
+@router.get("/strategy-catalog")
+def get_strategy_catalog() -> dict[str, object]:
+    """Return the reviewed, data-only Domain Agent strategy catalog."""
+
+    return {"schema_version": "website-strategy-catalog.v1", "strategies": strategy_catalog_payload()}
 
 
 def _now_iso() -> str:
@@ -334,6 +343,34 @@ def _job_dict(job: ProductionJob) -> dict:
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
+
+
+def _default_provider_call_limit(job: ProductionJob) -> int:
+    """Derive the hard Provider slot default from the approved Exact-N target.
+
+    There is intentionally no large sentinel (such as 5000): an omitted
+    approval limit must reserve exactly the requested production slots.
+    """
+
+    try:
+        base = int(job.target_value or job.requested_count or 1)
+    except (TypeError, ValueError):
+        base = 1
+    base = max(1, base)
+    if str(job.target_mode or "").upper() == "ALL":
+        # ALL has no finite Exact-N value at approval time; one slot is the
+        # conservative default and the operator can explicitly raise it.
+        return 1
+    if str(job.category_allocation or "").upper() == "PER_CATEGORY":
+        try:
+            policy = _policy(job)
+            category_ids = policy.get("category_ids") if isinstance(policy, dict) else []
+            count = len(category_ids) if isinstance(category_ids, list) else 0
+        except Exception:
+            count = 0
+        if count:
+            base *= count
+    return max(1, base)
 
 
 def _category_dict(category: SiteCategory) -> dict:
@@ -896,8 +933,10 @@ def approve_job(job_id: str, payload: ControlJobApproval, request: Request) -> d
             provider = job.provider.casefold()
             call_limit = payload.approved_provider_call_limit
             if call_limit is None:
-                # 未显式设限时按不设上限处理（取 schema 允许的最大值）。
-                call_limit = 5000
+                # V3: omitted approval means the Exact-N target, not an
+                # unbounded sentinel.  The operator can still enter a larger
+                # explicit limit when the workflow contract requires it.
+                call_limit = _default_provider_call_limit(job)
             if call_limit <= 0:
                 raise HTTPException(status_code=400, detail="Provider 非 OFF 时必须审批大于 0 的硬调用次数上限（approved_provider_call_limit）")
             credential_configured = bool(os.getenv("LUX3D_API_KEY", "").strip())
@@ -1373,10 +1412,24 @@ def get_control_site(site_key: str, request: Request) -> dict:
         summary_rows = _taxonomy_summary_rows(categories)
         jobs = list(session.scalars(select(ProductionJob).where(ProductionJob.site_key == site_key).order_by(ProductionJob.updated_at.desc())))
         profile = session.get(SiteProfile, site_key)
+        profile_payload = None
+        if profile and profile.profile_json:
+            try:
+                raw_profile = json.loads(profile.profile_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw_profile = None
+            if isinstance(raw_profile, dict):
+                try:
+                    # Never echo a malformed/legacy payload that could carry
+                    # browser credentials; the dedicated profile route gives
+                    # an explicit INVALID status for operator diagnosis.
+                    profile_payload = validate_site_profile(raw_profile, allow_draft=True).model_dump(mode="json")
+                except (TypeError, ValueError):
+                    profile_payload = {"schema_version": "website-site-profile.v1", "site_key": site_key, "status": "INVALID"}
         return {
             "schema_version": "website-site-detail.v1",
             "site": {"site_key": site.site_key, "domain": site.domain, "display_name": site.display_name, "source_kind": site.source_kind, "source_health": site.source_health, "acquisition_mode": site.acquisition_mode, "status": site.status, "profile_version": site.profile_version, "last_verified_at": site.last_verified_at.isoformat() if site.last_verified_at else None, "created_at": site.created_at.isoformat(), "updated_at": site.updated_at.isoformat()},
-            "profile": json.loads(profile.profile_json) if profile and profile.profile_json else None,
+            "profile": profile_payload,
             "entry_urls": [{"url": item.url, "first_seen_at": item.first_seen_at.isoformat(), "last_seen_at": item.last_seen_at.isoformat(), "last_status": item.last_status, "last_taxonomy_snapshot_id": item.last_taxonomy_snapshot_id} for item in entries],
             "categories": [_category_dict(item) for item in categories],
             "taxonomy_state": taxonomy["taxonomy_state"],
@@ -1389,6 +1442,45 @@ def get_control_site(site_key: str, request: Request) -> dict:
             "snapshots": [{"snapshot_id": item.snapshot_id, "source_url": item.source_url, "status": item.status, "captured_at": item.captured_at.isoformat(), "evidence": json.loads(item.evidence_json) if item.evidence_json else {}} for item in snapshots],
             "scans": [{"scan_id": item.scan_id, "source_url": item.source_url, "status": item.status, "live": item.live, "taxonomy_level": item.taxonomy_level, "brain_status": item.brain_status, "provider_posts": item.provider_posts, "receipt_path": item.receipt_path, "error_code": item.error_code, "error_message": item.error_message, "started_at": item.started_at.isoformat(), "finished_at": item.finished_at.isoformat() if item.finished_at else None} for item in scans],
             "jobs": [_job_dict(item) for item in jobs],
+        }
+    finally:
+        session.close()
+
+
+@router.get("/sites/{site_key}/profile")
+def get_site_profile(site_key: str, request: Request) -> dict:
+    """Return the safe SiteProfile v1 boundary and validation status."""
+
+    session = _session(request)
+    try:
+        if session.get(SiteRegistryRecord, site_key) is None:
+            raise HTTPException(status_code=404, detail="site not found")
+        row = session.get(SiteProfile, site_key)
+        if row is None:
+            return {"schema_version": "website-site-profile-response.v1", "site_key": site_key, "status": "MISSING", "profile": None}
+        try:
+            payload = json.loads(row.profile_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        try:
+            validated = validate_site_profile(payload, allow_draft=True)
+            profile = validated.model_dump(mode="json")
+            validation_status = "VALID"
+        except (TypeError, ValueError):
+            # Do not echo malformed JSON: legacy rows may contain session or
+            # credential fields and this endpoint is a public control-plane
+            # read model.  Keep only a safe diagnostic envelope.
+            profile = {"schema_version": "website-site-profile.v1", "site_key": site_key, "status": "INVALID"}
+            validation_status = "INVALID"
+        return {
+            "schema_version": "website-site-profile-response.v1",
+            "site_key": site_key,
+            "status": str(profile.get("status") or row.status or "DRAFT"),
+            "validation_status": validation_status,
+            "rules_version": row.rules_version,
+            "profile": profile,
         }
     finally:
         session.close()

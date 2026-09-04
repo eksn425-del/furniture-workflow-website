@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ from app.models import (
     SiteTaxonomySnapshot,
     utc_now,
 )
+from app.services.site_profile import build_site_profile, validate_site_profile
 
 
 class SiteScanRuntimeService:
@@ -43,6 +45,7 @@ class SiteScanRuntimeService:
 
     def start(self, *, site_key: str, source_url: str, job_id: str | None, live: bool) -> dict[str, Any]:
         session = self.database.session_factory()
+        existing_profile_payload: dict[str, Any] | None = None
         try:
             scan_id = f"scan_{uuid4().hex}"
             browser = BrowserSession(
@@ -208,11 +211,26 @@ class SiteScanRuntimeService:
             scan.resume_count += 1
             source_url, site_key, live = scan.source_url, scan.site_key, scan.live
             browser = session.get(BrowserSession, scan.browser_session_id) if scan.browser_session_id else None
+            profile_row = session.get(SiteProfile, site_key)
+            if profile_row is not None and profile_row.profile_json:
+                try:
+                    raw_profile = json.loads(profile_row.profile_json)
+                    if isinstance(raw_profile, dict):
+                        existing_profile_payload = raw_profile
+                except (TypeError, ValueError):
+                    existing_profile_payload = None
             session.commit()
         finally:
             session.close()
         output_dir = self.output_root / "_control" / "site_analysis" / site_key / scan_id
-        receipt = self.analyzer.analyze(source_url, live=live, output_dir=output_dir)
+        try:
+            analyze_parameters = inspect.signature(self.analyzer.analyze).parameters
+        except (TypeError, ValueError):
+            analyze_parameters = {}
+        if "profile" in analyze_parameters:
+            receipt = self.analyzer.analyze(source_url, live=live, output_dir=output_dir, profile=existing_profile_payload)
+        else:
+            receipt = self.analyzer.analyze(source_url, live=live, output_dir=output_dir)
         blocker = receipt.get("blocker") if isinstance(receipt.get("blocker"), dict) else {}
         blocker_code = str(blocker.get("code") or "")
         if self._needs_browser_enrichment(receipt) and browser is not None:
@@ -353,15 +371,42 @@ class SiteScanRuntimeService:
             site.acquisition_mode = "SCOPE_FIRST" if site.source_kind == "MARKETPLACE" else "CATEGORY_FIRST"
             site.profile_version = str(receipt.get("profile_version") or "native-unverified")
             site.last_verified_at = utc_now() if receipt.get("verified") else site.last_verified_at
-            profile_payload = {"source_url": scan.source_url, "site_key": site.site_key, "source_type": site.source_kind, "signals": receipt.get("evidence") or {}, "last_taxonomy_snapshot_id": snapshot_id}
+            raw_profile = receipt.get("site_profile") if isinstance(receipt.get("site_profile"), dict) else None
+            if raw_profile is not None:
+                try:
+                    profile_contract = validate_site_profile(raw_profile, allow_draft=True)
+                    profile_payload = profile_contract.model_dump(mode="json")
+                except (TypeError, ValueError):
+                    profile_payload = None
+            else:
+                profile_payload = None
+            if profile_payload is None:
+                # Keep the SQL row useful even for older/custom analyzers that
+                # return no v1 profile.  This fallback is DRAFT and therefore
+                # never considered reusable for an authenticated production run.
+                try:
+                    profile_payload = build_site_profile(
+                        site_key=site.site_key,
+                        source_url=scan.source_url,
+                        source_type=site.source_kind,
+                        platform=str((receipt.get("evidence") or {}).get("l0", {}).get("platform") if isinstance((receipt.get("evidence") or {}).get("l0"), dict) else "UNKNOWN"),
+                        evidence={"signals": receipt.get("evidence") or {}, "last_taxonomy_snapshot_id": snapshot_id},
+                        status="VALIDATED" if receipt.get("verified") else "DRAFT",
+                        confidence=1.0 if receipt.get("verified") else 0.0,
+                    )
+                except (TypeError, ValueError):
+                    profile_payload = {"schema_version": "website-site-profile.v1", "site_key": site.site_key, "source_url": scan.source_url, "source_type": site.source_kind, "status": "DRAFT", "last_taxonomy_snapshot_id": snapshot_id}
+            profile_payload["last_taxonomy_snapshot_id"] = snapshot_id
+            profile_payload["source_url"] = scan.source_url
+            profile_payload["site_key"] = site.site_key
             profile = session.get(SiteProfile, site.site_key)
             if profile is None:
-                profile = SiteProfile(site_key=site.site_key, source_url=scan.source_url, profile_json=json.dumps(profile_payload, ensure_ascii=False), rules_version="website-site-profile.v2", status="ready" if receipt.get("verified") else "review")
+                profile = SiteProfile(site_key=site.site_key, source_url=scan.source_url, profile_json=json.dumps(profile_payload, ensure_ascii=False), rules_version="website-site-profile.v1", status=str(profile_payload.get("status") or "DRAFT"))
                 session.add(profile)
             else:
                 profile.profile_json = json.dumps(profile_payload, ensure_ascii=False)
-                profile.rules_version = "website-site-profile.v2"
-                profile.status = "ready" if receipt.get("verified") else "review"
+                profile.rules_version = "website-site-profile.v1"
+                profile.status = str(profile_payload.get("status") or "DRAFT")
             brain = receipt.get("brain") if isinstance(receipt.get("brain"), dict) else {}
             scan.status = str(receipt.get("status") or "PARTIAL")
             scan.taxonomy_level = str(receipt.get("taxonomy_level") or "L0")
@@ -371,7 +416,14 @@ class SiteScanRuntimeService:
             blocker = receipt.get("blocker") if isinstance(receipt.get("blocker"), dict) else {}
             scan.error_code = str(blocker.get("code") or "") or None
             scan.error_message = str(blocker.get("message") or "") or None
-            scan.result_json = json.dumps({"snapshot_id": snapshot_id, "verified": bool(receipt.get("verified")), "category_count": len(categories)}, ensure_ascii=False)
+            scan.result_json = json.dumps({
+                "snapshot_id": snapshot_id,
+                "verified": bool(receipt.get("verified")),
+                "category_count": len(categories),
+                "site_profile_version": profile_payload.get("profile_version"),
+                "site_profile_status": profile_payload.get("status"),
+                "site_profile_reused": bool((receipt.get("brain") or {}).get("site_profile_reused")) if isinstance(receipt.get("brain"), dict) else False,
+            }, ensure_ascii=False)
             scan.finished_at = utc_now()
             scan.heartbeat_at = utc_now()
             browser = session.get(BrowserSession, scan.browser_session_id) if scan.browser_session_id else None
