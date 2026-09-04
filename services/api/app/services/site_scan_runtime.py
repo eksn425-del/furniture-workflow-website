@@ -6,6 +6,7 @@ import json
 import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -97,6 +98,52 @@ class SiteScanRuntimeService:
             session.close()
         for scan_id in ids:
             self._schedule(scan_id)
+        self._auto_resume_partial()
+
+    # PARTIAL 结果超过该阈值后自动用同一浏览器会话续扫一次（最多 1 次）。
+    AUTO_RESUME_PARTIAL_AFTER_SECONDS = 60.0
+
+    def _auto_resume_partial(self) -> None:
+        """PARTIAL 扫描自动续扫：减少 sixpenny / mackenzie-childs 等需要
+        手动点击"恢复站点浏览器会话"的场景。仅对 resume_count<=1（即尚未
+        自动续扫过）的 PARTIAL 结果触发一次。"""
+        now = datetime.now(UTC)
+        session = self.database.session_factory()
+        try:
+            candidates = list(session.scalars(select(SiteScanRun).where(
+                SiteScanRun.status == "PARTIAL",
+                SiteScanRun.resume_count <= 1,
+                SiteScanRun.finished_at.isnot(None),
+            )))
+        finally:
+            session.close()
+        for scan in candidates:
+            if scan.finished_at is None:
+                continue
+            try:
+                age = (now - scan.finished_at).total_seconds()
+            except TypeError:
+                continue
+            if age < self.AUTO_RESUME_PARTIAL_AFTER_SECONDS:
+                continue
+            session = self.database.session_factory()
+            try:
+                row = session.get(SiteScanRun, scan.scan_id)
+                if row is None or row.status != "PARTIAL" or row.resume_count > 1:
+                    continue
+                row.status = "QUEUED"
+                row.error_code = row.error_message = None
+                row.finished_at = None
+                row.heartbeat_at = utc_now()
+                if row.job_id:
+                    job = session.get(ProductionJob, row.job_id)
+                    if job:
+                        job.last_reason = "站点扫描为 PARTIAL，已自动用同一浏览器会话续扫一次"
+                        self._job_event(session, job, "SITE_SCAN_AUTO_RESUME", "QUEUED", job.last_reason, {"scan_id": row.scan_id, "reason_code": "PARTIAL"})
+                session.commit()
+            finally:
+                session.close()
+            self._schedule(scan.scan_id)
 
     def _execute_guarded(self, scan_id: str) -> None:
         try:

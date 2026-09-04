@@ -21,7 +21,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.models import (
     BrowserSession,
@@ -54,6 +54,10 @@ TERMINAL_RUNTIME_EVENTS = {
 RUNTIME_STARTUP_GRACE_SECONDS = 8.0
 RUNTIME_EVENT_FLUSH_SECONDS = 2.0
 MAX_EMPTY_LAUNCH_RETRIES = 1
+# worker 中途崩溃（已产出事件/checkpoint，但无终态事件）时，允许按 checkpoint
+# 自动续跑一次；终态事件（HUMAN_REQUIRED/TARGET_SHORTAGE/JOB_BLOCKED/JOB_FAILED）
+# 视为合法暂停态，不触发续跑。
+MAX_CRASH_RESUME_RETRIES = 1
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -78,46 +82,65 @@ def _expected_executable(command_json: str | None) -> str | None:
     return command[0]
 
 
+def _tasklist_alive(pid: int, expected_executable: str | None) -> bool:
+    """Windows tasklist-based liveness check.
+
+    os.kill(pid, 0) is NOT a usable liveness probe on Windows: signal 0 is not
+    a supported Win32 signal and raises OSError(22, '参数错误') even for live
+    processes, so it must never gate the result here. tasklist is the reliable
+    check. Reconcile previously misjudged every live worker as dead because of
+    this, marking active runs FAILED with
+    "exited before a terminal workflow event".
+    """
+    expected_name = Path(expected_executable).name.casefold() if expected_executable else None
+    # API 进程通常以无控制台方式运行（DETACHED / CREATE_NO_WINDOW）。无控制台
+    # 的父进程起子进程时会新建控制台窗口，导致 tasklist 每次被 reconcile
+    # 调用都弹出一个命令行窗口。所有探测类子进程必须显式 CREATE_NO_WINDOW。
+    probe_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+    for attempt in range(4):
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2,
+                check=False,
+                creationflags=probe_flags,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        rows = list(csv.reader(line for line in result.stdout.splitlines() if line.strip()))
+        if rows and rows[0] and not rows[0][0].startswith("INFO:"):
+            if expected_name is None:
+                return True
+            return Path(rows[0][0]).name.casefold() == expected_name
+        # tasklist can briefly miss a just-created process. Retry only for
+        # that bounded window; a process that has really exited must not
+        # remain RUNNING forever.
+        if attempt < 3:
+            time.sleep(0.05)
+    return False
+
+
 def _process_alive(pid: int | None, expected_executable: str | None = None) -> bool:
     if not pid or pid <= 0:
         return False
+    if os.name == "nt":
+        return _tasklist_alive(pid, expected_executable)
+
     try:
         os.kill(pid, 0)
     except (OSError, ProcessLookupError):
         return False
     if not expected_executable:
         return True
-
-    expected_name = Path(expected_executable).name.casefold()
-    if os.name == "nt":
-        for attempt in range(4):
-            try:
-                result = subprocess.run(
-                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return False
-            rows = list(csv.reader(line for line in result.stdout.splitlines() if line.strip()))
-            if rows and rows[0] and not rows[0][0].startswith("INFO:"):
-                return Path(rows[0][0]).name.casefold() == expected_name
-            # tasklist can briefly miss a just-created process. Retry only for
-            # that bounded window; a process that has really exited must not
-            # remain RUNNING forever.
-            if attempt < 3:
-                time.sleep(0.05)
-        return False
-
     proc_cmdline = Path(f"/proc/{pid}/cmdline")
     if proc_cmdline.is_file():
         try:
             first_argument = proc_cmdline.read_bytes().split(b"\0", 1)[0].decode(errors="replace")
-            return Path(first_argument).name.casefold() == expected_name
+            return Path(first_argument).name.casefold() == Path(expected_executable).name.casefold()
         except OSError:
             return False
     return True
@@ -136,6 +159,7 @@ def _terminate_process(pid: int | None, expected_executable: str | None = None) 
                 errors="replace",
                 timeout=5,
                 check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
             )
         except (OSError, subprocess.TimeoutExpired):
             return
@@ -155,13 +179,24 @@ def _payload(value: str | None) -> dict[str, Any]:
 
 
 class ProductionRuntimeService:
-    MAX_ACTIVE_PRODUCTION_JOBS = 1
+    # 同一时刻最多并行生产多少个 Job。试点期保守为 1；现在支持通过
+    # MAX_ACTIVE_PRODUCTION_JOBS 环境变量提升（默认 3），每个 worker 会占用
+    # 一个 L2 浏览器会话（约 300-500MB），并发上调前请确保内存充足。
+    MAX_ACTIVE_PRODUCTION_JOBS = max(
+        1, int(os.getenv("MAX_ACTIVE_PRODUCTION_JOBS", "3").strip() or "3")
+    )
 
     def __init__(self, database, output_root: Path, legacy_runtime: object | None = None) -> None:
         self.database = database
         self.output_root = Path(output_root).resolve()
         self.native_entrypoint = Path(__file__).resolve().parents[4] / "workers" / "native_runtime.py"
         self.python_executable = Path(sys.executable).resolve()
+        # reconcile_all 的最小执行间隔：控制平面每 5 秒被前端轮询，若每次都全量
+        # 读取所有 worker 的 runtime_events.jsonl 并 ingest，磁盘 IO 会被打满。
+        # 距上次 reconcile 不足该秒数时跳过 ingest，但始终执行 _promote_next，
+        # 以保证队列能及时填充到并发空槽。
+        self._reconcile_interval = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "2").strip() or "2")
+        self._last_reconcile_at = 0.0
 
     def _workspace(self, job: ProductionJob) -> Path:
         path = self.output_root / "web_productions" / job.site_key / job.job_id
@@ -342,8 +377,13 @@ class ProductionRuntimeService:
     def _latest_run(self, session, job_id: str) -> ProductionRun | None:
         return session.scalar(select(ProductionRun).where(ProductionRun.job_id == job_id).order_by(ProductionRun.created_at.desc()))
 
-    def _active_run(self, session) -> ProductionRun | None:
-        return session.scalar(select(ProductionRun).where(ProductionRun.status == "RUNNING").order_by(ProductionRun.created_at.asc()))
+    def _active_runs(self, session) -> list[ProductionRun]:
+        """当前 RUNNING 的生产运行，按创建时间升序，最多 MAX_ACTIVE_PRODUCTION_JOBS 个。
+
+        并发提升后同时可有多个 RUNNING，因此不再只返回单个，而是返回全部当前
+        RUNNING 运行（调用方据此判断是否还有空槽可继续 promote）。
+        """
+        return list(session.scalars(select(ProductionRun).where(ProductionRun.status == "RUNNING").order_by(ProductionRun.created_at.asc())))
 
     @staticmethod
     def _provider_ready(session, job: ProductionJob) -> bool:
@@ -568,6 +608,21 @@ class ProductionRuntimeService:
             return False
         return isinstance(command, list) and "--resume" in command
 
+    @staticmethod
+    def _has_checkpoint(run: ProductionRun) -> bool:
+        """True if the worker left a resumable checkpoint (candidate pool or acquisition)."""
+        if not run.workspace:
+            return False
+        workspace = Path(run.workspace)
+        for name in ("candidate_pool.json", "acquisition_checkpoint.json"):
+            path = workspace / name
+            try:
+                if path.is_file() and path.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+        return False
+
     def _sync_run_from_events(self, session, run: ProductionRun) -> None:
         event_query = select(RuntimeEvent).where(RuntimeEvent.job_id == run.job_id)
         launch_time = run.claimed_at or run.started_at
@@ -593,6 +648,18 @@ class ProductionRuntimeService:
                     pass
 
     def reconcile_run(self, run_id: str) -> dict[str, Any] | None:
+        # 并发提升后多个 API 轮询/多个 worker 汇入可能同时写 SQLite；WAL +
+        # busy_timeout 已让写入等待，这里再对 "database is locked" 这类
+        # OperationalError 做一次短暂重试，避免瞬时 500。
+        try:
+            return self._reconcile_run_once(run_id)
+        except OperationalError as exc:
+            if "locked" not in str(exc).casefold():
+                raise
+            time.sleep(0.5)
+            return self._reconcile_run_once(run_id)
+
+    def _reconcile_run_once(self, run_id: str) -> dict[str, Any] | None:
         session = self.database.session_factory()
         try:
             run = session.get(ProductionRun, run_id)
@@ -657,6 +724,22 @@ class ProductionRuntimeService:
                             run,
                             resume=self._command_is_resume(run.command_json),
                         )
+                    elif (
+                        self._has_checkpoint(run)
+                        and run.launch_attempts < MAX_CRASH_RESUME_RETRIES + 1
+                    ):
+                        # Worker 中途崩溃：已产出事件/checkpoint 但无终态事件。
+                        # 复用同一账本 + checkpoint 续跑一次，不重头开始、不重复
+                        # Provider 调用；HUMAN_REQUIRED 等终态事件已在上方处理，
+                        # 不会走到这里。
+                        run.error = None
+                        run.exit_code = None
+                        run.finished_at = None
+                        run.progress_note = (
+                            "Worker 异常退出，已自动按 checkpoint 续跑一次；"
+                            "不会重复候选或 Provider 调用"
+                        )
+                        self._launch(session, job, run, resume=True)
                     else:
                         run.status, run.stage, run.exit_code = "FAILED", "RUNTIME", 1
                         run.error = "Website Native Runtime exited before a terminal workflow event"
@@ -669,31 +752,36 @@ class ProductionRuntimeService:
             session.close()
 
     def reconcile_all(self) -> None:
-        session = self.database.session_factory()
-        try:
-            run_ids = [run.run_id for run in session.scalars(select(ProductionRun).where(ProductionRun.status == "RUNNING"))]
-        finally:
-            session.close()
-        for run_id in run_ids:
-            self.reconcile_run(run_id)
+        now = time.monotonic()
+        # ingest 节流：距上次执行不足间隔秒数时，跳过对 worker 文件的重复读取，
+        # 只保留队列提升（保证并发空槽能及时填充）。
+        if now - self._last_reconcile_at >= self._reconcile_interval:
+            self._last_reconcile_at = now
+            session = self.database.session_factory()
+            try:
+                run_ids = [run.run_id for run in session.scalars(select(ProductionRun).where(ProductionRun.status == "RUNNING"))]
+            finally:
+                session.close()
+            for run_id in run_ids:
+                self.reconcile_run(run_id)
         self._promote_next()
 
     def _promote_next(self) -> None:
         session = self.database.session_factory()
         try:
-            if self._active_run(session) is not None:
-                return
-            queued = session.scalar(select(ProductionRun).where(ProductionRun.status == "QUEUED").order_by(ProductionRun.queue_position.asc(), ProductionRun.created_at.asc()))
-            if queued is None:
-                return
-            job = session.get(ProductionJob, queued.job_id)
-            if job is None:
-                queued.status = "FAILED"
-                queued.error = "job missing"
+            # 并发提升：只要还有空槽就持续 promote 队列里的 QUEUED 运行。
+            while len(self._active_runs(session)) < self.MAX_ACTIVE_PRODUCTION_JOBS:
+                queued = session.scalar(select(ProductionRun).where(ProductionRun.status == "QUEUED").order_by(ProductionRun.queue_position.asc(), ProductionRun.created_at.asc()))
+                if queued is None:
+                    break
+                job = session.get(ProductionJob, queued.job_id)
+                if job is None:
+                    queued.status = "FAILED"
+                    queued.error = "job missing"
+                    session.commit()
+                    continue
+                self._launch(session, job, queued, resume=queued.stage == "RESUME")
                 session.commit()
-                return
-            self._launch(session, job, queued, resume=queued.stage == "RESUME")
-            session.commit()
         finally:
             session.close()
 
@@ -726,7 +814,16 @@ class ProductionRuntimeService:
         launch_time = utc_now()
         run.launch_attempts = int(run.launch_attempts or 0) + 1
         try:
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+            if os.name == "nt":
+                # CREATE_NO_WINDOW: 生产 worker 必须在后台静默运行，不弹出 python
+                # 控制台窗口（否则用户误关窗口会直接终止 worker，导致运行时
+                # 无终态事件、被判定为 "exited before a terminal workflow event"）。
+                creationflags = (
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                )
+            else:
+                creationflags = 0
             with log_path.open("a", encoding="utf-8") as log:
                 log.write(
                     f"[{launch_time.isoformat()}] spawning Website Native Runtime "
@@ -796,7 +893,7 @@ class ProductionRuntimeService:
             if not self._provider_ready(session, job):
                 raise ValueError("Provider 非 OFF：尚未收到 Website safety receipt（幂等性与 SUBMISSION_UNKNOWN 防重提），生产保持阻断")
             workspace = self._workspace(job)
-            if self._active_run(session) is not None:
+            if len(self._active_runs(session)) >= self.MAX_ACTIVE_PRODUCTION_JOBS:
                 position = int(session.scalar(select(func.count()).select_from(ProductionRun).where(ProductionRun.status == "QUEUED")) or 0) + 1
                 run = ProductionRun(run_id=f"run_{uuid4().hex}", job_id=job_id, status="QUEUED", stage="QUEUE", progress_note="等待唯一生产槽位", workspace=str(workspace), queue_position=position)
                 session.add(run)
@@ -846,7 +943,7 @@ class ProductionRuntimeService:
             # Count retries per user-requested launch, not across every
             # resume of the durable Job.
             latest.launch_attempts = 0
-            if self._active_run(session) is not None:
+            if len(self._active_runs(session)) >= self.MAX_ACTIVE_PRODUCTION_JOBS:
                 latest.queue_position = int(session.scalar(select(func.count()).select_from(ProductionRun).where(ProductionRun.status == "QUEUED")) or 0)
                 job.status, job.current_stage, job.last_reason = "QUEUED", "RESUME", "已进入持久化恢复队列"
             else:
@@ -868,6 +965,10 @@ class ProductionRuntimeService:
                 return None
             if run.status == "RUNNING" and _process_alive(run.pid, _expected_executable(run.command_json)):
                 if run.events_path and run.contract_path:
+                    _cancel_flags = (
+                        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                        | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                    ) if os.name == "nt" else 0
                     subprocess.run(
                         [str(self.python_executable), str(self.native_entrypoint), "cancel-job", "--contract", str(run.contract_path), "--events", str(run.events_path)],
                         cwd=str(self.native_entrypoint.parents[1]),
@@ -875,6 +976,7 @@ class ProductionRuntimeService:
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        creationflags=_cancel_flags,
                         timeout=5,
                         check=False,
                     )

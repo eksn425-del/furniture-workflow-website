@@ -12,6 +12,20 @@ from typing import Any
 LOCK_SCHEMA_VERSION = "workflow-locks.v1"
 
 
+class QuotaValidationError(ValueError):
+    """Raised when category quotas do not satisfy the Exact-N policy.
+
+    Carries `code="QUOTA_MISMATCH"` so callers (e.g. the production worker)
+    can turn it into a readable JOB_BLOCKED event instead of a raw error.
+    """
+
+    code = "QUOTA_MISMATCH"
+
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
@@ -86,9 +100,15 @@ def make_order_policy_lock(
     if exact_n <= 0:
         raise ValueError("Exact-N must be positive")
     if quota_mode != "NONE" and sum(categories.values()) != exact_n:
-        raise ValueError("category quota sum must equal Exact-N")
+        raise QuotaValidationError(
+            "所选类目配额合计与目标数量不一致，任务无法启动。",
+            details={"quota_sum": sum(categories.values()), "exact_n": exact_n, "categories": categories},
+        )
     if quota_mode == "NONE" and categories:
-        raise ValueError("category quotas must be empty when category_quota_mode is NONE")
+        raise QuotaValidationError(
+            "未启用类目配额时不能携带类目配额。",
+            details={"categories": categories},
+        )
     return OrderPolicyLock(
         source=source,
         categories=dict(categories),
@@ -169,6 +189,7 @@ __all__ = [
     "LOCK_SCHEMA_VERSION",
     "ModelInputLock",
     "OrderPolicyLock",
+    "QuotaValidationError",
     "make_model_input_lock",
     "make_order_policy_lock",
     "provider_idempotency_key",

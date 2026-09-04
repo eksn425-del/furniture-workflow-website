@@ -440,6 +440,7 @@ export interface ControlDeliveryBatch {
 export interface ControlDelivery {
   delivery_id: string;
   job_id?: string;
+  title?: string;
   relative_path: string;
   batch_count: number;
   model_count: number;

@@ -7,7 +7,7 @@ import pytest
 
 from app.services.brain_provider import BrainSettings, WebsiteBrainProvider
 from app.services.native_contracts import TaxonomyCategoryContract
-from app.services.native_site_analysis import NativeSiteAnalyzer
+from app.services.native_site_analysis import NativeSiteAnalyzer, _NavigationParser
 from app.services.product_acquisition import BrowserAccessDenied, BrowserTemporaryFailure, NativeBrowserCollector
 from workers.scrape.http_client import AccessControlDetected, HttpStatusError, RobotsDenied, SafeHttpClient
 
@@ -376,3 +376,127 @@ def test_magento_pwa_uses_authoritative_graphql_category_totals(tmp_path: Path) 
     assert any(item["role"] == "magento_graphql_total_count" for item in by_path["/bedroom/all-beds"]["evidence"])
     assert "/data-request" not in by_path
     assert not any("caitlin-by-the-everygirl" in path for path in by_path)
+
+
+SHOPIFY_NAV_HTML = """<html><body>
+<nav class="site-nav">
+<ul>
+<li class="has-dropdown"><a href="/collections/living-room">Living Room</a>
+  <ul class="dropdown">
+    <li><a href="/collections/sofas">Sofas</a></li>
+    <li><a href="/collections/chairs">Chairs</a></li>
+  </ul>
+</li>
+<li><a href="/collections/dining-room">Dining Room</a></li>
+</ul>
+</nav>
+</body></html>"""
+
+
+def test_nav_parser_builds_tree_and_preserves_flat_anchors() -> None:
+    parser = _NavigationParser()
+    parser.feed(SHOPIFY_NAV_HTML)
+    tree = parser.build_nav_tree()
+    labels = [n["label"] for n in tree]
+    assert "Living Room" in labels
+    living = next(n for n in tree if n["label"] == "Living Room")
+    assert {c["label"] for c in living["children"]} == {"Sofas", "Chairs"}
+    # 扁平 anchors 仍保留（向后兼容）
+    assert any(a["href"].endswith("/collections/sofas") for a in parser.anchors)
+
+
+def test_l0_l1_nav_tree_drives_level2_and_signals(tmp_path: Path) -> None:
+    analyzer = NativeSiteAnalyzer(tmp_path)
+    categories, signals = analyzer._l0_l1("https://example.test/", SHOPIFY_NAV_HTML)
+    sofas = next(c for c in categories if c.path == "/sofas")
+    # 路径 /sofas 只有 1 段（本应一级），但导航说它在 /living-room 下 → 二级
+    assert sofas.level == 2
+    assert sofas.parent_path == "/living-room"
+    living = next(c for c in categories if c.path == "/living-room")
+    assert living.level == 1
+    assert signals["navigation_hierarchy_used"] is True
+    assert signals["navigation_tree"]
+
+
+def test_l0_l1_flat_nav_falls_back_to_path(tmp_path: Path) -> None:
+    analyzer = NativeSiteAnalyzer(tmp_path)
+    html = '<nav><ul><li><a href="/sofas">Sofas</a></li><li><a href="/chairs">Chairs</a></li></ul></nav>'
+    categories, signals = analyzer._l0_l1("https://example.test/", html)
+    assert signals["navigation_tree"] == []
+    sofas = next(c for c in categories if c.path == "/sofas")
+    assert sofas.level == 1  # 无嵌套 → 走路径段数（1 段 = 一级）
+
+
+def test_l0_l1_ignores_footer_nested_nav(tmp_path: Path) -> None:
+    analyzer = NativeSiteAnalyzer(tmp_path)
+    html = ('<footer class="site-footer"><ul><li><a href="/living-room">Living Room</a>'
+            '<ul><li><a href="/sofas">Sofas</a></li></ul></li></ul></footer>')
+    categories, signals = analyzer._l0_l1("https://example.test/", html)
+    assert signals["navigation_tree"] == []
+    # footer 内的 /sofas 不会被导航强制成二级
+    assert not any(c.path == "/sofas" and c.level == 2 for c in categories)
+
+
+def test_nav_parser_deep_nesting_dropped() -> None:
+    parser = _NavigationParser()
+    parser.feed(
+        '<nav><ul><li><a href="/living">Living</a><ul><li><a href="/seating">Seating</a>'
+        '<ul><li><a href="/chairs">Chairs</a></li></ul></li></ul></li></ul></nav>'
+    )
+    tree = parser.build_nav_tree()
+    seen: set[str] = set()
+
+    def walk(nodes: list[dict]) -> None:
+        for n in nodes:
+            seen.add(n["label"])
+            walk(n["children"])
+
+    walk(tree)
+    assert "Chairs" not in seen  # 三级不进树
+
+
+def test_l0_l1_nav_tree_parent_locale_normalized(tmp_path: Path) -> None:
+    analyzer = NativeSiteAnalyzer(tmp_path)
+    html = ('<nav><ul><li><a href="/en/living-room">Living Room</a>'
+            '<ul><li><a href="/en/sofas">Sofas</a></li></ul></li></ul></nav>')
+    categories, _ = analyzer._l0_l1("https://example.test/", html)
+    sofas = next(c for c in categories if c.path == "/sofas")
+    assert sofas.level == 2
+    assert sofas.parent_path == "/living-room"  # /en 前缀被剥离
+
+
+def test_hierarchize_nav_tree_beats_path_level() -> None:
+    cat = TaxonomyCategoryContract(
+        category_id="c1", native_name="Sofas", canonical_name="Sofas",
+        path="/sofas", source_url="https://x.test/sofas", count_value=None, count_kind="UNKNOWN",
+        evidence=[{"role": "navigation"}, {"role": "nav_tree", "level": 2, "parent_path": "/living", "parent_href": None}],
+        confidence=0.7, level=2, parent_path="/living",
+    )
+    out = NativeSiteAnalyzer._hierarchize([cat])
+    c = next(x for x in out if x.path == "/sofas")
+    assert c.level == 2
+    assert c.parent_path == "/living"
+
+
+def test_hierarchize_brain_child_beats_nav_tree() -> None:
+    cat = TaxonomyCategoryContract(
+        category_id="c2", native_name="Sofas", canonical_name="Sofas",
+        path="/sofas", source_url="https://x.test/sofas", count_value=None, count_kind="UNKNOWN",
+        evidence=[{"role": "nav_tree", "level": 2, "parent_path": "/living"}, {"role": "brain_child"}],
+        confidence=0.7, level=2, parent_path="/seating",
+    )
+    out = NativeSiteAnalyzer._hierarchize([cat])
+    c = next(x for x in out if x.path == "/sofas")
+    assert c.parent_path == "/seating"  # 大脑优先于导航树
+
+
+def test_nav_parser_magento_div_submenu_parent_edge() -> None:
+    parser = _NavigationParser()
+    parser.feed(
+        '<nav><ul><li><a href="/living">Living</a><div class="submenu">'
+        '<ul><li><a href="/sofas">Sofas</a></li></ul></div></li></ul></nav>'
+    )
+    tree = parser.build_nav_tree()
+    living = next(n for n in tree if n["label"] == "Living")
+    assert [c["label"] for c in living["children"]] == ["Sofas"]
+

@@ -26,12 +26,15 @@ import base64
 import hashlib
 import json
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Mapping, MutableMapping
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 def img_to_datauri(raw: bytes, mime: str) -> str:
@@ -80,6 +83,38 @@ class Lux3DClient:
         self.interval = float(interval)
         self.max_attempts = int(max_attempts)
         self._http = http
+        # 连接复用 + 幂等 GET（poll/download）的重试：只有 GET 会被自动重试，
+        # POST create 因计费结果未知保持不自动重试，避免重复计费。仅在使用真实
+        # requests 时启用；测试注入的 http 对象直接原样使用。
+        self._session = None
+        if http is requests:
+            retry = Retry(
+                total=3,
+                connect=3,
+                read=2,
+                backoff_factor=1.0,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET"],  # 仅幂等请求自动重试
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            self._session = requests.Session()
+            self._session.mount("http://", adapter)
+            self._session.mount("https://", adapter)
+
+    @staticmethod
+    def _log(message: str) -> None:
+        print(f"[Lux3D] {message}", file=sys.stderr, flush=True)
+
+    def _get(self, url: str, **kwargs: Any) -> Any:
+        target = self._session if self._session is not None else self._http
+        return target.get(url, **kwargs)
+
+    def _post(self, url: str, **kwargs: Any) -> Any:
+        # 复用 session 连接；POST 不在 GET-only Retry 白名单内，故计费敏感请求
+        # 仍不会自动重试（保持“计费结果未知 → 不重试”的安全语义）。
+        target = self._session if self._session is not None else self._http
+        return target.post(url, **kwargs)
 
     def create_task(self, image_path: Path, *, idempotency_key: str | None = None) -> tuple[str | None, str | None]:
         """Returns (task_id, err). err non-empty -> task not safely retryable unless capacity."""
@@ -92,7 +127,7 @@ class Lux3DClient:
             headers = dict(self.headers)
             if idempotency_key:
                 headers["Idempotency-Key"] = idempotency_key
-            response = self._http.post(
+            response = self._post(
                 f"{self.base_url}/lux3d/v1/generate/img-to-3d/task/create",
                 json=payload, headers=headers, timeout=120,
             )
@@ -109,16 +144,22 @@ class Lux3DClient:
         return str(task_id), None
 
     def poll_task(self, task_id: str) -> tuple[dict | None, str | None]:
+        consecutive_errors = 0
         for _ in range(self.max_attempts):
-            time.sleep(self.interval)
+            # 轻度退避：连续网络错误时放大间隔，避免抖动打满尝试次数。
+            sleep_for = self.interval * min(1 + consecutive_errors * 0.5, 3)
+            time.sleep(sleep_for)
             try:
-                response = self._http.get(
+                response = self._get(
                     f"{self.base_url}/lux3d/v1/generate/task/get",
                     params={"taskid": task_id}, headers=self.headers, timeout=60,
                 )
                 body = response.json()
-            except Exception:
+            except Exception as exc:
+                consecutive_errors += 1
+                self._log(f"poll task={task_id} error={exc!r} consecutive={consecutive_errors}")
                 continue
+            consecutive_errors = 0
             data = body.get("d") if isinstance(body, dict) else None
             if isinstance(data, dict):
                 status = data.get("status")
@@ -135,7 +176,7 @@ class Lux3DClient:
                 if self._save(url, out_path):
                     return True
         try:
-            response = self._http.get(
+            response = self._get(
                 f"{self.base_url}/lux3d/v1/generate/task/download",
                 headers=self.headers, params={"taskid": task_id, "format": "glb"}, timeout=600,
             )

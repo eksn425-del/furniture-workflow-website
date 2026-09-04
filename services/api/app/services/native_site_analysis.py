@@ -12,7 +12,13 @@ from typing import Any, Callable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from uuid import uuid4
 
-from app.services.brain_provider import BrainError, BrainNotConfigured, WebsiteBrainProvider
+from app.services.brain_provider import (
+    AgentLoopOptions,
+    AgentToolError,
+    BrainError,
+    BrainNotConfigured,
+    WebsiteBrainProvider,
+)
 from app.services.native_contracts import BrainTaxonomyResponse, TaxonomyCategoryContract, TaxonomyReceipt
 from app.services.product_acquisition import (
     BrowserAccessDenied,
@@ -36,9 +42,12 @@ from workers.scrape.http_client import (
 
 
 COUNT_RE = re.compile(r"(?<![\w])([0-9][0-9,]*)\s*(?:items?|products?|results?|件|个)(?![\w])", re.I)
+# 导航锚文本里的「类目名 + 空格 + 行尾数字」数量格式（如 sixpenny 的 "CHAIRS 33"、
+# "TABLES 38"、"SOFAS 18"）。数字在行尾、无 items/products 后缀，原 COUNT_RE 匹配不到。
+TAIL_COUNT_RE = re.compile(r"(?<![\w])([0-9][0-9,]*)\s*$")
 PRODUCT_RE = re.compile(r"/(?:products?|product-page|p|item|sku)/[^/?#]+", re.I)
 ASSET_RE = re.compile(r"\.(?:css|js|png|jpe?g|gif|svg|webp|ico|pdf|xml|zip)(?:$|[?#])", re.I)
-MAX_COUNT_PROBES = 20
+MAX_COUNT_PROBES = 120
 BROWSER_ESCALATION_HTTP_STATUSES = frozenset({401, 403, 405, 430})
 CATEGORY_WORDS = {
     "furniture", "living", "bedroom", "dining", "office", "outdoor", "seating", "chairs", "sofas",
@@ -55,6 +64,17 @@ MARKETING_SEGMENTS = {
 }
 # 站点导航/目录前缀段：真正的部门在它之后（如 /catalog/home-decor），需剥离后才能按深度定层级。
 TAXONOMY_ROOTS = {"catalog", "collections", "shop", "products", "product", "categories"}
+# 多语言/地区站点在类目路径前的地区前缀（如 ligne-roset 的 /en/c/…、/fr/c/…）。
+# 计深度的真实类目在这些前缀之后，需先剥离才不会因路径过深而被丢弃。
+LOCALE_SEGMENTS = {
+    "en", "fr", "de", "es", "it", "pt", "nl", "pl", "uk", "us", "at", "ie", "cn",
+    "ru", "ja", "zh", "se", "dk", "fi", "no", "au", "ca",
+    "sg", "hk", "my", "id", "in", "ae", "kr", "tw", "jp", "mx", "br", "za", "nz",
+    "en-gb", "en-us", "en-ca", "en-au", "fr-fr", "fr-ch", "fr-ca", "de-de", "de-ch",
+    "es-es", "it-it", "pt-br", "nl-nl",
+}
+# ligne-roset 用 /c/ 作为类目根；一并视作目录前缀剥离。
+_CATEGORY_ROOTS = TAXONOMY_ROOTS | {"c"}
 # 页脚/工具/非商品页路径段：出现在类目清单里会污染两层结构（如 /contact-us、/terms-of-sale）。
 UTILITY_PATH_WORDS = {
     "accessibility", "affirm", "business", "contact", "contact-us", "customer", "customer-care",
@@ -69,6 +89,10 @@ UTILITY_PATH_WORDS = {
     "ccvalueprop", "my-boards", "registry", "shoppingcart", "void", "store-locator",
     "storelocator", "gift-card", "gift-card-services", "collaborations", "holidays",
     "iconography", "credit-card", "feedback",
+    # 选购指南/配置器/联名/活动页（如 castlery 的 Customisation Service、Furniture
+    # Configurator Tool、Outdoor/Sofa Buying Guide、The Gift Guide）不是商品类目。
+    "buying-guide", "gift-guide", "style-guide", "configurator", "customisation",
+    "customization", "our-story", "how-to", "designer", "partnership",
 }
 
 
@@ -84,37 +108,183 @@ def site_key_for(value: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+_LIST_TAGS = frozenset({"ul", "ol"})
+_ITEM_TAGS = frozenset({"li"})
+_MAX_ELEMENT_DEPTH = 64
+
+
+class _NavNode:
+    __slots__ = ("label", "href", "count_raw", "rel_depth", "parent_href", "excluded", "children")
+
+    def __init__(self, href: str, rel_depth: int) -> None:
+        self.label = ""
+        self.href = href
+        self.count_raw = ""
+        self.rel_depth = rel_depth
+        self.parent_href: str | None = None
+        self.excluded = False
+        self.children: list["_NavNode"] = []
+
+
+def _href_key(href: str) -> str:
+    return href.split("#")[0].rstrip("/").casefold()
+
+
+def _is_nav_container(tag: str, attrs: list[tuple[str, str | None]]) -> bool:
+    if tag in {"nav", "menu"}:
+        return True
+    # 链接/列表项不可能是导航根容器；class 里的 dropdown/menu 是子菜单标记，不作根。
+    if tag in {"a", "li"}:
+        return False
+    attrs_map = {str(k).casefold(): str(v or "").casefold() for k, v in attrs}
+    if attrs_map.get("role", "") == "navigation":
+        return True
+    hay = " ".join([attrs_map.get("class", ""), attrs_map.get("id", "")]).casefold()
+    # 子菜单容器（submenu/dropdown/mega）是导航根的子孙，绝不作为导航根。
+    if any(word in hay for word in ("submenu", "dropdown", "mega")):
+        return False
+    return any(word in hay for word in ("nav", "menu"))
+
+
+def _is_footer_like(tag: str, attrs: list[tuple[str, str | None]]) -> bool:
+    if tag == "footer":
+        return True
+    attrs_map = {str(k).casefold(): str(v or "").casefold() for k, v in attrs}
+    hay = " ".join([attrs_map.get("class", ""), attrs_map.get("id", "")])
+    return any(word in hay for word in ("footer", "foot", "legal"))
+
+
 class _NavigationParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.anchors: list[dict[str, str]] = []
+        self.anchors: list[dict[str, str]] = []      # 扁平锚（保持向后兼容）
+        self.nav_nodes: list[_NavNode] = []          # 带父子指针的导航节点
+        self.nav_tree: list[dict] = []               # 嵌套树（feed 后 build_nav_tree 填充）
         self._current: dict[str, str] | None = None
+        self._current_node: _NavNode | None = None
         self._stack = 0
+        self._element_stack: list[dict] = []         # 元素帧栈，用于推导导航父级
+        self._stack_full = False
+
+    def _frame(self, tag: str, attrs: list[tuple[str, str | None]]) -> dict:
+        return {
+            "tag": tag,
+            "is_nav_root": _is_nav_container(tag, attrs) and not (self._element_stack and self._element_stack[-1]["is_nav_root"]),
+            "excluded": _is_footer_like(tag, attrs),
+            "node": None,
+        }
+
+    def _open_nav_node(self, values: dict[str, str]) -> _NavNode:
+        node = _NavNode(href=values.get("href", ""), rel_depth=0)
+        if self._stack_full:
+            self.nav_nodes.append(node)
+            return node
+        nav_index = None
+        for i, frame in enumerate(self._element_stack):
+            if frame["is_nav_root"]:
+                nav_index = i
+        if nav_index is not None:
+            rel_depth, crossed_list, parent_href = 0, False, None
+            excluded = False
+            for frame in reversed(self._element_stack[nav_index + 1:]):
+                excluded = excluded or frame["excluded"]
+                if frame["tag"] in _LIST_TAGS:
+                    crossed_list = True
+                elif frame["tag"] in _ITEM_TAGS:
+                    # 数全部 <li> 得到真实深度；父锚取最内层已登记节点（不 break）。
+                    rel_depth += 1
+                    if parent_href is None and frame.get("node") is not None and crossed_list:
+                        parent_href = frame["node"].href
+            node.rel_depth = rel_depth
+            node.parent_href = parent_href
+            node.excluded = excluded
+            # 把本节点登记到最近的 <li> 帧，供更深层锚查找父级
+            for frame in reversed(self._element_stack):
+                if frame["tag"] in _ITEM_TAGS:
+                    frame["node"] = node
+                    break
+        self.nav_nodes.append(node)
+        return node
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.casefold() != "a":
+        tag = tag.casefold()
+        if tag != "a":
             if self._current is not None:
                 self._stack += 1
+            if len(self._element_stack) >= _MAX_ELEMENT_DEPTH:
+                self._stack_full = True
+            if not self._stack_full:
+                self._element_stack.append(self._frame(tag, attrs))
             return
         if self._current is not None:
             self.handle_endtag("a")
         values = {str(key).casefold(): str(value or "") for key, value in attrs}
         self._current = {"href": values.get("href", ""), "text": "", "count": values.get("data-count", "") or values.get("aria-label", "")}
+        self._current_node = self._open_nav_node(values)
         self._stack = 0
+        if not self._stack_full:
+            self._element_stack.append(self._frame(tag, attrs))
 
     def handle_data(self, data: str) -> None:
         if self._current is not None:
             self._current["text"] += f" {data}"
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.casefold() == "a" and self._current is not None:
+        tag = tag.casefold()
+        if tag == "a" and self._current is not None:
             item = {key: " ".join(value.split()) for key, value in self._current.items()}
             if item["href"]:
                 self.anchors.append(item)
+                if self._current_node is not None:
+                    self._current_node.label = item["text"]
+                    self._current_node.count_raw = item["count"]
             self._current = None
+            self._current_node = None
             self._stack = 0
         elif self._current is not None and self._stack:
             self._stack -= 1
+        if not self._stack_full:
+            self._pop_until(tag)
+
+    def _pop_until(self, tag: str) -> None:
+        for i in range(len(self._element_stack) - 1, -1, -1):
+            if self._element_stack[i]["tag"] == tag:
+                del self._element_stack[i:]
+                return
+        if self._element_stack:
+            self._element_stack.pop()
+
+    def build_nav_tree(self) -> list[dict]:
+        """构建「大标签→小标签」嵌套树。仅当存在至少一个二级(rel_depth==2)节点时输出非空。"""
+        nodes = [n for n in self.nav_nodes if not n.excluded and n.href and 1 <= n.rel_depth <= 2]
+        if not any(n.rel_depth == 2 for n in nodes):
+            self.nav_tree = []
+            return self.nav_tree
+        by_href: dict[str, _NavNode] = {}
+        for n in nodes:
+            by_href.setdefault(_href_key(n.href), n)
+        children: dict[int, list[_NavNode]] = {}
+        for n in nodes:
+            if n.parent_href:
+                parent = by_href.get(_href_key(n.parent_href))
+                if parent is not None:
+                    children.setdefault(id(parent), []).append(n)
+
+        def emit(n: _NavNode) -> dict:
+            return {
+                "label": " ".join(n.label.split()),
+                "path": urlsplit(n.href).path,
+                "count": _count_from_nav_text(n.label + " " + n.count_raw),
+                "children": [emit(child) for child in children.get(id(n), [])],
+            }
+
+        roots = [
+            emit(n) for n in nodes
+            if n.parent_href is None or by_href.get(_href_key(n.parent_href)) is None
+        ]
+        self.nav_tree = roots
+        return roots
+
 
 
 def _json_ld_values(page_html: str) -> list[dict[str, Any]]:
@@ -134,14 +304,35 @@ def _json_ld_values(page_html: str) -> list[dict[str, Any]]:
     return values
 
 
+def _int_or_none(value: str) -> int | None:
+    try:
+        return int(value.replace(",", ""))
+    except ValueError:
+        return None
+
+
 def _count_from_text(value: str) -> int | None:
     match = COUNT_RE.search(value)
     if not match:
         return None
-    try:
-        return int(match.group(1).replace(",", ""))
-    except ValueError:
-        return None
+    return _int_or_none(match.group(1))
+
+
+def _count_from_nav_text(value: str) -> int | None:
+    """从导航锚文本提取数量。
+
+    优先「数字 + items/products 后缀」（如 "33 items"），其次兼容
+    「类目名 + 空格 + 行尾数字」格式（如 sixpenny 的 "CHAIRS 33"）。
+    仅用于导航 label 场景；整页可见数量提取仍走 _count_from_text，避免误判。
+    """
+    match = COUNT_RE.search(value)
+    if match:
+        return _int_or_none(match.group(1))
+    if re.fullmatch(r".+\s+[0-9][0-9,]*", value.strip()):
+        tail = TAIL_COUNT_RE.search(value)
+        if tail:
+            return _int_or_none(tail.group(1))
+    return None
 
 
 def _canonical_name(native: str, path: str) -> str:
@@ -243,6 +434,117 @@ def _coarse_group(slug: str) -> str:
         if any(word in text for word in words):
             return name
     return "other"
+
+
+def _has_brain_parent(category: "TaxonomyCategoryContract") -> bool:
+    """类目是否由千问大脑明确输出了父子关系（带 brain_child 标记）。
+
+    这类父子是大脑基于导航语义判断的权威结构，_hierarchize 尊重其
+    level/parent_path，不被路径段数推断覆盖；无标记的类目仍走路径推断。
+    """
+    return any(str(item.get("role") or "") == "brain_child" for item in category.evidence)
+
+
+def _nav_tree_evidence(category: "TaxonomyCategoryContract") -> dict | None:
+    """返回类目上的 nav_tree evidence（若有），供 _hierarchize 读取导航层级。"""
+    for item in category.evidence:
+        if str(item.get("role") or "") == "nav_tree":
+            return item
+    return None
+
+
+def _normalize_parent_path(parent_path: str) -> str | None:
+    """剥离父路径的地区/目录前缀，与 _hierarchize 大脑分支逻辑一致（纯提取复用）。"""
+    parts = [p for p in parent_path.split("/") if p]
+    while parts and parts[0].casefold() in LOCALE_SEGMENTS:
+        parts = parts[1:]
+    while parts and parts[0].casefold() in _CATEGORY_ROOTS:
+        parts = parts[1:]
+    return ("/" + "/".join(parts)) if parts else None
+
+
+# 大脑 agent 可调用的工具声明（OpenAI function-calling 格式）。执行仍由
+# NativeSiteAnalyzer 注入的 executor 完成，并全部经过 SafeHttpClient 合规门。
+_AGENT_TOOLS: list[dict[str, object]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "browse",
+            "description": "Fetch a public page on the same site and return cleaned visible text plus candidate navigation links.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "same-site page URL to fetch"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_categories",
+            "description": "Run the rule-based category extractor on a page and return its candidate category list as a starting hint.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "same-site page URL (defaults to the site root)"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_count",
+            "description": "Fetch a category page and estimate its product count (EXACT/ESTIMATED). Use for categories whose count is UNKNOWN.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "same-site category page URL"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "escalate_browser",
+            "description": "Request that this page be re-fetched in a visible persistent browser session (L2). Not a CAPTCHA claim.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "page URL needing a headed browser"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": "Finalize the two-level furniture taxonomy with counts and stop.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "categories": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "native_name": {"type": "string"},
+                                "canonical_name": {"type": "string"},
+                                "path": {"type": "string"},
+                                "source_url": {"type": "string"},
+                                "count_value": {"type": ["integer", "null"]},
+                                "count_kind": {"type": "string", "enum": ["EXACT", "ESTIMATED", "UNKNOWN"]},
+                                "level": {"type": "integer"},
+                                "parent_path": {"type": ["string", "null"]},
+                            },
+                            "required": ["native_name", "canonical_name", "path", "level"],
+                        },
+                    },
+                    "reasoning": {"type": "string"},
+                },
+                "required": ["categories"],
+            },
+        },
+    },
+]
 
 
 class NativeSiteAnalyzer:
@@ -383,16 +685,28 @@ class NativeSiteAnalyzer:
             if signals.get("platform") == "MAGENTO_PWA":
                 magento_count_evidence = self._enrich_magento_pwa_counts(client, categories, normalized)
             # 数量补全：优先一级类目（页面少、信息密度高），再补二级类目；
-            # 覆盖前 20 个，避免只补前几个导致大面积「数量未知」。
+            # 一次扫描尽量覆盖全部 UNKNOWN，避免要求用户多次续扫。
             ordered = sorted(categories, key=lambda item: (item.level != 1, item.path))
-            for category in ordered[:MAX_COUNT_PROBES]:
-                if category.count_kind == "UNKNOWN":
+            unknown_targets = [category for category in ordered[:MAX_COUNT_PROBES] if category.count_kind == "UNKNOWN"]
+            if unknown_targets:
+                # 预算按待补证类目数自适应，而不是固定小预算导致 PARTIAL。
+                probe_client = self.client_factory(
+                    source_url=normalized,
+                    request_budget=len(unknown_targets) + 8,
+                    timeout=25,
+                    request_delay=0.15,
+                )
+                for category in unknown_targets:
                     try:
-                        category_html = client.get_html(category.source_url)
+                        category_html = probe_client.get_html(category.source_url)
                         self._enrich_count(category, category_html)
                     except (AccessControlDetected, RobotsDenied, NetworkPolicyError, HttpStatusError):
                         continue
-            ambiguous = not categories or any(item.confidence < 0.65 or item.count_kind == "UNKNOWN" for item in categories)
+            # 需要大脑介入的情形：规则未达 READY（低置信/数量 UNKNOWN），或站点为
+            # 全平铺一级（无任何二级，可能是 sixpenny 这类需要按部门分组的结构）。
+            ambiguous = (not categories
+                         or any(item.confidence < 0.65 or item.count_kind == "UNKNOWN" for item in categories)
+                         or (bool(categories) and not any(item.level == 2 for item in categories)))
             brain_metadata: dict[str, object] = {"status": "NOT_NEEDED", "provider_posts": 0}
             if source_type == "UNKNOWN":
                 try:
@@ -410,14 +724,10 @@ class NativeSiteAnalyzer:
                 except BrainError as error:
                     brain_metadata["source_status"] = {"status": error.code}
             if ambiguous:
-                try:
-                    brain_result, brain_metadata = self.brain.reason_taxonomy(source_url=normalized, evidence={"signals": signals, "categories": [item.model_dump() for item in categories[:30]]})
+                brain_result, brain_metadata = self._brain_agent_taxonomy(normalized, signals, categories, client)
+                if brain_result is not None:
                     brain_metadata["output"] = brain_result.model_dump(mode="json")
                     categories = self._merge_brain(categories, brain_result)
-                except BrainNotConfigured as error:
-                    brain_metadata = {"status": error.code, "provider_posts": self.brain.post_count}
-                except BrainError as error:
-                    brain_metadata = {"status": error.code, "error": str(error), "provider_posts": self.brain.post_count}
             status = "READY" if categories and all(item.count_kind != "UNKNOWN" for item in categories) else "PARTIAL"
             if not categories and brain_metadata.get("status") == "BRAIN_NOT_CONFIGURED":
                 status = "BRAIN_NOT_CONFIGURED"
@@ -495,7 +805,9 @@ class NativeSiteAnalyzer:
             count_probe_blocker: dict[str, object] | None = None
             collector = NativeBrowserCollector(session_dir)
             ordered = sorted(categories, key=lambda item: (item.level != 1, item.path))
-            l2_probe_limit = max(1, min(MAX_COUNT_PROBES, int(os.getenv("WEBSITE_L2_COUNT_PROBES", "4"))))
+            # 浏览器补证一次批量覆盖全部 UNKNOWN（上限 MAX_COUNT_PROBES），
+            # 不再每轮只补 4 个导致用户需要反复手动续扫。
+            l2_probe_limit = max(1, min(MAX_COUNT_PROBES, int(os.getenv("WEBSITE_L2_COUNT_PROBES", "120"))))
             probe_urls = [
                 category.source_url
                 for category in ordered[:l2_probe_limit]
@@ -609,16 +921,43 @@ class NativeSiteAnalyzer:
     def _l0_l1(self, source_url: str, page_html: str) -> tuple[list[TaxonomyCategoryContract], dict[str, object]]:
         parser = _NavigationParser()
         parser.feed(page_html)
+        nav_tree = parser.build_nav_tree()
+        # 导航层级索引：绝对化 href → 节点；节点 → 父节点绝对 href；父级 href 集合。
+        abs_nodes: dict[str, _NavNode] = {}
+        parent_abs: dict[int, str] = {}
+        parent_hrefs: set[str] = set()
+        for node in parser.nav_nodes:
+            if node.excluded or node.rel_depth < 1 or not node.href:
+                continue
+            abs_nodes.setdefault(_href_key(urljoin(source_url, node.href)), node)
+            if node.parent_href:
+                p_abs = urljoin(source_url, node.parent_href)
+                parent_abs[id(node)] = p_abs
+                parent_hrefs.add(_href_key(p_abs))
         categories: list[TaxonomyCategoryContract] = []
+        nav_items: list[dict[str, object]] = []
         for anchor in parser.anchors:
             href = urljoin(source_url, anchor["href"])
             if not _looks_like_category(href, anchor["text"], source_url):
                 continue
-            count = _count_from_text(anchor["text"] + " " + anchor["count"])
+            count = _count_from_nav_text(anchor["text"] + " " + anchor["count"])
             evidence = [{"role": "navigation", "source_url": href, "label": anchor["text"]}]
             if count is not None:
                 evidence.append({"role": "visible_count", "value": count, "source_url": source_url})
-            categories.append(self._category(href, anchor["text"], count, evidence, 0.78 if count is not None else 0.62))
+            # 导航优先：大标签（有子项）→ 一级；其下小标签 → 二级。仅当检测到
+            # 嵌套结构（nav_tree 非空）才启用，否则走 URL 路径段数兜底。
+            nav_level = nav_parent_path = nav_parent_href = None
+            node = abs_nodes.get(_href_key(href))
+            if node is not None and nav_tree:
+                p_href = parent_abs.get(id(node))
+                if p_href is not None and _href_key(p_href) in abs_nodes:
+                    nav_level = 2
+                    nav_parent_href = p_href
+                    nav_parent_path = urlsplit(p_href).path
+                elif _href_key(href) in parent_hrefs:
+                    nav_level = 1
+            categories.append(self._category(href, anchor["text"], count, evidence, 0.78 if count is not None else 0.62, nav_level=nav_level, nav_parent_path=nav_parent_path, nav_parent_href=nav_parent_href))
+            nav_items.append({"path": urlsplit(href).path, "label": anchor["text"], "count": count})
         for item in _json_ld_values(page_html):
             if str(item.get("@type", "")).casefold() in {"itemlist", "collectionpage"}:
                 count = item.get("numberOfItems")
@@ -630,6 +969,9 @@ class NativeSiteAnalyzer:
         signals = {
             "platform": self._platform(page_html),
             "navigation_links": len(parser.anchors),
+            "navigation_items": nav_items[:40],
+            "navigation_tree": nav_tree,
+            "navigation_hierarchy_used": bool(nav_tree),
             "json_ld_blocks": len(_json_ld_values(page_html)),
             "html_bytes": len(page_html.encode("utf-8")),
             "page_has_product_signals": bool(PRODUCT_RE.search(page_html)),
@@ -649,7 +991,9 @@ class NativeSiteAnalyzer:
                 category.confidence = max(category.confidence, 0.94)
                 return
         visible_count = _count_from_text(re.sub(r"<[^>]+>", " ", page_html))
-        if visible_count is not None:
+        # 0 通常不是真实类目数量（空状态文案/JS 未渲染的误读），不作为权威 EXACT，
+        # 回退到产品 JSON-LD / 产品链接样本估算。
+        if visible_count is not None and visible_count > 0:
             category.count_value = visible_count
             category.count_kind = "EXACT"
             category.evidence.append({"role": "visible_count", "value": visible_count, "source_url": category.source_url})
@@ -669,10 +1013,171 @@ class NativeSiteAnalyzer:
             category.evidence.append({"role": "bounded_product_link_sample", "value": product_links, "source_url": category.source_url})
             category.confidence = max(category.confidence, 0.7)
 
+    def _agent_tool_executor(self, client: SafeHttpClient, source_url: str, *, count_results: dict[str, dict[str, object]] | None = None) -> Callable[[str, dict[str, object]], dict[str, object]]:
+        def execute(name: str, args: dict[str, object]) -> dict[str, object]:
+            try:
+                return self._agent_dispatch(name, args, client, source_url, count_results=count_results)
+            except RequestBudgetExceeded as error:
+                raise AgentToolError("REQUEST_BUDGET_EXCEEDED", str(error)) from error
+            except (RobotsDenied, AccessControlDetected, HttpStatusError, NetworkPolicyError) as error:
+                raise AgentToolError(type(error).__name__, str(error)[:300]) from error
+        return execute
+
+    def _agent_dispatch(self, name: str, args: dict[str, object], client: SafeHttpClient, source_url: str, *, count_results: dict[str, dict[str, object]] | None = None) -> dict[str, object]:
+        if name == "browse":
+            url = str(args.get("url") or "").strip()
+            if not url:
+                raise AgentToolError("BAD_ARGS", "browse requires url")
+            html = client.get_html(url)
+            parser = _NavigationParser()
+            parser.feed(html)
+            visible = re.sub(r"<[^>]+>", " ", html)
+            visible = " ".join(visible.split())
+            nav = [
+                {"href": urljoin(url, anchor["href"]), "label": anchor["text"]}
+                for anchor in parser.anchors[:40]
+            ]
+            return {
+                "url": url,
+                "text_snippet": visible[:1500],
+                "nav_items": nav,
+                "nav_tree": parser.build_nav_tree()[:10],
+                "html_bytes": len(html.encode("utf-8")),
+            }
+        if name == "list_categories":
+            url = str(args.get("url") or source_url or "").strip()
+            if not url:
+                raise AgentToolError("BAD_ARGS", "list_categories requires url")
+            html = client.get_html(url)
+            cats, _ = self._l0_l1(url, html)
+            return {"url": url, "categories": [c.model_dump(mode="json") for c in cats[:30]]}
+        if name == "get_count":
+            url = str(args.get("url") or "").strip()
+            if not url:
+                raise AgentToolError("BAD_ARGS", "get_count requires url")
+            html = client.get_html(url)
+            category = self._category(
+                url, url.rstrip("/").rsplit("/", 1)[-1].replace("-", " ").title() or "Catalog", None,
+                [{"role": "agent_get_count", "source_url": url}], 0.5,
+            )
+            self._enrich_count(category, html)
+            outcome = {
+                "url": url,
+                "count_value": category.count_value,
+                "count_kind": category.count_kind,
+                "evidence_roles": [str(e.get("role") or "") for e in category.evidence],
+            }
+            if count_results is not None:
+                # 记录 agent 探到的数量，循环后回填到类目，即使模型没有在 finish
+                # 里复述 get_count 结果也不丢失（配合 _merge_brain 规则数量回填）。
+                count_results[url.rstrip("/").casefold()] = outcome
+            return outcome
+        if name == "escalate_browser":
+            return {"status": "BROWSER_REQUIRED", "url": str(args.get("url") or ""), "reason": "agent requested visible browser escalation; not treated as a CAPTCHA claim"}
+        raise AgentToolError("UNKNOWN_TOOL", f"unknown agent tool {name!r}")
+
+    @staticmethod
+    def _apply_agent_counts(categories: list[TaxonomyCategoryContract], count_results: dict[str, dict[str, object]]) -> None:
+        """Backfill counts the agent discovered via get_count onto rule categories.
+
+        Keeps agent-probed EXACT/ESTIMATED counts even when the model omits them
+        from the `finish` payload; `_merge_brain` then keeps them via its rule
+        count backfill. UNKNOWN/zero results are not written (no information).
+        """
+        for category in categories:
+            if category.count_kind != "UNKNOWN":
+                continue
+            outcome = count_results.get(category.source_url.rstrip("/").casefold())
+            if not outcome:
+                continue
+            value = outcome.get("count_value")
+            kind = str(outcome.get("count_kind") or "UNKNOWN").upper()
+            if isinstance(value, int) and value > 0 and kind in ("EXACT", "ESTIMATED"):
+                category.count_value = value
+                category.count_kind = kind
+                category.evidence.append({"role": "agent_get_count", "value": value, "source_url": category.source_url})
+                category.confidence = max(category.confidence, 0.7)
+
+    def _brain_agent_taxonomy(
+        self,
+        source_url: str,
+        signals: dict[str, object],
+        categories: list[TaxonomyCategoryContract],
+        client: SafeHttpClient,
+    ) -> tuple[BrainTaxonomyResponse | None, dict[str, object]]:
+        """Run the Brain as an agent to build the taxonomy; fall back to rules."""
+        if (
+            self.brain.settings.local_agent_mode
+            or not self.brain.settings.configured
+            or not self.brain.settings.agent_enabled
+        ):
+            return None, {"status": "BRAIN_NOT_CONFIGURED", "provider_posts": self.brain.post_count}
+        remaining_unknown = [item.path for item in categories if item.count_kind == "UNKNOWN"]
+        count_results: dict[str, dict[str, object]] = {}
+        input_payload: dict[str, object] = {
+            "source_url": source_url,
+            "task": "Produce the authoritative two-level furniture taxonomy with per-category counts.",
+            "signals": signals,
+            "navigation_items": signals.get("navigation_items") or [],
+            "navigation_tree": signals.get("navigation_tree") or [],
+            "categories": [item.model_dump() for item in categories[:30]],
+            "remaining_unknown_counts": remaining_unknown[:40],
+        }
+        system_prompt = (
+            "You are an autonomous furniture-site taxonomy analyst for a compliant product-mapping workflow. "
+            "Use browse / list_categories / get_count to explore the public site. Produce a clean two-level "
+            "furniture taxonomy: level=1 departments (Seating / Tables / Beds / Rugs / Lighting ...) and level=2 "
+            "their child categories (Chairs / Sofas ...). Every level=2 category must set parent_path to its "
+            "department. Fill count_value / count_kind (EXACT / ESTIMATED) for as many categories as possible, "
+            "preferring get_count over guessing. Never invent counts. When finished, call finish with "
+            "{categories: [{native_name, canonical_name, path, source_url, count_value, count_kind, level, parent_path}], reasoning}. "
+            "When navigation_tree is present it already encodes the site's department->category DOM nesting; "
+            "honor that nesting for level/parent_path. Stay on the same site and respect the access guidance in tool errors."
+        )
+        try:
+            result = self.brain.run_agent_loop(
+                system_prompt=system_prompt,
+                input_payload=input_payload,
+                tools=_AGENT_TOOLS,
+                tool_executor=self._agent_tool_executor(client, source_url, count_results=count_results),
+                options=AgentLoopOptions(
+                    response_schema=BrainTaxonomyResponse,
+                    finish_tool_name="finish",
+                    max_steps=self.brain.settings.agent_max_steps,
+                ),
+            )
+        except BrainError as error:
+            return None, {"status": error.code, "provider_posts": self.brain.post_count}
+        # 回填 agent 探到的数量到当前类目（即使模型没在 finish 复述也不丢失）。
+        self._apply_agent_counts(categories, count_results)
+        receipt = {
+            "status": "AGENT_READY" if result.validated is not None else result.stopped_reason,
+            "stopped_reason": result.stopped_reason,
+            "turns": result.turns,
+            "tool_calls": [
+                {"name": call.get("name"), "arguments": call.get("arguments"), "result_status": call.get("result_status")}
+                for call in result.tool_calls
+            ],
+            "provider_posts": result.provider_posts,
+        }
+        if result.validated is not None:
+            return result.validated, receipt
+        # 大脑 agent 未收敛：回退到一次性 reason_taxonomy，再失败则走规则兜底（保证摸底有产出）。
+        try:
+            response, brain_metadata = self.brain.reason_taxonomy(source_url=source_url, evidence={
+                "signals": signals,
+                "navigation_items": signals.get("navigation_items") or [],
+                "navigation_tree": signals.get("navigation_tree") or [],
+                "categories": [item.model_dump() for item in categories[:30]],
+            })
+            brain_metadata["agent_loop"] = receipt
+            return response, brain_metadata
+        except BrainError as error:
+            return None, {"status": error.code, "provider_posts": self.brain.post_count, "agent_loop": receipt}
+
     @staticmethod
     def _discover_magento_pwa_taxonomy(client: SafeHttpClient, source_url: str) -> tuple[list[TaxonomyCategoryContract], dict[str, object]]:
         """Read the official two-level Magento category tree through public GraphQL."""
-
         endpoint = urljoin(source_url, "/graphql")
         parsed = urlsplit(endpoint)
         candidates = [endpoint]
@@ -905,11 +1410,16 @@ class NativeSiteAnalyzer:
         )
 
     @staticmethod
-    def _category(source_url: str, native: str, count: int | None, evidence: list[dict[str, object]], confidence: float) -> TaxonomyCategoryContract:
+    def _category(source_url: str, native: str, count: int | None, evidence: list[dict[str, object]], confidence: float, *, nav_level: int | None = None, nav_parent_path: str | None = None, nav_parent_href: str | None = None) -> TaxonomyCategoryContract:
         path = urlsplit(source_url).path or "/"
         segments = [part for part in path.split("/") if part]
-        level = 2 if len(segments) >= 2 else 1
-        parent_path = "/" + segments[0] if level == 2 else None
+        if nav_level is not None:
+            level = nav_level
+            parent_path = nav_parent_path
+            evidence = list(evidence) + [{"role": "nav_tree", "level": level, "parent_path": nav_parent_path, "parent_href": nav_parent_href}]
+        else:
+            level = 2 if len(segments) >= 2 else 1
+            parent_path = "/" + segments[0] if level == 2 else None
         return TaxonomyCategoryContract(category_id=f"cat_{hashlib.sha256(path.encode('utf-8')).hexdigest()[:16]}", native_name=_canonical_name(native, path), canonical_name=_canonical_name(native, path), path=path, source_url=source_url, count_value=count, count_kind="EXACT" if count is not None else "UNKNOWN", evidence=evidence, confidence=confidence, level=level, parent_path=parent_path)
 
     @staticmethod
@@ -926,11 +1436,19 @@ class NativeSiteAnalyzer:
             "sideboards", "bookcases", "bookcase", "stools", "stool", "desks", "desk", "rugs", "rug",
         }
         output: list[TaxonomyCategoryContract] = []
+        output_index: dict[tuple[int, str], int] = {}
         for category in categories:
             segments = [part for part in category.path.split("/") if part]
-            # 剥离目录前缀（catalog/shop/collections/products…），真正的部门在其后。
-            while segments and segments[0].casefold() in TAXONOMY_ROOTS:
+            # 剥离多语言/地区前缀（/en/c/… 中的 en），再剥离目录前缀
+            #（catalog/shop/collections/products/c…），真正的部门在其后。
+            while segments and segments[0].casefold() in LOCALE_SEGMENTS:
                 segments = segments[1:]
+            while segments and segments[0].casefold() in _CATEGORY_ROOTS:
+                segments = segments[1:]
+            # Shopify 内容路由（/pages/xxx、/blogs/xxx）是营销/推荐页，
+            # 不是商品类目；混进两级结构会形成假二级（如"おすすめベッド12選"）。
+            if segments and segments[0].casefold() in {"pages", "blogs"}:
+                continue
             if not segments or len(segments) > 2:
                 # 路径深度超过两级（如 /bedroom/all-beds/mattresses）按两级模型忽略。
                 continue
@@ -951,13 +1469,41 @@ class NativeSiteAnalyzer:
             if last in MARKETING_SEGMENTS or last.endswith("-collection") or last.endswith("-collections"):
                 # 营销主题页（如 /alexander-collection）不是商品类目。
                 continue
-            category.level = 2 if len(segments) == 2 else 1
-            category.parent_path = "/" + segments[0] if category.level == 2 else None
+            # 层级判定优先级：大脑(brain_child) > 导航树(nav_tree) > URL 路径段数。
+            if category.level == 2 and category.parent_path and _has_brain_parent(category):
+                # Brain 明确输出的父子关系被尊重，父路径做前缀剥离与规范化后的父类目对齐。
+                category.parent_path = _normalize_parent_path(category.parent_path)
+            elif (nav := _nav_tree_evidence(category)) is not None:
+                # 导航 DOM 嵌套：大标签(有子项)=一级；其下小标签=二级，父指向大标签。
+                category.level = int(nav.get("level") or (2 if nav.get("parent_path") else 1))
+                if category.level == 2 and nav.get("parent_path"):
+                    category.parent_path = _normalize_parent_path(str(nav["parent_path"]))
+                else:
+                    category.parent_path = None
+            else:
+                category.level = 2 if len(segments) == 2 else 1
+                category.parent_path = "/" + segments[0] if category.level == 2 else None
             if category.level == 1:
                 words = set(re.split(r"[-_]", last))
                 is_direct_scope = any(str(item.get("role") or "") == "source_scope" for item in category.evidence)
-                if not is_direct_scope and not (words & slug_words):
+                has_nav_scope = any(str(item.get("role") or "") == "nav_tree" for item in category.evidence)
+                # 导航强制的一级（大标签，如 living/office）视为导航权威证据，免于家具词白名单。
+                if not (is_direct_scope or has_nav_scope) and not (words & slug_words):
                     continue
+            # 同一规范化类目在多个地区（castlery 的 /sg /ca /au /us）重复时，
+            # 保留数量最多者作为代表，并合并证据，避免类目清单里出现重复。
+            dedup_key = (category.level, normalized_path.casefold())
+            existing_index = output_index.get(dedup_key)
+            if existing_index is not None:
+                existing = output[existing_index]
+                if (category.count_value or 0) > (existing.count_value or 0):
+                    if existing.evidence:
+                        category.evidence = list(category.evidence or []) + list(existing.evidence)
+                    output[existing_index] = category
+                else:
+                    existing.evidence = list(existing.evidence or []) + list(category.evidence or [])
+                continue
+            output_index[dedup_key] = len(output)
             output.append(category)
         return NativeSiteAnalyzer._coarsen(output)
 
@@ -1049,14 +1595,28 @@ class NativeSiteAnalyzer:
 
     @staticmethod
     def _merge_brain(current: list[TaxonomyCategoryContract], brain: BrainTaxonomyResponse) -> list[TaxonomyCategoryContract]:
-        merged = list(current)
+        if not brain.categories:
+            return NativeSiteAnalyzer._dedupe_categories(NativeSiteAnalyzer._hierarchize(current))
+        rules_by_url = {c.source_url.rstrip("/").casefold(): c for c in current}
+        merged_by_url: dict[str, TaxonomyCategoryContract] = {}
+        # 大脑输出为主：它基于完整导航语义给出了权威的部门→子类目结构。
         for item in brain.categories:
-            if item.source_url and any(existing.source_url.rstrip("/").casefold() == item.source_url.rstrip("/").casefold() for existing in merged):
-                continue
             if item.count_kind == "EXACT" and item.count_value is None:
                 item.count_kind = "UNKNOWN"
-            merged.append(item)
-        return NativeSiteAnalyzer._dedupe_categories(NativeSiteAnalyzer._hierarchize(merged))
+            # 规则已确定的 EXACT/ESTIMATED 数量回填，避免大脑对精确数字的偏差。
+            rule = rules_by_url.get(item.source_url.rstrip("/").casefold())
+            if rule is not None and rule.count_kind in ("EXACT", "ESTIMATED") and rule.count_value is not None:
+                item.count_value = rule.count_value
+                item.count_kind = rule.count_kind
+                item.evidence = list(item.evidence) + list(rule.evidence)
+            if item.level == 2 and item.parent_path:
+                item.evidence = list(item.evidence) + [{"role": "brain_child"}]
+            merged_by_url[item.source_url.rstrip("/").casefold()] = item
+        # 大脑未覆盖的规则类目补上，避免遗漏。
+        for url, rule in rules_by_url.items():
+            if url not in merged_by_url:
+                merged_by_url[url] = rule
+        return NativeSiteAnalyzer._dedupe_categories(NativeSiteAnalyzer._hierarchize(list(merged_by_url.values())))
 
     @staticmethod
     def _platform(page_html: str) -> str:

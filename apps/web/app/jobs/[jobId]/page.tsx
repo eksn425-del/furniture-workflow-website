@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { API_ROOT } from "@/lib/api";
 import {
   approveControlJob,
@@ -41,6 +41,32 @@ const STATUS: Record<string, string> = {
   RUNNING: "运行中",
   HUMAN_REQUIRED: "需要人工",
 };
+// 阻断原因 → 可操作指引。文案风格与 production-console.tsx 的 siteScanBlocker 保持一致。
+type BlockerGuidance = { text: string; retryable: boolean; relink?: { href: string; label: string } };
+const BLOCKER_GUIDANCE: Record<string, BlockerGuidance> = {
+  SUPPLY_EXHAUSTED: {
+    text: "该类目可能是落地页，当前范围内可供建模的候选已耗尽。建议改选其下具体子类目（如 Chairs / Tables）后重试。",
+    retryable: true,
+    relink: { href: "/jobs/new", label: "重新选择类目 →" },
+  },
+  ROBOTS_DENIED: {
+    text: "该站 robots.txt 拒绝抓取，属合规阻断，不可绕过。",
+    retryable: false,
+  },
+  HUMAN_REQUIRED: {
+    text: "需要人工完成验证码处理。请在浏览器会话中完成后恢复同一 Job。",
+    retryable: true,
+  },
+};
+const BLOCKER_GUIDANCE_RE = /(SUPPLY_EXHAUSTED|ROBOTS_DENIED|HUMAN_REQUIRED)/;
+
+function blockerGuidanceFor(status: string, reason: string | null | undefined): BlockerGuidance | null {
+  if (status === "HUMAN_REQUIRED") return BLOCKER_GUIDANCE.HUMAN_REQUIRED;
+  const match = reason?.match(BLOCKER_GUIDANCE_RE);
+  const key = match ? match[1] : status;
+  return BLOCKER_GUIDANCE[key] ?? null;
+}
+
 const STAGES = [
   { key: "SITE_SCAN", label: "站点扫描", detail: "Source Type、类目、数量与范围" },
   { key: "TARGET_POLICY", label: "目标策略", detail: "选定类目、Exact-N 与边界" },
@@ -135,11 +161,17 @@ export default function JobDetailRoute({ params }: { params: Promise<{ jobId: st
 
   useEffect(() => {
     let active = true;
+    // 轮询防抖：上一次请求未返回时不发起新请求，避免弱网下请求叠加。
+    const inFlight = { current: false };
     const refresh = async () => {
+      if (inFlight.current) return;
+      inFlight.current = true;
       try {
         await load();
       } catch (reason) {
         if (active) setError(readableConsoleError(reason));
+      } finally {
+        inFlight.current = false;
       }
     };
     void refresh();
@@ -338,12 +370,14 @@ export default function JobDetailRoute({ params }: { params: Promise<{ jobId: st
   const latestL2Payload = latestL2Event?.payload && typeof latestL2Event.payload === "object" ? latestL2Event.payload as Record<string, unknown> : {};
   const latestL2Url = typeof latestL2Payload.url === "string" && /^https?:\/\//i.test(latestL2Payload.url) ? latestL2Payload.url : null;
   const latestL2IsCandidate = typeof latestL2Payload.candidate_id === "string" && latestL2Payload.candidate_id.length > 0;
+  const runRunning = run?.status === "RUNNING";
+  const blockerGuidance = blockerGuidanceFor(job.status, job.last_reason);
   return <div className="console-page">
     <div className="console-breadcrumb"><Link href="/jobs">任务</Link><span>/</span><span>{job.title}</span></div>
     <div className="console-page-header"><div><p className="console-eyebrow">Job Detail / {job.job_id}</p><h1>{job.title}</h1><p className="console-page-description">{job.goal}</p></div><div className="console-header-actions"><span className={`console-status console-status--${job.status === "PRODUCTION_BLOCKED" ? "danger" : job.status === "COMPLETED" ? "success" : "attention"}`}><i />{STATUS[job.status] ?? job.status}</span><Link href="/review" className="console-button console-button--secondary">打开 Review</Link></div></div>
     <section className="job-detail-summary"><div><span>站点</span><strong>{job.site_name}</strong><small>{job.source_url}</small></div><div><span>目标</span><strong>{job.target_mode === "ALL" ? "全部" : job.target_value}</strong><small>{job.scope === "NEW_ONLY" ? "只要新增" : "包含既有"}</small></div><div><span>合格</span><strong>{job.counts.eligible_count}</strong><small>reported {job.counts.reported_count} · unique {job.counts.unique_count}</small></div><div><span>已交付</span><strong>{job.counts.delivered_count}</strong><small>Provider calls {job.provider_calls}</small></div></section>
-    {job.status === "TARGET_SHORTAGE" ? <div className="console-alert console-alert--attention"><strong>Exact-N 数量不足</strong><span>{job.last_reason ?? "当前范围已耗尽。你可以接受现有完成数量并交付，或调整目标/类目后再恢复。"}</span><button type="button" className="console-button console-button--secondary" onClick={() => void acceptShortageAndResume()} disabled={starting}>接受当前数量并继续交付 →</button></div> : null}
-     <section className="console-panel"><div className="console-section-title"><div><h2>生产控制</h2><p>启动 Website Production Engine；候选池、浏览器会话、Provider ledger 和收据都归属同一 Job。</p></div></div>{actionMsg ? <p className="console-empty-text">{actionMsg}</p> : null}{askCeiling ? <div className="console-alert console-alert--attention"><strong>审批成本与 Provider 硬调用上限</strong><p className="wizard-inline-note">两项都是硬安全门。达到调用上限后不会再发送 Provider POST；SUBMISSION_UNKNOWN 也会占用一个额度。</p><div className="wizard-input-row"><label className="console-field console-field--small"><span>成本上限（元）</span><input className="console-input" type="number" min={1} step={1} value={ceilingRaw} onChange={(event) => setCeilingRaw(event.target.value)} /></label><label className="console-field console-field--small"><span>Provider 调用上限</span><input className="console-input" type="number" min={1} step={1} value={callLimitRaw} onChange={(event) => setCallLimitRaw(event.target.value)} /></label><button type="button" className="console-button console-button--primary" onClick={() => void confirmCeiling()} disabled={starting}>{starting ? "审批并启动中…" : "确认双重上限并启动 →"}</button><button type="button" className="console-button console-button--quiet" onClick={() => setAskCeiling(false)} disabled={starting}>取消</button></div></div> : null}<p className="wizard-inline-note">正常流程不需要填写证据目录。Website 会从已选类目自动采集；遇到明确 CAPTCHA 控件才显示 Human Required，临时故障和静态拒绝会单独分类。</p>{latestL2Url ? <div className="console-alert console-alert--attention"><strong>{latestL2IsCandidate ? "需要处理 L2 商品核对" : "需要处理 L2 发现入口"}</strong><p>{String(latestL2Payload.reason_code ?? "L2_BROWSER_REQUIRED")}：系统会自动从同一浏览器会话继续；如需人工核对，请在浏览器会话中完成处理后恢复同一 Job。</p></div> : null}<div className="wizard-footer"><button type="button" className="console-button console-button--primary" onClick={() => void startRunNow()} disabled={starting || run?.status === "RUNNING"}>{starting ? "启动中…" : run?.status === "RUNNING" ? "生产中…" : "开始生产 →"}</button>{canResume ? <button type="button" className="console-button console-button--secondary" onClick={() => void resumeRunNow()} disabled={starting}>恢复同一 Job →</button> : null}{canResumeScan ? <button type="button" className="console-button console-button--secondary" onClick={() => void resumeScanNow()} disabled={starting}>恢复站点浏览器会话 →</button> : null}</div></section>
+    {job.status === "TARGET_SHORTAGE" ? <div className="console-alert console-alert--attention"><strong>Exact-N 数量不足</strong><span>{blockerGuidance?.text ?? job.last_reason ?? "当前范围已耗尽。你可以接受现有完成数量并交付，或调整目标/类目后再恢复。"}</span>{blockerGuidance?.relink ? <span className="console-blocker-actions"><Link href={blockerGuidance.relink.href} className="console-inline-link">{blockerGuidance.relink.label}</Link></span> : null}{!blockerGuidance || blockerGuidance.retryable ? <span className="console-blocker-actions"><button type="button" className="console-button console-button--secondary" onClick={() => void acceptShortageAndResume()} disabled={starting}>接受当前数量并继续交付 →</button></span> : null}</div> : null}
+     <section className="console-panel"><div className="console-section-title"><div><h2>生产控制</h2><p>启动 Website Production Engine；候选池、浏览器会话、Provider ledger 和收据都归属同一 Job。</p></div></div>{actionMsg ? <p className="console-empty-text">{actionMsg}</p> : null}{askCeiling ? <div className="console-alert console-alert--attention"><strong>审批成本与 Provider 硬调用上限</strong><p className="wizard-inline-note">两项都是硬安全门。达到调用上限后不会再发送 Provider POST；SUBMISSION_UNKNOWN 也会占用一个额度。</p><div className="wizard-input-row"><label className="console-field console-field--small"><span>成本上限（元）</span><input className="console-input" type="number" min={1} step={1} value={ceilingRaw} onChange={(event) => setCeilingRaw(event.target.value)} /></label><label className="console-field console-field--small"><span>Provider 调用上限</span><input className="console-input" type="number" min={1} step={1} value={callLimitRaw} onChange={(event) => setCallLimitRaw(event.target.value)} /></label><button type="button" className="console-button console-button--primary" onClick={() => void confirmCeiling()} disabled={starting}>{starting ? "审批并启动中…" : "确认双重上限并启动 →"}</button><button type="button" className="console-button console-button--quiet" onClick={() => setAskCeiling(false)} disabled={starting}>取消</button></div></div> : null}<p className="wizard-inline-note">正常流程不需要填写证据目录。Website 会从已选类目自动采集；遇到明确 CAPTCHA 控件才显示 Human Required，临时故障和静态拒绝会单独分类。</p>{latestL2Url ? <div className="console-alert console-alert--attention"><strong>{latestL2IsCandidate ? "需要处理 L2 商品核对" : "需要处理 L2 发现入口"}</strong><p>{String(latestL2Payload.reason_code ?? "L2_BROWSER_REQUIRED")}：系统会自动从同一浏览器会话继续；如需人工核对，请在浏览器会话中完成处理后恢复同一 Job。</p></div> : null}<div className="wizard-footer">{runRunning ? <p className="console-empty-text">生产正在运行，无需额外操作；进度见下方「生产运行」面板。</p> : <><button type="button" className="console-button console-button--primary" onClick={() => void startRunNow()} disabled={starting}>{starting ? "启动中…" : "开始生产 →"}</button>{canResume ? <button type="button" className="console-button console-button--secondary" onClick={() => void resumeRunNow()} disabled={starting}>恢复同一 Job →</button> : null}{canResumeScan ? <button type="button" className="console-button console-button--secondary" onClick={() => void resumeScanNow()} disabled={starting}>恢复站点浏览器会话 →</button> : null}</>}</div></section>
     {run ? <section className="console-panel"><div className="console-section-title"><div><h2>生产运行</h2><p>最近一次生产的实时进度与结构化事件（每 5 秒刷新）。</p></div></div><div className="plan-head"><div><span className="console-card-kicker">{run.run_id}</span><h3>{run.stage} · {run.status}</h3><p>{run.items_total ? `${run.items_done} / ${run.items_total}` : run.progress_note ?? "等待 Production Engine 输出…"}</p></div><span className={`console-status console-status--${run.status === "SUCCEEDED" ? "success" : run.status === "RUNNING" || providerSafetyBlocked ? "attention" : "danger"}`}><i />{run.status === "RUNNING" ? "生产中" : run.status === "SUCCEEDED" ? "完成" : providerSafetyBlocked ? "Ready Pool 已保存" : run.status === "BLOCKED" ? "流程已暂停" : "失败"}</span></div>{run.workspace ? <p className="console-footnote">工作区：<code>{run.workspace}</code></p> : null}{run.stdout_tail ? <details className="developer-details"><summary>运行日志（末尾）</summary><pre>{run.stdout_tail}</pre></details> : null}{run.error ? <div className={`console-alert ${providerSafetyBlocked ? "console-alert--attention" : "console-alert--danger"}`}><strong>{providerSafetyBlocked ? "下一步" : "失败原因"}</strong><span>{run.error}</span></div> : null}</section> : null}
     <div className="job-detail-grid"><section className="console-panel console-panel--wide"><div className="console-section-title"><div><h2>Pipeline Timeline</h2><p>线性流程：从站点扫描一路到交付，每一步顺序推进，不会跳步。</p></div></div><div className="stage-steps-wrap"><div className="stage-steps">{STAGES.map((stage, index) => { const done = index < currentStageIndex; const current = index === currentStageIndex; return <div className={`stage-step ${done ? "is-done" : current ? "is-current" : ""}`} key={stage.key}><span className="stage-step-dot">{done ? "✓" : index + 1}</span><div className="stage-step-body"><b>{stage.label}</b><small>{current ? job.last_reason ?? stage.detail : stage.detail}</small></div></div>; })}</div></div></section><section className="console-panel"><div className="console-section-title"><div><h2>当前状态与安全</h2><p>只显示可操作状态、证据结果和 reason code。</p></div></div><div className="job-policy-kv"><div><span>目标策略</span><strong>{job.target_mode} / {job.allocation_strategy}</strong></div><div><span>短缺策略</span><strong>{job.spillover}</strong></div><div><span>Provider</span><strong>{job.provider}</strong></div><div><span>Safety Gate</span><strong>{job.provider_safety}</strong></div><div><span>Site Scan</span><strong>{siteScan?.status ?? "—"}</strong></div><div><span>Ready Pool</span><strong>{String(job.counts.ready_count ?? candidatePool.target_count ?? 0)}</strong></div></div>{job.last_reason ? <div className={`console-alert ${providerSafetyBlocked ? "console-alert--attention" : job.status === "RUNNING" || job.status === "COMPLETED" ? "" : "console-alert--danger"}`}><strong>{providerSafetyBlocked ? "下一步" : job.current_stage}</strong><span>{job.last_reason}</span></div> : null}<details className="developer-details"><summary>查看 Job Policy / Candidate Pool 摘要</summary><pre>{JSON.stringify({ policy: job.policy, candidate_pool: candidatePool }, null, 2)}</pre></details></section></div>
     <section className="console-panel"><div className="console-section-title"><div><h2>最终命名与 Production Gate</h2><p>名称按整词治理，字符数包含空格；超过 50 个字符不能进入建模。</p></div></div>{candidateItems.length ? <div className="console-table-wrap"><table className="console-table"><thead><tr><th>最终名称</th><th>字符数</th><th>候选状态</th><th>媒体绑定</th><th>Review Provider</th><th>Gate</th><th>操作</th></tr></thead><tbody>{candidateItems.map((item) => <tr key={item.candidate_id ?? item.product_name}><td><strong>{item.product_name || "待命名"}</strong></td><td>{item.name_char_count ?? 0} / {item.name_limit ?? 50}</td><td>{item.state ?? "—"}</td><td>{item.media_binding_status ?? "—"}</td><td>{item.review_provider ?? "—"}</td><td><strong>{item.production_gate_status ?? "尚未评估"}</strong>{item.production_gate_reasons?.length ? <small>{item.production_gate_reasons.join("、")}</small> : null}</td><td>{item.candidate_id && item.state === "VISUAL_PENDING" && !item.review_provider ? <button type="button" className="console-row-action" onClick={() => void openLocalReview(item.candidate_id ?? "")} disabled={localReviewBusy}>{localReviewBusy ? "读取中…" : "本地复核"}</button> : "—"}</td></tr>)}</tbody></table></div> : <p className="console-empty-text">候选进入池后会在这里显示最终名称、字符数和 Gate 结果。</p>}

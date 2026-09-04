@@ -39,7 +39,9 @@ class Database:
         try:
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=FULL")
+            # WAL 模式下 NORMAL 依旧崩溃安全（最多丢失最近一次检查点，不损坏库），
+            # 但大幅降低每次提交的 fsync 开销，提升并发写入吞吐。
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA busy_timeout=30000")
         finally:
             cursor.close()
@@ -118,6 +120,12 @@ class Database:
                 text("INSERT OR IGNORE INTO schema_migrations(version) VALUES (:version)"),
                 {"version": self.SCHEMA_VERSION},
             )
+            # 高频查询索引：列表页按 updated_at 排序、详情页按 job 查事件/任务、
+            # Review 按 status 过滤。均为幂等 CREATE INDEX IF NOT EXISTS。
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_production_jobs_updated_at ON production_jobs (updated_at)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_production_job_events_job ON production_job_events (job_id, sequence)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_production_provider_tasks_job ON production_provider_tasks (job_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_review_queue_items_status ON review_queue_items (status)"))
 
     @staticmethod
     def _add_missing_columns(connection, table_name: str, definitions: dict[str, str]) -> None:

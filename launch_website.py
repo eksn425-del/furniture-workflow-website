@@ -114,11 +114,30 @@ def find_executable(*names: str) -> str | None:
 
 
 def check_port_free(port: int) -> bool:
+    """端口是否空闲：用 netstat 检查是否有进程在 LISTENING。
+
+    不能用 HTTP 探测：后端 API 的根路径 ``/`` 返回 404（无根路由），会被误判为
+    端口空闲，导致重复启动第二个 API、绑定 8000 失败。这里直接查 TCP 监听态。
+    """
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1.5):
-            return False  # 已有服务在响应
-    except Exception:
-        return True
+        out = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True, errors="replace", timeout=5, check=False,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        # 无法查询时退回 HTTP 探测（只作为兜底）
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1.5):
+                return False
+        except Exception:
+            return True
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "TCP":
+            local = parts[1]
+            state = parts[-1]
+            if state == "LISTENING" and local.endswith(f":{port}"):
+                return False
+    return True
 
 
 def wait_for(url: str, timeout: float = 90.0, label: str = "") -> bool:

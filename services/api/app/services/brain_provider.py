@@ -5,7 +5,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, Callable, TypeVar
 
 import requests
 from pydantic import BaseModel, ValidationError
@@ -54,10 +54,13 @@ class BrainSettings:
     base_url: str = ""
     model: str = ""
     timeout_seconds: float = 25.0
+    connect_timeout_seconds: float = 5.0
     max_retries: int = 2
     rpm_limit: int = 30
     model_mode: str = "TEXT_BRAIN_PLUS_VISION"
     local_agent_override: bool = False
+    agent_enabled: bool = True
+    agent_max_steps: int = 6
     mode_source: str = "explicit"
 
     @classmethod
@@ -88,10 +91,13 @@ class BrainSettings:
             base_url=os.getenv("WEBSITE_BRAIN_BASE_URL", "").strip().rstrip("/"),
             model=os.getenv("WEBSITE_BRAIN_MODEL", "").strip(),
             timeout_seconds=max(1.0, min(float(os.getenv("WEBSITE_BRAIN_TIMEOUT_SECONDS", "25")), 120.0)),
+            connect_timeout_seconds=max(1.0, min(float(os.getenv("WEBSITE_BRAIN_CONNECT_TIMEOUT_SECONDS", "5")), 30.0)),
             max_retries=max(0, min(int(os.getenv("WEBSITE_BRAIN_MAX_RETRIES", "2")), 3)),
             rpm_limit=max(1, min(int(os.getenv("WEBSITE_BRAIN_RPM_LIMIT", "30")), 600)),
             model_mode=normalized_mode,
             local_agent_override=requested_mode,
+            agent_enabled=os.getenv("WEBSITE_BRAIN_AGENT_ENABLED", "true").strip().casefold() not in {"0", "false", "off", "no"},
+            agent_max_steps=max(1, min(int(os.getenv("WEBSITE_BRAIN_AGENT_MAX_STEPS", "6")), 20)),
             mode_source=mode_source,
         )
 
@@ -116,6 +122,7 @@ class VisionSettings:
     base_url: str = ""
     model: str = ""
     timeout_seconds: float = 25.0
+    connect_timeout_seconds: float = 5.0
     max_retries: int = 2
     rpm_limit: int = 30
 
@@ -126,6 +133,7 @@ class VisionSettings:
             base_url=os.getenv("WEBSITE_VISION_BASE_URL", "").strip().rstrip("/"),
             model=os.getenv("WEBSITE_VISION_MODEL", "").strip(),
             timeout_seconds=max(1.0, min(float(os.getenv("WEBSITE_VISION_TIMEOUT_SECONDS", "25")), 120.0)),
+            connect_timeout_seconds=max(1.0, min(float(os.getenv("WEBSITE_VISION_CONNECT_TIMEOUT_SECONDS", "5")), 30.0)),
             max_retries=max(0, min(int(os.getenv("WEBSITE_VISION_MAX_RETRIES", "2")), 3)),
             rpm_limit=max(1, min(int(os.getenv("WEBSITE_VISION_RPM_LIMIT", "30")), 600)),
         )
@@ -136,6 +144,37 @@ class VisionSettings:
 
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class AgentToolError(RuntimeError):
+    """Raised by a tool executor to terminate an agent loop (e.g. budget/access).
+
+    Terminating on this error is intentional: the loop must not keep spending
+    Brain turns after a compliance gate (robots/access/budget) is tripped.
+    """
+
+    def __init__(self, code: str, message: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True, slots=True)
+class AgentLoopOptions:
+    max_steps: int = 6
+    max_tool_calls: int = 16
+    response_schema: type[BaseModel] | None = None
+    finish_tool_name: str = "finish"
+    temperature: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class AgentLoopResult:
+    validated: BaseModel | None
+    turns: int
+    tool_calls: list[dict[str, object]]
+    provider_posts: int
+    stopped_reason: str  # FINISH / SCHEMA / MAX_STEPS / BUDGET / TERMINAL_TOOL / BRAIN_NOT_CONFIGURED / BRAIN_ERROR
 
 
 class WebsiteBrainProvider:
@@ -209,9 +248,16 @@ class WebsiteBrainProvider:
 
     def reason_taxonomy(self, *, source_url: str, evidence: dict[str, object]) -> tuple[BrainTaxonomyResponse, dict[str, object]]:
         prompt = (
-            "Classify ambiguous public e-commerce navigation into a conservative furniture taxonomy. "
-            "Return JSON only. Never invent counts: use UNKNOWN unless the supplied evidence contains a direct count. "
-            "Preserve source URLs and explain each merge."
+            "Classify the supplied public e-commerce navigation into a clean two-level furniture taxonomy "
+            "(level=1 departments like Seating/Tables/Beds/Rugs, level=2 their child categories like Chairs/Sofas). "
+            "Use evidence.navigation_items (each has path, label, count) as the primary source: infer department->category "
+            "relationships even when the site renders them as a flat list, and group flat sibling categories under a "
+            "sensible department. When evidence.navigation_tree with explicit nesting is present, treat its top-level "
+            "entries as level-1 departments and their children as level-2. A label ending in a number (e.g. \"CHAIRS 33\") "
+            "is a direct count of 33; otherwise use UNKNOWN unless evidence.navigation_items gives a direct count. "
+            "Never invent counts. Return JSON only with "
+            "categories[{path, source_url, native_name, canonical_name, count_value, count_kind, level, parent_path}] "
+            "and short reasoning."
         )
         response, metadata = self.reason(
             prompt=prompt,
@@ -282,6 +328,7 @@ class WebsiteBrainProvider:
                     base_url=self.vision_settings.base_url,
                     model=self.vision_settings.model,
                     timeout_seconds=self.vision_settings.timeout_seconds,
+                    connect_timeout_seconds=self.vision_settings.connect_timeout_seconds,
                     max_retries=self.vision_settings.max_retries,
                     rpm_limit=self.vision_settings.rpm_limit,
                     model_mode="MULTIMODAL_SINGLE_MODEL",
@@ -368,12 +415,51 @@ class WebsiteBrainProvider:
         media_sha256 = str(evidence.get("media_sha256") or "").strip().casefold()
         if visual_request and (not visual_url or not media_sha256):
             raise VisionInputRequired("MULTIMODAL_SINGLE_MODEL requires image_url and media_sha256")
-        request_body = {
+        message, metadata = self._chat_once(
+            messages=self._messages(prompt, input_payload),
+            response_format={"type": "json_object"},
+            input_payload=input_payload,
+        )
+        try:
+            content = message.get("content")
+            parsed = self._parse_json(content)
+            validated = schema.model_validate(parsed)
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError, ValidationError) as error:
+            raise BrainInvalidSchema("Website Brain response did not match the required JSON schema") from error
+        if visual_request:
+            metadata.update({
+                "vision_input": "IMAGE_URL",
+                "visual_input_included": True,
+                "reviewed_media_sha256": media_sha256,
+            })
+        return validated, metadata
+
+    def _chat_once(
+        self,
+        *,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+        response_format: dict[str, object] | None = None,
+        input_payload: dict[str, object] | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Single OpenAI-compatible chat completion. Returns (message, metadata).
+
+        Shared by `reason()` (one-shot JSON) and the agent loop (multi-turn
+        tool calling). Handles rate limiting, retries, backoff and receipt
+        metadata once, so the agent loop does not duplicate that bookkeeping.
+        """
+        if not self.settings.configured:
+            raise BrainNotConfigured("WEBSITE_BRAIN_API_KEY/BASE_URL/MODEL are required")
+        request_body: dict[str, object] = {
             "model": self.settings.model,
             "temperature": 0,
-            "messages": self._messages(prompt, input_payload),
-            "response_format": {"type": "json_object"},
+            "messages": messages,
         }
+        if tools:
+            request_body["tools"] = tools
+            request_body["tool_choice"] = "auto"
+        if response_format:
+            request_body["response_format"] = response_format
         endpoint = self.settings.base_url
         if not endpoint.endswith("/chat/completions"):
             endpoint = f"{endpoint}/chat/completions"
@@ -383,7 +469,7 @@ class WebsiteBrainProvider:
             self._respect_rate_limit()
             try:
                 self.post_count += 1
-                response = self.session.post(endpoint, json=request_body, headers=headers, timeout=self.settings.timeout_seconds)
+                response = self.session.post(endpoint, json=request_body, headers=headers, timeout=(self.settings.connect_timeout_seconds, self.settings.timeout_seconds))
             except requests.Timeout as error:
                 last_error = BrainTimeout("Website Brain request timed out")
                 if attempt >= self.settings.max_retries:
@@ -410,28 +496,124 @@ class WebsiteBrainProvider:
                 raise BrainRequestFailed(f"Website Brain returned HTTP {response.status_code}")
             try:
                 payload = response.json()
-                content = payload["choices"][0]["message"]["content"]
-                parsed = self._parse_json(content)
-                validated = schema.model_validate(parsed)
-            except (ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError, ValidationError) as error:
-                raise BrainInvalidSchema("Website Brain response did not match the required JSON schema") from error
+                message = payload["choices"][0]["message"]
+            except (ValueError, KeyError, IndexError, TypeError) as error:
+                raise BrainInvalidSchema("Website Brain response was not a valid chat completion") from error
             metadata = {
                 "status": "READY",
                 "review_provider": self.review_provider,
                 "model_mode": self.settings.model_mode,
                 "model": self.settings.model,
                 "attempt": attempt + 1,
-                "input_hash": hashlib.sha256(json.dumps(input_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
                 "provider_posts": self.post_count,
             }
-            if visual_request:
-                metadata.update({
-                    "vision_input": "IMAGE_URL",
-                    "visual_input_included": True,
-                    "reviewed_media_sha256": media_sha256,
-                })
-            return validated, metadata
+            if input_payload is not None:
+                metadata["input_hash"] = hashlib.sha256(json.dumps(input_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+            return message, metadata
         raise last_error or BrainRequestFailed("Website Brain request failed")
+
+    def run_agent_loop(
+        self,
+        *,
+        system_prompt: str,
+        input_payload: dict[str, object],
+        tools: list[dict[str, object]],
+        tool_executor: Callable[[str, dict[str, object]], dict[str, object]],
+        options: AgentLoopOptions | None = None,
+    ) -> AgentLoopResult:
+        """Multi-turn ReAct loop driving the Brain through `tools`.
+
+        The Brain only *decides*; `tool_executor(name, args)` executes each tool
+        and must respect the compliance gates (robots/access/budget). The loop
+        stops on: a `finish` tool whose payload validates against
+        `response_schema`, a content-only response that validates, the step
+        budget, an `AgentToolError`, or a Brain failure (fall back to rules).
+        """
+        options = options or AgentLoopOptions()
+        if (
+            self.settings.local_agent_mode
+            or not self.settings.configured
+            or not self.settings.agent_enabled
+        ):
+            return AgentLoopResult(None, 0, [], self.post_count, "BRAIN_NOT_CONFIGURED")
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(input_payload, ensure_ascii=False, sort_keys=True)},
+        ]
+        tool_calls_log: list[dict[str, object]] = []
+        turns = 0
+        tool_budget = options.max_tool_calls
+        while turns < options.max_steps and tool_budget > 0:
+            turns += 1
+            try:
+                message, _ = self._chat_once(messages=messages, tools=tools, input_payload=input_payload)
+            except BrainNotConfigured:
+                return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BRAIN_NOT_CONFIGURED")
+            except BrainError:
+                return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BRAIN_ERROR")
+            calls = message.get("tool_calls") or []
+            if calls:
+                for tc in calls:
+                    fn = tc.get("function") or {}
+                    name = str(fn.get("name") or "")
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                        args = args if isinstance(args, dict) else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                    if name == options.finish_tool_name:
+                        validated = self._finish_payload(args, options.response_schema)
+                        return AgentLoopResult(validated, turns, tool_calls_log, self.post_count, "FINISH" if validated is not None else "SCHEMA")
+                    if tool_budget <= 0:
+                        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BUDGET")
+                    tool_budget -= 1
+                    try:
+                        result = tool_executor(name, args)
+                        result_status = "OK"
+                        content = json.dumps(result, ensure_ascii=False, default=str)
+                    except AgentToolError as err:
+                        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "TERMINAL_TOOL")
+                    except Exception as exc:  # noqa: BLE001 - executor bugs must not kill the scan
+                        result_status = "EXEC_ERROR"
+                        content = json.dumps({"error": "EXEC_ERROR", "message": str(exc)[:300]}, ensure_ascii=False, default=str)
+                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": content})
+                    tool_calls_log.append({"name": name, "arguments": args, "result_status": result_status})
+                continue
+            # No tool calls: model answered directly. Validate content as the schema if possible.
+            content = message.get("content")
+            if options.response_schema is not None and content:
+                validated = self._finish_payload(
+                    {"_content": content}, options.response_schema, from_content=True
+                )
+                if validated is not None:
+                    return AgentLoopResult(validated, turns, tool_calls_log, self.post_count, "SCHEMA")
+            return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "MAX_STEPS" if turns >= options.max_steps else "STOPPED")
+        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BUDGET" if tool_budget <= 0 else "MAX_STEPS")
+
+    @staticmethod
+    def _finish_payload(args: dict[str, object], schema: type[BaseModel] | None, *, from_content: bool = False) -> BaseModel | None:
+        """Validate a `finish` payload (or a content-only answer) against schema."""
+        if schema is None:
+            return None
+        candidates: list[object] = []
+        if from_content:
+            try:
+                candidates.append(WebsiteBrainProvider._parse_json(args.get("_content")))
+            except (ValueError, json.JSONDecodeError):
+                return None
+        else:
+            candidates.append(args)
+            nested = args.get("taxonomy") or args.get("report") or args.get("result")
+            if isinstance(nested, dict):
+                candidates.append(nested)
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                try:
+                    return schema.model_validate(candidate)
+                except ValidationError:
+                    continue
+        return None
 
     @staticmethod
     def _evidence(input_payload: dict[str, object]) -> dict[str, object]:
@@ -532,6 +714,7 @@ class WebsiteBrainProvider:
 
 __all__ = [
     "MODEL_MODES",
+    "AgentLoopOptions", "AgentLoopResult", "AgentToolError",
     "BrainAccessDecision", "BrainError", "BrainInvalidSchema", "BrainNotConfigured", "BrainRateLimited",
     "BrainRequestFailed", "BrainSettings", "BrainTimeout", "VisionInputRequired",
     "VisionProviderNotConfigured", "VisionSettings", "WebsiteBrainProvider",

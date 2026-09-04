@@ -7,9 +7,12 @@ import json
 import os
 import re
 import shutil
+import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -39,7 +42,7 @@ from furniture_workflow_engine import (
 )
 from packages.workflow_core.candidate_pool import CandidatePoolStore, CandidateRecord, TERMINAL_ITEM_STATES
 from packages.workflow_core.dimensions import govern_dimensions, round_dimension
-from packages.workflow_core.locks import make_order_policy_lock, provider_idempotency_key, stable_hash
+from packages.workflow_core.locks import QuotaValidationError, make_order_policy_lock, provider_idempotency_key, stable_hash
 from packages.workflow_core.naming import (
     NamingReviewRequired,
     compose_brand_official_name,
@@ -70,6 +73,13 @@ _L2_HUMAN_REQUIRED_REASONS = frozenset({
     "DIMENSIONS_BROWSER_HUMAN_REQUIRED",
 })
 
+# 目标数量/配额校验失败的可见中文说明（reason_code 仍保留为具体英文码）。
+_TARGET_POLICY_MESSAGES: dict[str, str] = {
+    "CATEGORY_COUNTS_REQUIRED_FOR_PROPORTIONAL": "按比例分配需要每个已选类目都有可用的商品数量，数量为 UNKNOWN 的类目无法按比例分配。请补全该类目数量，或改用其他分配策略。",
+    "CUSTOM_CATEGORY_QUOTAS_REQUIRED_BY_SCOPE_ID": "自定义配额必须与已选类目一一对应：每个已选类目都要有配额，不能多也不能少。",
+    "CUSTOM_CATEGORY_QUOTAS_MUST_SUM_TO_TARGET": "自定义配额合计必须等于目标数量，当前不一致，任务无法启动。",
+}
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -78,6 +88,32 @@ def _json(value: Any) -> str:
 def _safe_name(value: str) -> str:
     text = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", " ", str(value or ""))
     return re.sub(r"\s+", " ", text).strip(" .")[:140]
+
+
+def _official_name_from_slug(canonical_url: str, source_name: str) -> str:
+    """从描述性 URL slug 派生更完整的官方商品名。
+
+    部分品牌站（如 Interiordefine）的结构化 name（JSON-LD / GraphQL）只给
+    系列/品牌短词（如 "Cyrus"），完整官方名反而在 URL slug 里
+    （cyrus-custom-upholstered-left-facing-3-seat-chaise-sectional）。
+    当 slug 明显更长且是描述性文案时，优先采用 slug 派生的官方名；
+    否则回退到 source_name，避免把纯 ID slug 误当成名字。
+    """
+    try:
+        slug = urlsplit(str(canonical_url or "")).path.rstrip("/").rsplit("/", 1)[-1]
+    except Exception:
+        return source_name
+    if not slug or len(slug) <= len(source_name):
+        return source_name
+    words = [w for w in slug.replace("-", " ").split() if w]
+    if len(words) < 2:
+        return source_name
+    # slug 必须是描述性文案（含字母词），而不是 "p123" / "item-42" 这类 ID。
+    if not any(len(w) > 1 and any(ch.isalpha() for ch in w) for w in words[1:]):
+        return source_name
+    cleaned = " ".join(w if w.isdigit() else (w[0].upper() + w[1:]) for w in words)
+    return cleaned
+
 
 
 def _distribute_evenly(total: int, groups: list[str]) -> dict[str, int]:
@@ -426,7 +462,11 @@ class WebsiteStageAdapter:
         if error:
             return StageOutcome(StageDecision.PENDING, error)
         assert decision is not None
-        accepted = all(bool(decision.get(key)) for key in ("eligible", "single_product", "background_ok", "image_to_3d_suitable"))
+        # 采纳用户筛选策略：只要主体是一个清晰独立的家具产品（eligible + single_product）即放行。
+        # background_ok=False（产品为生活场景/摆场照片）与 image_to_3d_suitable=False
+        # （多因官网无官方尺寸 NO_OFFICIAL_DIMENSIONS）均不构成硬性拒绝：
+        # 前者对应「单主体带道具/摆场」仍可建模；后者由后续 DIMENSION 阶段用 AI 预估尺寸兜底。
+        accepted = bool(decision.get("eligible")) and bool(decision.get("single_product"))
         if not accepted:
             codes = ",".join(str(value) for value in decision.get("reason_codes") or [])
             self.pool.enrich_candidate(candidate.candidate_id, lineage={
@@ -500,6 +540,36 @@ class WebsiteStageAdapter:
     def _stage_date(self, candidate: CandidateRecord) -> StageOutcome:
         return StageOutcome(StageDecision.ACCEPTED, "DATE_POLICY_NOT_RESTRICTED", {"date_policy": "SOURCE_CURRENT_PUBLIC_CATALOG"})
 
+    def _extract_dimensions_bounded(self, url: str, session_dir: Path, timeout: float = 60.0) -> tuple[dict[str, float], str]:
+        """带硬超时的官网尺寸提取。
+
+        Playwright 同步事件循环在个别站点（导航/加载事件永不返回）可能永久阻塞，
+        即使设了 navigation_timeout 也无法中断，导致 worker 卡死在 DIMENSION 阶段、
+        无终态事件。这里用 daemon 线程 + join(timeout) 强制返回：超时即抛
+        BrowserTemporaryFailure 让上层写出可恢复的暂停事件，而不是永久卡死。
+        """
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                box["result"] = NativeBrowserCollector(session_dir).extract_dimensions(url)
+            except Exception as exc:  # noqa: BLE001 - 需要原样回传任何异常
+                box["error"] = exc
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            raise BrowserTemporaryFailure(
+                "尺寸提取超时：L2 浏览器阻塞（Playwright 导航/加载事件未返回），已跳过该候选的官方尺寸读取",
+                url=url,
+                session_dir=session_dir,
+                reason_code="DIMENSION_L2_TIMEOUT",
+            )
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
     def _stage_dimension(self, candidate: CandidateRecord) -> StageOutcome:
         axes = ("width", "depth", "height")
         values = candidate.lineage.get("source_dimensions") or {}
@@ -517,46 +587,57 @@ class WebsiteStageAdapter:
         if all(values.get(axis) for axis in axes):
             source = source or "OFFICIAL_PAGE"
         else:
-            # L1/HTML evidence may omit an accordion's Dimensions block.  Give
-            # the same bounded L2 session one chance to obtain official values
-            # before accepting any Brain estimate. A visible challenge is not
-            # evidence that the official dimensions are absent: keep the
-            # candidate resumable instead of silently converting an access
-            # failure into AI_ESTIMATED dimensions.
-            browser_dims: dict[str, float] = {}
-            browser_unit = ""
-            try:
-                session_dir = Path(str(self.acquisition.browser_session_dir))
-                browser_dims, browser_unit = NativeBrowserCollector(session_dir).extract_dimensions(str(candidate.canonical_url))
-            except BrowserHumanRequired as error:
-                return StageOutcome(
-                    StageDecision.PENDING,
-                    "DIMENSIONS_BROWSER_HUMAN_REQUIRED",
-                    {
-                        "dimension_access_status": "HUMAN_REQUIRED",
+            # L1/HTML evidence 没有三轴官方尺寸。若 Brain 复核阶段已给出
+            # AI 预估高度（官网确实无官方尺寸），直接采用并跳过 L2 浏览器——
+            # 部分站点（如 Interiordefine）的尺寸页读取会永久阻塞 Playwright，
+            # 导致 worker 卡死、任务失败。有可用的 AI 预估高度时不再为读官网
+            # 尺寸而启动浏览器。
+            decision = candidate.lineage.get("brain_product_decision") or {}
+            est_source = str(decision.get("dimension_source") or "").upper()
+            ai_height = decision.get("height") if est_source == "AI_ESTIMATED" else None
+            if not any(values.get(axis) for axis in axes) and ai_height:
+                values = {"width": None, "depth": None, "height": float(ai_height)}
+                source = "AI_ESTIMATED"
+                candidate.lineage["dimension_source_detail"] = "AI_HEIGHT_ESTIMATE"
+                candidate.lineage["dimension_estimation"] = True
+                unit = str(decision.get("dimension_unit") or "in").strip().casefold()
+                candidate.lineage["dimension_unit"] = unit if unit in _SUPPORTED_DIMENSION_UNITS else "in"
+            else:
+                # 官网可能有尺寸但 L1 未抓到：用有界超时尝试 L2 读取官方尺寸。
+                browser_dims: dict[str, float] = {}
+                browser_unit = ""
+                try:
+                    session_dir = Path(str(self.acquisition.browser_session_dir))
+                    browser_dims, browser_unit = self._extract_dimensions_bounded(str(candidate.canonical_url), session_dir)
+                except BrowserHumanRequired as error:
+                    return StageOutcome(
+                        StageDecision.PENDING,
+                        "DIMENSIONS_BROWSER_HUMAN_REQUIRED",
+                        {
+                            "dimension_access_status": "HUMAN_REQUIRED",
+                            "dimension_access_reason": error.reason_code,
+                            "dimension_access_url": error.url,
+                        },
+                    )
+                except BrowserTemporaryFailure as error:
+                    return StageOutcome(StageDecision.PENDING, error.reason_code, {
+                        "dimension_access_status": "TEMPORARY_FAILURE",
                         "dimension_access_reason": error.reason_code,
                         "dimension_access_url": error.url,
-                    },
-                )
-            except BrowserTemporaryFailure as error:
-                return StageOutcome(StageDecision.PENDING, error.reason_code, {
-                    "dimension_access_status": "TEMPORARY_FAILURE",
-                    "dimension_access_reason": error.reason_code,
-                    "dimension_access_url": error.url,
-                })
-            except BrowserAccessDenied as error:
-                return StageOutcome(StageDecision.PENDING, error.code, {
-                    "dimension_access_status": "ACCESS_CHANGE_REQUIRED",
-                    "dimension_access_reason": error.reason_code,
-                    "dimension_access_url": error.url,
-                })
-            except BrowserRuntimeMissing:
-                raise
-            if all(browser_dims.get(axis) for axis in axes):
-                values = {axis: browser_dims[axis] for axis in axes}
-                source = "OFFICIAL_PAGE"
-                candidate.lineage["dimension_source_detail"] = "L2_BROWSER_DIMENSIONS_TAB"
-                candidate.lineage["dimension_unit"] = browser_unit or candidate.lineage.get("dimension_unit") or "source_unit"
+                    })
+                except BrowserAccessDenied as error:
+                    return StageOutcome(StageDecision.PENDING, error.code, {
+                        "dimension_access_status": "ACCESS_CHANGE_REQUIRED",
+                        "dimension_access_reason": error.reason_code,
+                        "dimension_access_url": error.url,
+                    })
+                except BrowserRuntimeMissing:
+                    raise
+                if all(browser_dims.get(axis) for axis in axes):
+                    values = {axis: browser_dims[axis] for axis in axes}
+                    source = "OFFICIAL_PAGE"
+                    candidate.lineage["dimension_source_detail"] = "L2_BROWSER_DIMENSIONS_TAB"
+                    candidate.lineage["dimension_unit"] = browser_unit or candidate.lineage.get("dimension_unit") or "source_unit"
 
         if not all(values.get(axis) for axis in axes):
             decision = candidate.lineage.get("brain_product_decision") or {}
@@ -614,6 +695,9 @@ class WebsiteStageAdapter:
         decision = candidate.lineage.get("brain_product_decision") or {}
         reliable = len(source_name) >= 3 and source_name.casefold() not in {"product", "item", "untitled"}
         decision_source = "SOURCE_NAME_FIRST"
+        # 从 URL slug 派生的完整官方名应尽量保留原样（不被 50 字符强制截断成
+        # 语义残缺的名字）；仅对这类"裸品牌短词 → slug 官方名"的产物放宽长度。
+        preserve_official_name = False
 
         # 品牌库（界面标记 / 配置登记）：品牌前缀 + 官方名 + 四段式（风格/颜色/材质/类型）。
         if bool(self.contract.get("is_brand_library")):
@@ -674,10 +758,30 @@ class WebsiteStageAdapter:
                 return StageOutcome(StageDecision.REJECTED, f"NAMING_REVIEW:{error}")
         else:
             governed_name = source_name
-            if reliable and source_type == "DIRECT_BRAND" and site_brand and not source_name.casefold().startswith(site_brand.casefold()):
-                governed_name = f"{site_brand} {source_name}"
+            if reliable and source_type == "DIRECT_BRAND" and site_brand:
+                # 品牌直营站（如 Interior Define）：走文档标准
+                # 「官方名 + 品牌前缀 + 校验类型」，而不是把采集标题原样照抄。
+                try:
+                    governed_name = compose_official_name(
+                        source_name=source_name,
+                        verified_type=decision.get("product_type") or candidate.lineage.get("visual_product_type") or source_name,
+                        brand=site_brand,
+                    )
+                    decision_source = "DIRECT_BRAND_OFFICIAL"
+                except NamingReviewRequired as error:
+                    return StageOutcome(StageDecision.REJECTED, f"NAMING_REVIEW:{error}")
             elif reliable and source_type in {"MULTI_BRAND_RETAILER", "MULTI_CATEGORY_RETAILER"} and source_brand and not source_name.casefold().startswith(source_brand.casefold()):
                 governed_name = f"{source_brand} {source_name}"
+            # 品牌直营已用 compose_official_name 补全类型，不再套用 slug 派生，
+            # 避免覆盖掉「品牌 + 官方名 + 类型」的标准结构。
+            if reliable and source_type != "DIRECT_BRAND" and len(source_name.split()) <= 1:
+                # 结构化 name 只给了品牌/系列短词（如 Interiordefine 的 "Cyrus"），
+                # 完整官方名在 URL slug 里；优先从 slug 派生，避免交付"裸品牌名"。
+                slug_name = _official_name_from_slug(candidate.canonical_url, source_name)
+                if slug_name != source_name:
+                    governed_name = slug_name
+                    decision_source = "OFFICIAL_NAME_FROM_URL_SLUG"
+                    preserve_official_name = True
             if not reliable:
                 try:
                     governed_name = compose_product_name(
@@ -692,16 +796,20 @@ class WebsiteStageAdapter:
                     decision_source = "GOVERNED_FALLBACK"
                 except NamingReviewRequired as error:
                     return StageOutcome(StageDecision.REJECTED, f"NAMING_REVIEW:{error}")
+        # 从 slug 派生的官方名保留原样（可超过 50，但仍是完整官方名）；
+        # 其余名称维持 50 字符的正式上限。
+        name_limit = 140 if preserve_official_name else 50
         try:
             governed_name = shorten_name_to_limit(
                 governed_name,
+                max_chars=name_limit,
                 required_prefix=site_brand if self.source_policy.is_brand_direct else "",
                 required_type=decision.get("product_type") or candidate.lineage.get("visual_product_type") or "",
                 removable_phrases=("New", "Exclusive", "Collection", "Premium", "Signature", "Limited Edition"),
             )
         except NamingReviewRequired as error:
             return StageOutcome(StageDecision.REJECTED, f"NAMING_REVIEW:{error}")
-        if len(governed_name) > 50:
+        if len(governed_name) > name_limit:
             return StageOutcome(StageDecision.REJECTED, "NAMING_REVIEW:product_name_exceeds_50_characters")
         self.pool.enrich_candidate(candidate.candidate_id, product_name=governed_name, lineage={
             "governed_name": governed_name,
@@ -713,13 +821,13 @@ class WebsiteStageAdapter:
             "route_category_authority": self.source_policy.category_authority,
             "type_authority": self.source_policy.type_authority,
             "final_name_char_count": len(governed_name),
-            "final_name_limit": 50,
+            "final_name_limit": name_limit,
         })
         return StageOutcome(StageDecision.ACCEPTED, "NAMING_READY", {
             "product_name": governed_name,
             "decision_source": decision_source,
             "final_name_char_count": len(governed_name),
-            "final_name_limit": 50,
+            "final_name_limit": name_limit,
         })
 
     def _stage_catalog(self, candidate: CandidateRecord) -> StageOutcome:
@@ -815,8 +923,9 @@ class WebsiteStageAdapter:
         plan = self.contract.get("approved_plan")
         raw = plan.get("approved_provider_call_limit") if isinstance(plan, dict) else None
         if raw in (None, ""):
-            # Backward-compatible safe default for pre-hardening Exact-N Jobs.
-            raw = self.contract.get("target_value")
+            # 未显式设限时按不设上限处理（取 schema 允许的最大值），
+            # 避免测试期因默认按目标数设限、把失败/进行中的调用也算进去而提前阻塞。
+            raw = 5000
         try:
             return max(0, int(raw or 0))
         except (TypeError, ValueError):
@@ -824,11 +933,15 @@ class WebsiteStageAdapter:
 
     @staticmethod
     def _provider_slot_reserved(ledger: ProductionProviderTask) -> bool:
-        return bool(
-            ledger.provider_task_id
-            or ledger.status in {"CREATE_IN_FLIGHT", "SUBMISSION_UNKNOWN"}
-            or ledger.checkpoint_state in {"CREATE_IN_FLIGHT", "SUBMISSION_UNKNOWN"}
-        )
+        # 只有真正可能产生计费调用的在途/未知账本占用额度；终态非计费账本
+        # （FAILED / REJECTED / DOWNLOAD_FAILED 等）不再计入 reserved，否则
+        # 积压的失败候选会把 approved_provider_call_limit 提前烧光，
+        # 触发无谓的 PROVIDER_CALL_LIMIT_REACHED 提前阻断。
+        if ledger.status in {"ACTIVE", "CREATE_IN_FLIGHT", "SUBMISSION_UNKNOWN"}:
+            return True
+        if ledger.checkpoint_state in {"ACTIVE", "CREATE_IN_FLIGHT", "SUBMISSION_UNKNOWN"}:
+            return True
+        return False
 
     def _stage_submit(self, candidate: CandidateRecord) -> StageOutcome:
         provider = str(self.contract.get("provider") or "OFF").casefold()
@@ -907,11 +1020,30 @@ class WebsiteStageAdapter:
                 ledger.error_message = str(error or "")[:1000]
                 session.commit()
                 return StageOutcome(StageDecision.PENDING, "Provider capacity wait; no task ID was created")
+            error_text = str(error or "")
+            if error_text.startswith("create_rejected"):
+                # Provider 明确拒绝（无计费，例如图片未通过校验）。这不是计费结果未知，
+                # 不应 HARD_STOP 整个任务：把该候选标记为 REJECTED 释放保留槽，
+                # 其余候选继续推进。
+                ledger.status = ledger.checkpoint_state = "FAILED"
+                ledger.error_code = "PROVIDER_REJECTED"
+                ledger.error_message = error_text[:1000]
+                session.commit()
+                return StageOutcome(StageDecision.REJECTED, "PROVIDER_REJECTED", {"error": error_text[:300]})
+            if error_text.startswith("create_http_error") and os.getenv("WEBSITE_PROVIDER_RETRY_AMBIGUOUS_CREATE", "").strip().casefold() in {"1", "true", "yes"}:
+                # 门控（默认关闭）：同一 Idempotency-Key 有界重试一次网络类歧义。
+                # 默认行为仍走下方 SUBMISSION_UNKNOWN 人工门，绝不自动重复计费。
+                if ledger.post_attempts < 2:
+                    ledger.status = ledger.checkpoint_state = "SUBMISSION_UNKNOWN"
+                    ledger.error_code = "SUBMISSION_UNKNOWN_RETRY"
+                    ledger.error_message = error_text[:1000]
+                    session.commit()
+                    return StageOutcome(StageDecision.PENDING, "Provider create network ambiguity; one bounded retry with the same idempotency key")
             ledger.status = ledger.checkpoint_state = "SUBMISSION_UNKNOWN"
             ledger.error_code = "SUBMISSION_UNKNOWN"
-            ledger.error_message = str(error or "create returned no trustworthy task ID")[:1000]
+            ledger.error_message = error_text or "create returned no trustworthy task ID"
             session.commit()
-            return StageOutcome(StageDecision.HARD_STOP, "SUBMISSION_UNKNOWN: Provider create outcome is ambiguous")
+            return StageOutcome(StageDecision.HARD_STOP, "SUBMISSION_UNKNOWN: Provider create outcome is ambiguous", {"ledger_id": ledger.ledger_id, "candidate_id": candidate.candidate_id, "error": error_text[:300]})
         finally:
             session.close()
 
@@ -1200,27 +1332,47 @@ class ProductionPipeline:
             self.emit("JOB_BLOCKED", "DISCOVERY", str(error), 0, int(self.contract.get("target_value") or 0), {"blocker": reason, "reason_code": reason, "browser_escalation": False})
             return 2
         except ProductAcquisitionError as error:
-            reason = str(error).strip() if str(error).strip().isupper() else error.code
-            self.emit("JOB_BLOCKED", "DISCOVERY", str(error), 0, 0, {"blocker": reason, "reason_code": reason})
+            raw = str(error).strip()
+            reason = raw if raw.isupper() else error.code
+            message = _TARGET_POLICY_MESSAGES.get(raw, raw)
+            self.emit("JOB_BLOCKED", "DISCOVERY", message, 0, 0, {"blocker": reason, "reason_code": reason})
             return 2
-        policy_lock = make_order_policy_lock(
-            source=str(self.contract.get("site_key") or "Website"),
-            categories=quotas,
-            exact_n=target,
-            provider=str(self.contract.get("provider") or "OFF"),
-            ruleset="website-production-20260826",
-            image_policy=self.source_policy.media_policy,
-            five_year_policy="source-current-public-catalog",
-            naming_policy=f"{self.source_policy.naming_contract_version}:{self.source_policy.type_authority}",
-            dimension_policy="source-explicit-or-l2-browser-or-review",
-            registry_identity="production_registry_entries",
-            registry_version="v1",
-            authorization_mode="COST_CEILING",
-            quality_policy="validated-raw-glb",
-            category_quota_mode=quota_mode,
-            policy_revision="20260826.1",
-            allowed_product_scope=str(self.contract.get("scope") or "NEW_ONLY"),
-        )
+        try:
+            policy_lock = make_order_policy_lock(
+                source=str(self.contract.get("site_key") or "Website"),
+                categories=quotas,
+                exact_n=target,
+                provider=str(self.contract.get("provider") or "OFF"),
+                ruleset="website-production-20260826",
+                image_policy=self.source_policy.media_policy,
+                five_year_policy="source-current-public-catalog",
+                naming_policy=f"{self.source_policy.naming_contract_version}:{self.source_policy.type_authority}",
+                dimension_policy="source-explicit-or-l2-browser-or-review",
+                registry_identity="production_registry_entries",
+                registry_version="v1",
+                authorization_mode="COST_CEILING",
+                quality_policy="validated-raw-glb",
+                category_quota_mode=quota_mode,
+                policy_revision="20260826.1",
+                allowed_product_scope=str(self.contract.get("scope") or "NEW_ONLY"),
+            )
+        except QuotaValidationError as error:
+            details = error.details or {}
+            self.emit(
+                "JOB_BLOCKED",
+                "TARGET_POLICY",
+                str(error),
+                0,
+                int(self.contract.get("target_value") or 0),
+                {
+                    "blocker": error.code,
+                    "reason_code": error.code,
+                    "quota_sum": details.get("quota_sum"),
+                    "exact_n": details.get("exact_n"),
+                    "quotas": details.get("categories"),
+                },
+            )
+            return 2
         gates = tuple(sorted(set(value for value in (1, 3, target) if value <= target)))
         try:
             requested_slots = int(
@@ -1322,6 +1474,13 @@ class ProductionPipeline:
             added = self.pool.add_candidates(initial)["added"]
             self.emit("DISCOVERY_COMPLETED", "DISCOVERY", f"已在所选范围发现 {added} 个唯一候选", added, target, {"discovered_count": added, "unique_count": added, "provider_calls": 0})
             granular_emitted = self._emit_granular_progress(self.pool.records(), granular_emitted)
+        # Lux3D 并发限制为 1：连续提交多个候选时，后一个会收到瞬时的
+        # GENERATION_CONCURRENCY_LIMIT_EXCEEDED。这种"容量"是瞬时状态（前一个
+        # 生成结束即释放），不应把整个 Job 打成终态 BLOCK。改为在 worker 内
+        # 有界等待后自动重试同一候选；等待过久仍无容量才落回 BLOCK。
+        capacity_wait_started: float | None = None
+        capacity_wait_interval = float(os.getenv("LUX3D_QUERY_INTERVAL", "15"))
+        capacity_wait_max_seconds = float(os.getenv("LUX3D_CAPACITY_WAIT_MAX_SECONDS", "1800"))
         try:
             for _ in range(max(80, target * 20)):
                 records = self.pool.records()
@@ -1409,7 +1568,17 @@ class ProductionPipeline:
                     self.emit("JOB_BLOCKED", "PROVIDER_RECONCILIATION", "存在 SUBMISSION_UNKNOWN，禁止自动重提", self.pool.success_count(), target, {"blocker": "SUBMISSION_UNKNOWN", "provider_calls": adapter.provider_posts})
                     return 2
                 if adapter.provider_capacity_waiting():
-                    self.emit("JOB_BLOCKED", "PROVIDER_CAPACITY", "Provider 当前容量已满；checkpoint 已保存，将从同一 Job 安全恢复", self.pool.success_count(), target, {"blocker": "PROVIDER_CAPACITY", "provider_calls": adapter.provider_posts, "resume_safe": True})
+                    # 瞬时并发冲突：等一个查询周期后继续同一 Job，让引擎重试
+                    # 同一候选。仅在等待累计超过上限仍无容量时才落回 BLOCK，
+                    # 避免把一个能自愈的瞬时状态误当成终态失败。
+                    now = time.monotonic()
+                    if capacity_wait_started is None:
+                        capacity_wait_started = now
+                    waited = now - capacity_wait_started
+                    if waited < capacity_wait_max_seconds:
+                        time.sleep(min(capacity_wait_interval, capacity_wait_max_seconds - waited))
+                        continue
+                    self.emit("JOB_BLOCKED", "PROVIDER_CAPACITY", f"Provider 连续无可用容量（已等待 {int(waited)}s）；checkpoint 已保存，可从同一 Job 安全恢复", self.pool.success_count(), target, {"blocker": "PROVIDER_CAPACITY", "provider_calls": adapter.provider_posts, "resume_safe": True, "capacity_waited_seconds": int(waited)})
                     return 2
                 # A local-agent review may unblock a candidate while another
                 # candidate is still waiting for review. Finish every durable

@@ -43,7 +43,23 @@ SOURCE_TYPES = {
     "SEARCH_RESULT",
     "UNKNOWN",
 }
-PRODUCT_PATH = re.compile(r"/(?:products?|product-page|p|item|sku|listing)/[^/?#]+", re.I)
+# 商品详情 URL 形态：
+#  1) 常见前缀式：/products/xxx、/product/xxx、/p/xxx、/item/xxx、/sku/xxx、/listing/xxx
+#  2) Salesforce Commerce Cloud（Demandware）式：/<产品名>/<PID>.html，如
+#     /mocha-check-mallard-duck-figurine/36100-007.html（末段含连字符且以 .html 结尾）。
+PRODUCT_PATH = re.compile(
+    r"/(?:products?|product-page|p|item|sku|listing|product)/[^/?#]+"
+    r"|/[^/?#]+/[A-Za-z0-9]+(?:[-\u2013_][A-Za-z0-9]+)+\.html",
+    re.I,
+)
+# 跟进落地页子类目时跳过的工具/营销/内容段（不是商品类目）。
+_LANDING_SKIP_SEGMENTS = {
+    "about", "account", "bag", "blog", "cart", "checkout", "contact", "faq", "gift",
+    "gift-card", "help", "journal", "login", "lookbook", "new", "press", "privacy",
+    "rewards", "search", "shipping", "signin", "sitemap", "story", "stores", "terms",
+    "wishlist", "track-order", "trackorder", "delivery-information", "collection",
+    "collaborations", "trending", "showroom", "registry",
+}
 VISIBLE_CHALLENGE_TEXT = re.compile(r"captcha|verify you are human|checking your browser|security challenge|人机验证|访问验证", re.I)
 TEMPORARY_FAILURE_TEXT = re.compile(r"technical difficulties|try again later|temporarily unavailable|service unavailable|暂时无法|稍后再试", re.I)
 ACCESS_DENIED_TEXT = re.compile(r"access denied|request blocked|restricted access|permission denied|forbidden|访问被拒绝|请求被阻止", re.I)
@@ -1128,7 +1144,15 @@ class ProductAcquisitionEngine:
                     cursor["visited"] = True
                     cursor.setdefault("seen_page_urls", []).append(f"{scope_url}#graphql-page-1")
                 else:
-                    links = self._product_links(current_page_url, html)
+                    # Shopify collection HTML embeds "recommended" / "related"
+                    # product links from other collections, which would pollute
+                    # the candidate pool and fail the category visual review.
+                    # The read-only products.json endpoint returns only products
+                    # that actually belong to the current collection, so prefer it
+                    # whenever it is available and falls back to HTML links.
+                    links = self._shopify_collection_products(current_page_url)
+                    if not links:
+                        links = self._product_links(current_page_url, html)
                     if not links and not PRODUCT_PATH.search(urlsplit(current_page_url).path):
                         # A JS shell is the one bounded reason to use the same
                         # persistent Website L2 browser session.
@@ -1139,6 +1163,11 @@ class ProductAcquisitionEngine:
                         page_product = self._product_from_html(current_page_url, html, scope, acquisition)
                         if page_product is not None and self._is_product_detail_url(current_page_url, page_product):
                             links = [current_page_url]
+                    if not links:
+                        # 一级落地页常只有子类目链接、没有直接产品卡片（如
+                        # mackenzie-childs 的 /furniture）。有界跟进属于当前类目
+                        # 路径下的少量子类目页以找到产品，避免把这类类目误判为供应耗尽。
+                        links = self._subcategory_products(current_page_url, html)
                     for product_url in links[:max(limit, 1)]:
                         try:
                             product_html, detail_mode = (html, acquisition) if product_url == current_page_url else self._get_html(product_url)
@@ -1409,6 +1438,101 @@ class ProductAcquisitionEngine:
             seen.add(canonical)
             unique.append(canonical)
         return unique
+
+    def _shopify_collection_products(self, collection_url: str) -> list[str]:
+        """Return exact on-collection product URLs for a Shopify collection page.
+
+        Shopify collection HTML can embed "recommended" / "related" product
+        links from other collections, which pollute the candidate pool and fail
+        the category visual review.  The read-only ``/collections/<handle>/
+        products.json`` endpoint returns only products that actually belong to
+        the current collection, so prefer it whenever it is available.  On any
+        fetch failure (robots denial, non-JSON response, network policy) this
+        returns an empty list so the caller falls back to HTML link parsing.
+        """
+        parts = urlsplit(collection_url)
+        match = re.search(r"/collections/([^/]+)/?(?:products/[^/?#]+)?$", parts.path)
+        if not match:
+            return []
+        handle = match.group(1)
+        origin = f"{parts.scheme}://{parts.netloc}"
+        products: list[str] = []
+        seen: set[str] = set()
+        page = 1
+        while page <= 50:
+            endpoint = f"{origin}/collections/{handle}/products.json?limit=250&page={page}"
+            try:
+                data = self.client.get_json(endpoint)
+            except (NetworkPolicyError, RobotsDenied, HttpStatusError, RequestBudgetExceeded, AccessControlDetected):
+                return products
+            items = data.get("products") if isinstance(data, dict) else None
+            if not isinstance(items, list) or not items:
+                break
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_handle = str(item.get("handle") or "")
+                if not item_handle:
+                    continue
+                canonical = _canonical_url(f"{origin}/products/{item_handle}")
+                if canonical not in seen:
+                    seen.add(canonical)
+                    products.append(canonical)
+            if len(items) < 250 or len(products) >= 250:
+                break
+            page += 1
+        return products
+
+    def _subcategory_products(self, category_url: str, page_html: str, *, max_subs: int = 8) -> list[str]:
+        """Follow a bounded set of child-category links to locate products.
+
+        Top-level category landing pages often have no direct product cards,
+        only links to child categories (e.g. mackenzie-childs /furniture).
+        When that happens we fetch a small bounded number of child category
+        pages *under the current category path* and collect their product URLs,
+        so the scope is not misreported as supply-exhausted.  Constraining to
+        the current category path keeps us from pulling in off-category
+        products from unrelated global-nav categories.
+        """
+        host = (urlsplit(category_url).hostname or "").casefold()
+        category_path = urlsplit(category_url).path.rstrip("/")
+        children: list[str] = []
+        seen: set[str] = set()
+        for href in re.findall(r"<a[^>]+href=[\"']([^\"']+)[\"']", page_html, re.I):
+            absolute = urljoin(category_url, html_lib.unescape(href))
+            parts = urlsplit(absolute)
+            if (parts.hostname or "").casefold() != host:
+                continue
+            path = parts.path.rstrip("/")
+            if not path.startswith(category_path + "/"):
+                continue  # only follow children of the current category
+            if PRODUCT_PATH.search(path):
+                continue  # already a product detail link, not a subcategory
+            segments = [s for s in path.split("/") if s]
+            if not 2 <= len(segments) <= 3:
+                continue
+            # only category-slug-like segments（字母数字/连字符/下划线），
+            # 排除控制台/控制器等含点的路径。
+            if any(not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", s.casefold()) for s in segments):
+                continue
+            if any(s.casefold() in _LANDING_SKIP_SEGMENTS for s in segments):
+                continue
+            canon = _canonical_url(absolute)
+            if canon not in seen:
+                seen.add(canon)
+                children.append(canon)
+        products: list[str] = []
+        pseen: set[str] = set()
+        for child in children[:max_subs]:
+            try:
+                child_html, _ = self._get_html(child)
+            except (HttpStatusError, NetworkPolicyError, RequestBudgetExceeded, RobotsDenied):
+                continue
+            for product in self._product_links(child, child_html):
+                if product not in pseen:
+                    pseen.add(product)
+                    products.append(product)
+        return products
 
     @staticmethod
     def _is_product_detail_url(url: str, product: AcquiredProduct) -> bool:

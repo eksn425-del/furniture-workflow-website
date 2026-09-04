@@ -51,6 +51,64 @@ from packages.workflow_core.candidate_pool import CandidatePoolError, CandidateP
 from packages.workflow_core.statuses import ItemState
 
 
+# candidate_pool.json 的 mtime 缓存：前端每 5 秒轮询详情页，若每次都全量
+# 解析同一文件会浪费 IO。文件 mtime 未变则复用上次解析结果。
+_CANDIDATE_POOL_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _candidate_pool_summary(path: str) -> dict:
+    """读取 candidate_pool.json 并生成前端摘要，带 mtime 缓存。
+
+    worker 写文件时可能读到半截 JSON（瞬时 500 的已知来源之一），此处捕获
+    OSError/JSONDecodeError 返回 UNREADABLE，下次 mtime 变化会重试。
+    """
+    pool_path = Path(path)
+    try:
+        mtime = pool_path.stat().st_mtime
+    except OSError:
+        return {"path": path, "status": "UNREADABLE"}
+    cached = _CANDIDATE_POOL_CACHE.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    if not pool_path.is_file():
+        return {"path": path, "status": "UNREADABLE"}
+    try:
+        raw_pool = json.loads(pool_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        result = {"path": path, "status": "UNREADABLE"}
+    else:
+        states: dict[str, int] = {}
+        summaries = []
+        for item in (raw_pool.get("items") or {}).values():
+            if not isinstance(item, dict):
+                continue
+            state = str(item.get("state") or "UNKNOWN")
+            states[state] = states.get(state, 0) + 1
+            lineage = item.get("lineage") if isinstance(item.get("lineage"), dict) else {}
+            product_name = str(item.get("product_name") or "")
+            summaries.append({
+                "candidate_id": item.get("candidate_id"),
+                "record_id": item.get("record_id"),
+                "state": item.get("state"),
+                "product_name": product_name,
+                "name_char_count": len(product_name),
+                "name_limit": 50,
+                "production_gate_status": lineage.get("production_gate_status"),
+                "production_gate_reasons": lineage.get("production_gate_reasons") or [],
+                "review_provider": lineage.get("review_provider"),
+                "media_binding_status": lineage.get("media_binding_status"),
+                "target_dimensions": lineage.get("target_dimensions") or lineage.get("dimensions") or {},
+                "dimension_source": lineage.get("dimension_source") or "UNKNOWN",
+                "dimension_unit": lineage.get("dimension_unit") or "source_unit",
+                "blender_qa_status": lineage.get("blender_qa_status"),
+                "blender_qa": lineage.get("blender_qa") or {},
+                "identity_conflicts": lineage.get("identity_conflicts") or [],
+            })
+        result = {"path": path, "job_status": raw_pool.get("job_status"), "target_count": raw_pool.get("target_count"), "state_counts": states, "items": summaries, "updated_at": raw_pool.get("updated_at")}
+    _CANDIDATE_POOL_CACHE[path] = (mtime, result)
+    return result
+
+
 router = APIRouter(prefix="/control", tags=["control-plane"])
 
 
@@ -58,21 +116,40 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _safe_payload(value: str | None) -> dict:
+    """安全解析事件 payload_json；损坏时返回 {} 而不是抛出导致详情页 500。"""
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def _site_key(url: str) -> str:
     parsed = urlsplit(url)
     return (parsed.hostname or "unknown-site").lower().removeprefix("www.")
 
 
+# 已知品牌直营站：display_name 用于界面与命名中的品牌前缀，source_kind
+# 用于让命名走「官方名 + 品牌前缀」规则。新品牌站可在此登记。
+_BRAND_DIRECT_SITES: dict[str, str] = {
+    "interiordefine.com": "Interior Define",
+    "roomandboard.com": "Room & Board",
+}
+
+
 def _display_name(site_key: str) -> str:
-    known = {"roomandboard.com": "Room & Board", "cgtrader.com": "CGTrader"}
+    known = {"cgtrader.com": "CGTrader", **_BRAND_DIRECT_SITES}
     return known.get(site_key, site_key.replace(".", " ").title())
 
 
 def _source_kind(site_key: str) -> str:
     if site_key == "cgtrader.com":
         return "MODEL_MARKETPLACE"
-    if site_key == "roomandboard.com":
-        return "BRAND_DIRECT"
+    if site_key in _BRAND_DIRECT_SITES:
+        return "DIRECT_BRAND"
     return "UNKNOWN"
 
 
@@ -159,6 +236,55 @@ def _policy(job: ProductionJob) -> dict:
         return value if isinstance(value, dict) else {}
     except (TypeError, ValueError):
         return {}
+
+
+def _validate_quota_policy(session, job: ProductionJob) -> None:
+    """Pre-validate target/allocation/quota consistency before persisting.
+
+    Mirrors `_target_and_quotas` in the production worker so CUSTOM quota-sum
+    and PROPORTIONAL UNKNOWN mistakes surface as a readable 422 here instead of
+    a raw error / JOB_BLOCKED only after the worker starts.
+    """
+    policy = _policy(job)
+    allocation = str(policy.get("category_allocation") or job.category_allocation or "TOTAL_ACROSS_SELECTED")
+    strategy = str(policy.get("allocation_strategy") or job.allocation_strategy or "SEQUENTIAL").upper()
+    category_ids = [str(value) for value in (policy.get("category_ids") or []) if value]
+    if not category_ids or job.target_mode == "ALL":
+        return
+    target = int(job.target_value or 0)
+    if allocation == "TOTAL_ACROSS_SELECTED" and strategy == "CUSTOM":
+        quotas = {str(key): int(value) for key, value in (policy.get("category_quotas") or {}).items()}
+        if set(quotas) != set(category_ids):
+            raise HTTPException(status_code=422, detail="自定义配额必须与已选类目一一对应：每个已选类目都要有配额，不能多也不能少。")
+        if sum(quotas.values()) != target:
+            raise HTTPException(status_code=422, detail=f"自定义配额合计（{sum(quotas.values())}）必须等于目标数量（{target}）。")
+    if allocation == "TOTAL_ACROSS_SELECTED" and strategy == "PROPORTIONAL":
+        snapshot_id = str(policy.get("category_snapshot_id") or "").strip()
+        unknown: list[str] = []
+        if snapshot_id:
+            rows = list(session.scalars(
+                select(SiteCategorySnapshot).where(
+                    SiteCategorySnapshot.snapshot_id == snapshot_id,
+                    SiteCategorySnapshot.category_id.in_(category_ids),
+                )
+            ))
+            by_id = {row.category_id: row for row in rows}
+            for cid in category_ids:
+                row = by_id.get(cid)
+                if row is None or row.count_kind == "UNKNOWN":
+                    unknown.append(str(row.canonical_name if row else cid))
+        elif policy.get("category_snapshot_id") is None:
+            rows = list(session.scalars(
+                select(SiteCategory).where(
+                    SiteCategory.site_key == job.site_key,
+                    SiteCategory.category_id.in_(category_ids),
+                )
+            ))
+            by_id = {row.category_id: row for row in rows}
+            unknown = [str(by_id[cid].canonical_name if by_id.get(cid) else cid) for cid in category_ids if by_id.get(cid) is None or by_id[cid].count_kind == "UNKNOWN"]
+        if unknown:
+            names = "、".join(unknown[:5])
+            raise HTTPException(status_code=422, detail=f"按比例分配需要每个已选类目都有可用商品数量，以下类目数量未知：{names}。请补全数量或改用其他分配策略。")
 
 
 def _job_dict(job: ProductionJob) -> dict:
@@ -602,7 +728,9 @@ def create_control_job(payload: ControlJobCreate, request: Request) -> dict:
 
 @router.get("/jobs/{job_id}")
 def get_control_job(job_id: str, request: Request) -> dict:
-    _runtime(request).status(job_id)
+    # status() 内部会先 reconcile_all()（已节流），再返回该 run 的 dict。
+    # 只调用一次并复用结果，避免每次请求重复 reconcile 两次。
+    run_status = _runtime(request).status(job_id)
     session = _session(request)
     try:
         job = session.get(ProductionJob, job_id)
@@ -615,45 +743,10 @@ def get_control_job(job_id: str, request: Request) -> dict:
         provider_tasks = list(session.scalars(select(ProductionProviderTask).where(ProductionProviderTask.job_id == job.job_id).order_by(ProductionProviderTask.created_at)))
         candidate_pool: dict = {}
         if job.candidate_pool_path:
-            pool_path = Path(job.candidate_pool_path)
-            if pool_path.is_file():
-                try:
-                    raw_pool = json.loads(pool_path.read_text(encoding="utf-8"))
-                    states: dict[str, int] = {}
-                    for item in (raw_pool.get("items") or {}).values():
-                        if isinstance(item, dict):
-                            state = str(item.get("state") or "UNKNOWN")
-                            states[state] = states.get(state, 0) + 1
-                    summaries = []
-                    for item in (raw_pool.get("items") or {}).values():
-                        if not isinstance(item, dict):
-                            continue
-                        lineage = item.get("lineage") if isinstance(item.get("lineage"), dict) else {}
-                        product_name = str(item.get("product_name") or "")
-                        summaries.append({
-                            "candidate_id": item.get("candidate_id"),
-                            "record_id": item.get("record_id"),
-                            "state": item.get("state"),
-                            "product_name": product_name,
-                            "name_char_count": len(product_name),
-                            "name_limit": 50,
-                            "production_gate_status": lineage.get("production_gate_status"),
-                            "production_gate_reasons": lineage.get("production_gate_reasons") or [],
-                            "review_provider": lineage.get("review_provider"),
-                            "media_binding_status": lineage.get("media_binding_status"),
-                            "target_dimensions": lineage.get("target_dimensions") or lineage.get("dimensions") or {},
-                            "dimension_source": lineage.get("dimension_source") or "UNKNOWN",
-                            "dimension_unit": lineage.get("dimension_unit") or "source_unit",
-                            "blender_qa_status": lineage.get("blender_qa_status"),
-                            "blender_qa": lineage.get("blender_qa") or {},
-                            "identity_conflicts": lineage.get("identity_conflicts") or [],
-                        })
-                    candidate_pool = {"path": str(pool_path), "job_status": raw_pool.get("job_status"), "target_count": raw_pool.get("target_count"), "state_counts": states, "items": summaries, "updated_at": raw_pool.get("updated_at")}
-                except (OSError, json.JSONDecodeError):
-                    candidate_pool = {"path": str(pool_path), "status": "UNREADABLE"}
+            candidate_pool = _candidate_pool_summary(job.candidate_pool_path)
         return {
             "job": _job_dict(job),
-            "run": _runtime(request).status(job.job_id),
+            "run": run_status,
             "categories": [_category_dict(item) for item in categories],
             "artifacts": [_artifact_dict(item) for item in artifacts],
             "site_scan": request.app.state.site_scan_runtime.status(latest_scan.scan_id) if latest_scan else None,
@@ -682,7 +775,7 @@ def get_control_job(job_id: str, request: Request) -> dict:
                     "items_done": item.items_done,
                     "items_total": item.items_total,
                     "message": item.message,
-                    "payload": json.loads(item.payload_json) if item.payload_json else {},
+                    "payload": _safe_payload(item.payload_json),
                     "created_at": item.created_at.isoformat(),
                 }
                 for item in events
@@ -772,6 +865,7 @@ def update_target(job_id: str, payload: ControlJobTargetPatch, request: Request)
                 raise HTTPException(status_code=422, detail="target_value is required")
             job.target_value = payload.target_value
             job.requested_count = payload.target_value
+            _validate_quota_policy(session, job)
             job.status = "POLICY_READY"
             job.current_stage = "TARGET_POLICY"
             job.last_reason = payload.reason or "用户修改了目标数量"
@@ -802,7 +896,8 @@ def approve_job(job_id: str, payload: ControlJobApproval, request: Request) -> d
             provider = job.provider.casefold()
             call_limit = payload.approved_provider_call_limit
             if call_limit is None:
-                call_limit = int(job.target_value or job.requested_count or 0)
+                # 未显式设限时按不设上限处理（取 schema 允许的最大值）。
+                call_limit = 5000
             if call_limit <= 0:
                 raise HTTPException(status_code=400, detail="Provider 非 OFF 时必须审批大于 0 的硬调用次数上限（approved_provider_call_limit）")
             credential_configured = bool(os.getenv("LUX3D_API_KEY", "").strip())
@@ -1151,6 +1246,10 @@ def list_deliveries(request: Request) -> dict:
         grouped: dict[str, list[ProductionArtifact]] = {}
         for artifact in artifacts:
             grouped.setdefault(artifact.job_id, []).append(artifact)
+        job_ids = list(grouped.keys())
+        jobs: dict[str, ProductionJob] = {}
+        if job_ids:
+            jobs = {job.job_id: job for job in session.scalars(select(ProductionJob).where(ProductionJob.job_id.in_(job_ids)))}
         items = []
         for job_id, rows in grouped.items():
             batch_rows = [row for row in rows if row.artifact_type == "DELIVERY_BATCH_ZIP"]
@@ -1160,13 +1259,18 @@ def list_deliveries(request: Request) -> dict:
                 # runtime.
                 batch_rows = [row for row in rows if row.artifact_type == "DELIVERY_FOLDER"]
             display_rows = sorted(batch_rows, key=lambda item: item.relative_path) if batch_rows else rows
+            job = jobs.get(job_id)
+            model_count = sum(item.item_count for item in batch_rows) if batch_rows else max((item.item_count for item in rows), default=0)
             items.append({
                 "delivery_id": job_id,
                 "job_id": job_id,
+                "title": _delivery_title(session, job, model_count) if job else f"{job_id} · {model_count} 个模型",
                 "relative_path": "runtime-receipt",
                 "batch_count": len(batch_rows) if batch_rows else 0,
-                "model_count": sum(item.item_count for item in batch_rows) if batch_rows else max((item.item_count for item in rows), default=0),
-                "modified_at": max(item.updated_at for item in rows).isoformat(),
+                "model_count": model_count,
+                # 完成时间取该交付批次首次落库的时间（模型完成/打包交付），并统一按
+                # UTC 带时区输出，前端 new Date() 才能正确转成本地时间。
+                "modified_at": _api_ts(max((item.created_at for item in rows), default=None)),
                 "batches": [
                     {
                         "artifact_id": item.artifact_id,
@@ -1180,10 +1284,52 @@ def list_deliveries(request: Request) -> dict:
                     for item in display_rows
                 ],
             })
-        items.sort(key=lambda item: item["modified_at"], reverse=True)
+        items.sort(key=lambda item: item["modified_at"] or "", reverse=True)
         return {"schema_version": "website-deliveries.v2", "items": items, "total": len(items)}
     finally:
         session.close()
+
+
+def _api_ts(value: datetime | None) -> str | None:
+    """Serialize a (possibly naive-UTC) datetime as a UTC ISO string with timezone."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.isoformat() + "Z"
+    return value.astimezone(UTC).isoformat()
+
+
+def _job_category_names(session, job: ProductionJob | None) -> list[str]:
+    """Selected category canonical names bound to a job (from its immutable snapshot)."""
+    if job is None:
+        return []
+    policy = _policy(job)
+    snapshot_id = str(policy.get("category_snapshot_id") or "").strip()
+    ids = [str(value) for value in (policy.get("category_ids") or []) if value]
+    if not ids:
+        return []
+    rows = None
+    if snapshot_id:
+        rows = list(session.scalars(
+            select(SiteCategorySnapshot)
+            .where(SiteCategorySnapshot.snapshot_id == snapshot_id, SiteCategorySnapshot.category_id.in_(ids))
+            .order_by(SiteCategorySnapshot.path)
+        ))
+    else:
+        rows = list(session.scalars(
+            select(SiteCategory)
+            .where(SiteCategory.site_key == job.site_key, SiteCategory.category_id.in_(ids))
+            .order_by(SiteCategory.path)
+        ))
+    return [row.canonical_name for row in rows][:4]
+
+
+def _delivery_title(session, job: ProductionJob, model_count: int) -> str:
+    """Human-friendly delivery title: 网站 · 类目 · N 个模型."""
+    site = _display_name(job.site_key)
+    cats = _job_category_names(session, job)
+    cat_part = " / ".join(cats) if cats else "未指定类目"
+    return f"{site} · {cat_part} · {model_count} 个模型"
 
 
 @router.post("/sites/{site_key}/scan")
@@ -1517,6 +1663,7 @@ def update_control_job(job_id: str, payload: ControlJobEdit, request: Request) -
             if job.status not in {"RUNNING", "PROVIDER_RUNNING"}:
                 job.status = "POLICY_READY"
                 job.current_stage = "TARGET_POLICY"
+        _validate_quota_policy(session, job)
         _event(session, job, "JOB_EDITED", job.status, "操作员编辑了任务信息", {
             "title": payload.title is not None,
             "goal": payload.goal is not None,

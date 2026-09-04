@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 CountKind = Literal["EXACT", "ESTIMATED", "UNKNOWN"]
@@ -12,7 +13,8 @@ CountKind = Literal["EXACT", "ESTIMATED", "UNKNOWN"]
 class TaxonomyCategoryContract(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    category_id: str = Field(min_length=1, max_length=128)
+    # 大脑返回的类目可能不携带 category_id；缺失时按 path 生成确定性 id。
+    category_id: str = Field(default="", max_length=128)
     native_name: str = Field(min_length=1, max_length=255)
     canonical_name: str = Field(min_length=1, max_length=255)
     path: str = Field(min_length=1, max_length=2000)
@@ -29,6 +31,12 @@ class TaxonomyCategoryContract(BaseModel):
     @classmethod
     def normalize_text(cls, value: str) -> str:
         return " ".join(value.split())
+
+    @model_validator(mode="after")
+    def ensure_category_id(self) -> "TaxonomyCategoryContract":
+        if not self.category_id:
+            self.category_id = f"cat_{hashlib.sha256(self.path.encode('utf-8')).hexdigest()[:16]}"
+        return self
 
 
 class BrainTaxonomyResponse(BaseModel):
@@ -119,3 +127,26 @@ class TaxonomyReceipt(BaseModel):
     brain: dict[str, object] = Field(default_factory=dict)
     profile_version: str = "native-unverified"
     captured_at: datetime
+
+
+class AgentToolCall(BaseModel):
+    """One executed tool call recorded in the agent-loop receipt."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(min_length=1, max_length=64)
+    arguments: dict[str, object] = Field(default_factory=dict)
+    result_status: str = "OK"
+
+
+class BrainAgentReceipt(BaseModel):
+    """Receipt of a Brain agent-loop run (persisted with taxonomy evidence)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: str = "AGENT_READY"
+    stopped_reason: str = "FINISH"
+    turns: int = 0
+    tool_calls: list[AgentToolCall] = Field(default_factory=list)
+    provider_posts: int = 0
+

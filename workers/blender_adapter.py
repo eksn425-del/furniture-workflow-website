@@ -432,6 +432,7 @@ class BlenderCLIAdapter:
                 errors="replace",
                 timeout=self.timeout_seconds,
                 check=False,
+                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0),
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise BlenderAdapterError(f"blender_cli_failed:{type(error).__name__}") from error
