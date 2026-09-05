@@ -12,6 +12,7 @@ import html as html_lib
 import json
 import os
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -32,6 +33,7 @@ from packages.workflow_core.source_identity import (
     scope_status,
 )
 from packages.workflow_core.source_policy import resolve_source_policy
+from app.services.site_profile import profile_capability_reusable
 
 
 SOURCE_TYPES = {
@@ -107,7 +109,9 @@ HEIGHT_DIAMETER_RE = re.compile(
     re.I,
 )
 DIMENSION_TAB_LABELS = ("dimensions", "尺寸", "specifications", "规格")
-DIMENSION_UNIT_RE = re.compile(r"(in|inch|cm|mm)", re.I)
+# Keep the token boundary strict: a bare ``in`` in prose must not be mistaken
+# for an inch unit, while the common metre spelling remains supported.
+DIMENSION_UNIT_RE = re.compile(r"(?<![A-Za-z])(?:in|inch|inches|cm|mm|m)(?![A-Za-z])|[\"″]", re.I)
 MAGENTO_PWA_CLIENT_RE = re.compile(r"(?:^|[\"'])/client\.[^\"']+\.js", re.I)
 MAX_ACQUISITION_PAGES = 100
 
@@ -753,7 +757,19 @@ class NativeBrowserCollector:
                 context, page, released = self._open_resolved(playwright, urls[0], headless=True)
                 pages: dict[str, str] = {urls[0]: released if released is not None else page.content()}
                 headless = True
+                # The per-navigation timeout is intentionally independent of
+                # the batch budget, but a bounded L2 scan must not spend the
+                # entire site watchdog probing a long tail of categories.
+                # Remaining URLs stay UNKNOWN and are represented by the
+                # caller's truthful PARTIAL receipt.
+                try:
+                    batch_timeout_ms = max(10_000, min(120_000, int(os.getenv("WEBSITE_L2_BATCH_TIMEOUT_MS", "60000"))))
+                except (TypeError, ValueError):
+                    batch_timeout_ms = 60_000
+                batch_deadline = time.monotonic() + batch_timeout_ms / 1000.0
                 for url in urls[1:]:
+                    if time.monotonic() >= batch_deadline:
+                        break
                     navigation_timeout = max(8_000, min(45_000, int(os.getenv("WEBSITE_L2_NAVIGATION_TIMEOUT_MS", "15000"))))
                     try:
                         page.goto(url, wait_until="domcontentloaded", timeout=navigation_timeout)
@@ -796,11 +812,12 @@ class NativeBrowserCollector:
                 except Exception:
                     pass
 
-    def extract_dimensions(self, url: str) -> tuple[dict[str, float], str]:
-        """用 L2 可见浏览器打开商品详情页，展开 Dimensions 标签并解析官方尺寸。
+    def extract_dimensions_structured(self, url: str) -> dict[str, Any]:
+        """Read official dimensions through one persistent visible-session boundary.
 
-        返回 (dimensions, unit)；解析失败时 dimensions 为空 dict、unit 为空串。
-        主要面向把尺寸放在可折叠"Dimensions/规格"标签里的反爬站点（如 Room & Board）。
+        The structured result keeps per-axis provenance and the checked scope;
+        callers that still use the historical tuple API can use
+        :meth:`extract_dimensions` below without losing compatibility.
         """
         try:
             from playwright.sync_api import Error as PlaywrightError
@@ -826,9 +843,8 @@ class NativeBrowserCollector:
                             continue
                 body = page.content()
                 context.close()
-                visible = re.sub(r"<[^>]+>", " ", body)
-                visible = html_lib.unescape(visible)
-                return _parse_dimension_text(visible)
+                visible = html_lib.unescape(re.sub(r"<[^>]+>", " ", body))
+                return _parse_dimension_text_structured(visible, url=url)
         except (BrowserHumanRequired, BrowserTemporaryFailure, BrowserAccessDenied):
             raise
         except PlaywrightError as error:
@@ -844,6 +860,13 @@ class NativeBrowserCollector:
                 reason_code="BROWSER_NAVIGATION_FAILED",
             ) from error
 
+    def extract_dimensions(self, url: str) -> tuple[dict[str, float], str]:
+        """Backward-compatible tuple view of :meth:`extract_dimensions_structured`."""
+
+        result = self.extract_dimensions_structured(url)
+        dimensions = result.get("dimensions") if isinstance(result.get("dimensions"), dict) else {}
+        return {str(axis): float(value) for axis, value in dimensions.items()}, str(result.get("dimension_unit") or "")
+
 
 def _parse_dimension_text(visible: str) -> tuple[dict[str, float], str]:
     """从页面可见文本解析 Overall/紧凑/间距式尺寸，返回 (dimensions, unit)。"""
@@ -856,9 +879,15 @@ def _parse_dimension_text(visible: str) -> tuple[dict[str, float], str]:
                 "height": float(match.group("h")),
             }
             unit_match = DIMENSION_UNIT_RE.search(match.group(0))
+            # A frequent commerce format places one unit after the final H
+            # (``80 W x 160 D x 90 H cm``), outside the legacy regex match.
+            if unit_match is None:
+                unit_match = DIMENSION_UNIT_RE.search(visible[match.end():match.end() + 12])
             unit = unit_match.group(0).lower() if unit_match else "source_unit"
             if unit == "source_unit" and "\"" in match.group(0):
                 # 官网常见单位符号：33"w 35"d 30"h -> inch
+                unit = "in"
+            elif unit in {'"', "″", "inch", "inches"}:
                 unit = "in"
             return dimensions, unit
     for pattern in (DIAMETER_HEIGHT_RE, HEIGHT_DIAMETER_RE):
@@ -868,11 +897,101 @@ def _parse_dimension_text(visible: str) -> tuple[dict[str, float], str]:
             height = float(match.group("h"))
             dimensions = {"width": diameter, "depth": diameter, "height": height}
             unit_match = DIMENSION_UNIT_RE.search(match.group(0))
+            if unit_match is None:
+                unit_match = DIMENSION_UNIT_RE.search(visible[match.end():match.end() + 12])
             unit = unit_match.group(0).lower() if unit_match else "source_unit"
             if unit == "source_unit" and "\"" in match.group(0):
                 unit = "in"
+            elif unit in {'"', "″", "inch", "inches"}:
+                unit = "in"
             return dimensions, unit
     return {}, ""
+
+
+def _dimension_unit_token(value: str) -> str:
+    token = str(value or "").strip().casefold()
+    if token in {'"', "″", "in", "inch", "inches"}:
+        return "in"
+    if token in {"cm", "mm", "m"}:
+        return token
+    return "source_unit"
+
+
+def _ordered_dimension_axes(match: re.Match[str], *, url: str, visible: str) -> dict[str, dict[str, Any]]:
+    """Return per-axis values/units from an ordered W/D/H-style match.
+
+    The old tuple parser intentionally exposed one unit.  Production needs
+    each axis' exact unit because official pages may mix a trailing global
+    unit with explicit per-axis labels or (rarely) publish mixed units.
+    """
+
+    axis_names = ("width", "depth", "height")
+    group_names = ("w", "d", "h")
+    starts = [match.start(group) for group in group_names]
+    trailing = DIMENSION_UNIT_RE.search(visible[match.end():match.end() + 12])
+    trailing_unit = _dimension_unit_token(trailing.group(0)) if trailing else "source_unit"
+    axes: dict[str, dict[str, Any]] = {}
+    unit = ""
+    for index, (axis, group) in enumerate(zip(axis_names, group_names)):
+        value = float(match.group(group))
+        segment_end = starts[index + 1] if index + 1 < len(starts) else match.end()
+        segment = visible[starts[index]:segment_end]
+        unit_match = DIMENSION_UNIT_RE.search(segment)
+        unit = _dimension_unit_token(unit_match.group(0)) if unit_match else trailing_unit
+        axes[axis] = {
+            "value": value,
+            "unit": unit,
+            "source": "OFFICIAL_PAGE",
+            "evidence": [{"url": url, "role": "visible_dimensions_panel", "text_match": match.group(0)[:240]}],
+        }
+    return axes
+
+
+def _parse_dimension_text_structured(visible: str, *, url: str) -> dict[str, Any]:
+    """Parse exact ordered dimensions first, then independently labelled axes."""
+
+    axes: dict[str, dict[str, Any]] = {}
+    unit = ""
+    ordered_match = next((pattern.search(visible) for pattern in (OVERALL_DIMENSION_RE, WIDTH_HEIGHT_DEPTH_RE, DIMENSION_SPACED_RE, DIMENSION_RE) if pattern.search(visible)), None)
+    if ordered_match:
+        axes = _ordered_dimension_axes(ordered_match, url=url, visible=visible)
+    else:
+        label_patterns = {
+            "width": r"(?:\bwidth\b|\bw\b|宽)\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>inches?|in|cm|mm|m|\")?",
+            "depth": r"(?:\bdepth\b|\bd\b|深)\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>inches?|in|cm|mm|m|\")?",
+            "height": r"(?:\bheight\b|\bh\b|高)\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>inches?|in|cm|mm|m|\")?",
+        }
+        for axis, pattern in label_patterns.items():
+            match = re.search(pattern, visible, re.I)
+            if not match:
+                continue
+            raw_unit = (match.group("unit") or "").lower()
+            axis_unit = _dimension_unit_token(raw_unit)
+            axes[axis] = {
+                "value": float(match.group("value")),
+                "unit": axis_unit or "source_unit",
+                "source": "OFFICIAL_PAGE",
+                "evidence": [{"url": url, "role": "visible_dimensions_panel", "text_match": match.group(0)[:160]}],
+            }
+        if axes:
+            unit = next((str(item["unit"]) for item in axes.values() if item.get("unit") and item.get("unit") != "source_unit"), "")
+    units = {str(item.get("unit") or "source_unit") for item in axes.values()}
+    unit = next(iter(units)) if len(units) == 1 else (unit if "unit" in locals() else "")
+    state = "OFFICIAL_FOUND" if len(axes) == 3 else "PARTIAL_OFFICIAL" if axes else "LOOKUP_INCOMPLETE"
+    return {
+        "axes": axes,
+        "dimensions": {axis: item["value"] for axis, item in axes.items()},
+        "dimension_unit": unit,
+        "dimension_lookup_state": state,
+        "dimension_lookup_contract_state": state,
+        "completed": bool(axes),
+        "lookup_completed": bool(axes),
+        "scope_complete": bool(axes),
+        "checked_pages": [url],
+        "checked_sources": [{"url": url, "role": "product_detail_dimensions"}],
+        "official_absent": False,
+        "blocking_reason": "" if axes else "no_explicit_dimension_text_in_checked_scope",
+    }
 
 
 class ProductAcquisitionEngine:
@@ -896,7 +1015,15 @@ class ProductAcquisitionEngine:
         self.site_key = site_key
         self.source_type = source_type if source_type in SOURCE_TYPES else "UNKNOWN"
         self.site_profile = dict(site_profile) if isinstance(site_profile, Mapping) else {}
-        self.site_profile_reusable = str(self.site_profile.get("status") or "").upper() == "VALIDATED" and str(self.site_profile.get("site_key") or site_key) == site_key
+        self.site_profile_reusable = (
+            str(self.site_profile.get("status") or "").upper() == "VALIDATED"
+            and str(self.site_profile.get("site_key") or site_key) == site_key
+            and profile_capability_reusable(self.site_profile, "product_discovery_strategy")
+        )
+        self.site_profile_capabilities = {
+            name: profile_capability_reusable(self.site_profile, name)
+            for name in ("taxonomy_strategy", "product_discovery_strategy", "pagination_strategy", "pdp_strategy", "image_strategy", "dimension_strategy")
+        }
         self.agent_recovery = agent_recovery
         self.categories = self._compact_scopes(categories)
         self.workspace = Path(workspace).resolve()

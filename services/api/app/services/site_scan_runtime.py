@@ -28,7 +28,7 @@ from app.models import (
     SiteTaxonomySnapshot,
     utc_now,
 )
-from app.services.site_profile import build_site_profile, profile_capability_evidence_valid, validate_site_profile
+from app.services.site_profile import build_site_profile, profile_capability_evidence_valid, profile_capability_status, validate_site_profile
 
 
 class SiteScanRuntimeService:
@@ -380,10 +380,19 @@ class SiteScanRuntimeService:
                 try:
                     profile_contract = validate_site_profile(raw_profile, allow_draft=True)
                     profile_payload = profile_contract.model_dump(mode="json")
-                    if str(profile_payload.get("status") or "").upper() == "VALIDATED" and not profile_capability_evidence_valid(profile_payload):
-                        profile_payload["status"] = "DRAFT"
-                        profile_payload["validated_at"] = None
-                        profile_payload["last_success_at"] = None
+                    if str(profile_payload.get("status") or "").upper() == "VALIDATED":
+                        capability_status = profile_capability_status(profile_payload)
+                        profile_payload.setdefault("evidence", {})
+                        if isinstance(profile_payload["evidence"], dict):
+                            profile_payload["evidence"]["reusable_capabilities"] = capability_status
+                        # Keep a validated profile when at least one capability
+                        # has real evidence; downstream consumers select only
+                        # the capability they can prove.  A profile with no
+                        # verified capability remains DRAFT and is relearned.
+                        if not any(capability_status.values()):
+                            profile_payload["status"] = "DRAFT"
+                            profile_payload["validated_at"] = None
+                            profile_payload["last_success_at"] = None
                 except (TypeError, ValueError):
                     profile_payload = None
             else:
@@ -552,8 +561,16 @@ class SiteScanRuntimeService:
         self._schedule(scan_id)
         return self.status(scan_id) or {}
 
-    def shutdown(self) -> None:
-        self.executor.shutdown(wait=False, cancel_futures=False)
+    def shutdown(self, *, wait: bool = False) -> None:
+        """Stop the scan executor.
+
+        Production callers keep the historical non-blocking behavior, while
+        bounded acceptance workers can request ``wait=True`` after a durable
+        terminal receipt so no browser/network task survives its evidence
+        boundary.
+        """
+
+        self.executor.shutdown(wait=wait, cancel_futures=False)
 
 
 __all__ = ["SiteScanRuntimeService"]

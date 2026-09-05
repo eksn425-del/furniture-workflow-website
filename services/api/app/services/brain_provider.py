@@ -79,6 +79,10 @@ class BrainTimeout(BrainError):
     code = "BRAIN_TIMEOUT"
 
 
+class BrainCancelled(BrainError):
+    code = "BRAIN_CANCELLED"
+
+
 class BrainInvalidSchema(BrainError):
     code = "BRAIN_INVALID_SCHEMA"
 
@@ -375,6 +379,10 @@ class WebsiteBrainProvider:
                 "- \"dimension_source\": one of OFFICIAL_STRUCTURED, OFFICIAL_PAGE, AI_ESTIMATED, UNKNOWN; use AI_ESTIMATED when the Website did not provide official dimensions and you estimated the height\n"
                 "- \"confidence\": number 0..1\n"
                 "- \"reason_codes\": array of short uppercase codes\n"
+                "- \"background_quality\": CLEAN, SIMPLE, LIFESTYLE, DISTRACTING, or UNKNOWN\n"
+                "- \"subject_count\": integer when visible, otherwise null\n"
+                "- \"occlusion_level\": NONE, LOW, HIGH, or UNKNOWN\n"
+                "- \"product_completeness\": COMPLETE, PARTIAL, or UNKNOWN\n"
                 "Use the source_name, source_brand, category_group, and source_dimensions in the evidence as authoritative "
                 "facts. reason_codes must be short codes, not private reasoning."
         )
@@ -422,6 +430,20 @@ class WebsiteBrainProvider:
                 "background_ok": bool(decision.background_ok and vision_decision.background_ok),
                 "image_to_3d_suitable": bool(decision.image_to_3d_suitable and vision_decision.image_to_3d_suitable),
                 "confidence": min(decision.confidence, vision_decision.confidence),
+                "background_quality": (
+                    vision_decision.background_quality
+                    if vision_decision.background_quality != "UNKNOWN"
+                    else decision.background_quality
+                ),
+                "subject_count": vision_decision.subject_count if vision_decision.subject_count is not None else decision.subject_count,
+                "occlusion_level": (
+                    "HIGH" if "HIGH" in {decision.occlusion_level, vision_decision.occlusion_level}
+                    else vision_decision.occlusion_level if vision_decision.occlusion_level != "UNKNOWN" else decision.occlusion_level
+                ),
+                "product_completeness": (
+                    "PARTIAL" if "PARTIAL" in {decision.product_completeness, vision_decision.product_completeness}
+                    else vision_decision.product_completeness if vision_decision.product_completeness != "UNKNOWN" else decision.product_completeness
+                ),
                 "source_image_vision_consistent": bool(
                     decision.source_image_vision_consistent is not False
                     and vision_decision.source_image_vision_consistent is not False
@@ -600,63 +622,190 @@ class WebsiteBrainProvider:
         root = Path(root_text).resolve()
         pending = root / "pending"
         responses = root / "responses"
-        pending.mkdir(parents=True, exist_ok=True)
-        responses.mkdir(parents=True, exist_ok=True)
-        request_id = f"bridge_{int(time.time() * 1000)}_{uuid4().hex}"
-        payload = {
-            "schema_version": "website-codex-bridge-request.v1",
-            "request_id": request_id,
-            "created_at": time.time(),
-            "model_mode": self.settings.model_mode,
-            "task": "website_brain_turn",
-            "messages": _safe_trace_value(messages),
-            "tools": _safe_trace_value(tools or []),
-            "input_payload": _safe_trace_value(input_payload or {}),
-            "policy": {
-                "temperature": 0,
-                "same_site_tools_only": True,
-                "public_read_only": True,
-                "no_hidden_rescue": True,
-                "response_file": f"responses/{request_id}.json",
-            },
-        }
-        request_path = pending / f"{request_id}.json"
-        response_path = responses / f"{request_id}.json"
-        request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        deadline = time.monotonic() + self.settings.bridge_timeout_seconds
-        while time.monotonic() < deadline:
-            if response_path.is_file():
+        sessions = root / "sessions"
+        cancel_dir = root / "cancelled"
+        for directory in (pending, responses, sessions, cancel_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        raw_input = dict(input_payload or {})
+        try:
+            turn = max(1, int(raw_input.get("_bridge_turn") or raw_input.get("turn") or 1))
+        except (TypeError, ValueError):
+            raise BrainInvalidSchema("Codex bridge turn must be an integer") from None
+        # The turn marker changes per ReAct turn; the logical id does not, so
+        # a fresh provider process can resume the same agent run.
+        logical_seed = raw_input.get("bridge_session_id") or raw_input.get("agent_run_id") or raw_input.get("logical_run_id")
+        if not logical_seed:
+            logical_seed = hashlib.sha256(json.dumps(
+                {key: value for key, value in raw_input.items() if key not in {"_bridge_turn", "turn"}},
+                ensure_ascii=False, sort_keys=True, default=str,
+            ).encode("utf-8")).hexdigest()[:24]
+        logical_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(logical_seed))[:80] or f"run-{uuid4().hex[:12]}"
+        base_input_hash = hashlib.sha256(json.dumps(
+            {key: value for key, value in raw_input.items() if key not in {"_bridge_turn", "turn"}},
+            ensure_ascii=False, sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest()
+        input_hash = hashlib.sha256(json.dumps(raw_input, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        session_path = sessions / f"{logical_id}.json"
+        cancel_path = cancel_dir / f"{logical_id}.json"
+        lock_path = sessions / f"{logical_id}.lock"
+
+        def _write_json(path: Path, value: dict[str, object]) -> None:
+            temporary = path.with_suffix(path.suffix + f".{uuid4().hex}.tmp")
+            temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(path)
+
+        # A short exclusive lock makes two workers sharing one logical run
+        # deterministic without keeping a platform-specific file lock open.
+        lock_acquired = False
+        for _ in range(40):
+            try:
+                with lock_path.open("x", encoding="utf-8") as handle:
+                    handle.write(str(time.time()))
+                lock_acquired = True
+                break
+            except FileExistsError:
                 try:
-                    response_payload = json.loads(response_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError, json.JSONDecodeError) as error:
-                    raise BrainInvalidSchema("Codex bridge response is not valid JSON") from error
-                if not isinstance(response_payload, dict) or response_payload.get("request_id") != request_id:
-                    raise BrainInvalidSchema("Codex bridge response request_id mismatch")
-                message = response_payload.get("message")
-                if not isinstance(message, dict) or str(message.get("role") or "assistant") != "assistant":
-                    raise BrainInvalidSchema("Codex bridge response must contain an assistant message")
-                metadata = response_payload.get("metadata")
-                metadata = metadata if isinstance(metadata, dict) else {}
-                metadata = {
-                    **metadata,
-                    "status": "CODEX_BRIDGE_RESPONSE",
-                    "review_provider": "CODEX_DEVELOPMENT_BRIDGE",
-                    "model_mode": self.settings.model_mode,
-                    "request_id": request_id,
-                    "input_hash": hashlib.sha256(
-                        json.dumps(input_payload or {}, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-                    ).hexdigest(),
-                    "provider_posts": self.post_count,
-                    "bridge_request_path": str(request_path),
-                    "bridge_response_path": str(response_path),
-                }
-                try:
-                    request_path.unlink(missing_ok=True)
+                    if time.time() - lock_path.stat().st_mtime > 90:
+                        lock_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+                time.sleep(0.05)
+        if not lock_acquired:
+            raise BrainRequestFailed("Codex bridge session lock is busy")
+        try:
+            try:
+                session_state = json.loads(session_path.read_text(encoding="utf-8")) if session_path.is_file() else {}
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                raise BrainInvalidSchema("Codex bridge session state is not valid JSON") from error
+            if not isinstance(session_state, dict):
+                session_state = {}
+            if session_state.get("base_input_hash") and session_state.get("base_input_hash") != base_input_hash:
+                raise BrainInvalidSchema("Codex bridge logical session input changed")
+            if cancel_path.is_file() or str(session_state.get("status") or "").upper() == "CANCELLED":
+                session_state.update({"status": "CANCELLED", "updated_at": time.time(), "logical_session_id": logical_id})
+                _write_json(session_path, session_state)
+                raise BrainCancelled("Codex bridge logical session was cancelled")
+
+            status = str(session_state.get("status") or "").upper()
+            active_hash = str(session_state.get("input_hash") or "")
+            response_path = Path(str(session_state.get("response_path") or "")) if session_state.get("response_path") else None
+            request_path = Path(str(session_state.get("request_path") or "")) if session_state.get("request_path") else None
+            if status == "RESPONDED" and active_hash == input_hash and response_path and response_path.is_file():
+                reuse_response = True
+            else:
+                reuse_response = status == "WAITING" and active_hash == input_hash and request_path is not None and request_path.is_file()
+            if not reuse_response:
+                previous_request = str(session_state.get("request_id") or "")
+                request_id = f"bridge_{int(time.time() * 1000)}_{uuid4().hex}"
+                request_path = pending / f"{request_id}.json"
+                response_path = responses / f"{request_id}.json"
+                payload = {
+                    "schema_version": "website-codex-bridge-request.v2",
+                    "request_id": request_id,
+                    "logical_session_id": logical_id,
+                    "turn": turn,
+                    "created_at": time.time(),
+                    "model_mode": self.settings.model_mode,
+                    "task": "website_brain_turn",
+                    "messages": _safe_trace_value(messages),
+                    "tools": _safe_trace_value(tools or []),
+                    "input_payload": _safe_trace_value(raw_input),
+                    "policy": {
+                        "temperature": 0,
+                        "same_site_tools_only": True,
+                        "public_read_only": True,
+                        "no_hidden_rescue": True,
+                        "response_file": f"responses/{request_id}.json",
+                        "late_response_policy": "IGNORE_IF_SUPERSEDED",
+                    },
+                }
+                _write_json(request_path, payload)
+                session_state = {
+                    "schema_version": "website-codex-bridge-session.v1",
+                    "logical_session_id": logical_id,
+                    "base_input_hash": base_input_hash,
+                    "input_hash": input_hash,
+                    "request_id": request_id,
+                    "turn": turn,
+                    "status": "WAITING",
+                    "attempts": int(session_state.get("attempts") or 0) + 1,
+                    "created_at": session_state.get("created_at") or time.time(),
+                    "updated_at": time.time(),
+                    "request_path": str(request_path),
+                    "response_path": str(response_path),
+                    "supersedes_request_id": previous_request or None,
+                }
+                _write_json(session_path, session_state)
+            request_id = str(session_state.get("request_id") or "")
+            request_path = Path(str(session_state.get("request_path") or request_path))
+            response_path = Path(str(session_state.get("response_path") or response_path))
+        finally:
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        def _consume_response() -> tuple[dict[str, object], dict[str, object]]:
+            try:
+                response_payload = json.loads(response_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                raise BrainInvalidSchema("Codex bridge response is not valid JSON") from error
+            if not isinstance(response_payload, dict) or response_payload.get("request_id") != request_id:
+                # A response for a superseded request must never be accepted
+                # as the current turn's answer.
+                raise BrainInvalidSchema("Codex bridge response request_id mismatch")
+            message = response_payload.get("message")
+            if not isinstance(message, dict) or str(message.get("role") or "assistant") != "assistant":
+                raise BrainInvalidSchema("Codex bridge response must contain an assistant message")
+            metadata = response_payload.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            metadata = {
+                **metadata,
+                "status": "CODEX_BRIDGE_RESPONSE",
+                "review_provider": "CODEX_DEVELOPMENT_BRIDGE",
+                "model_mode": self.settings.model_mode,
+                "request_id": request_id,
+                "logical_session_id": logical_id,
+                "turn": turn,
+                "input_hash": input_hash,
+                "provider_posts": self.post_count,
+                "bridge_request_path": str(request_path),
+                "bridge_response_path": str(response_path),
+            }
+            return message, metadata
+
+        deadline = time.monotonic() + self.settings.bridge_timeout_seconds
+        while time.monotonic() < deadline:
+            if cancel_path.is_file():
+                try:
+                    state = json.loads(session_path.read_text(encoding="utf-8")) if session_path.is_file() else {}
+                except (OSError, ValueError, json.JSONDecodeError):
+                    state = {}
+                state.update({"status": "CANCELLED", "updated_at": time.time()})
+                _write_json(session_path, state)
+                raise BrainCancelled("Codex bridge logical session was cancelled")
+            if response_path.is_file():
+                message, metadata = _consume_response()
+                try:
+                    state = json.loads(session_path.read_text(encoding="utf-8")) if session_path.is_file() else {}
+                except (OSError, ValueError, json.JSONDecodeError):
+                    state = {}
+                state.update({
+                    "status": "RESPONDED",
+                    "updated_at": time.time(),
+                    "response_sha256": hashlib.sha256(response_path.read_bytes()).hexdigest(),
+                })
+                _write_json(session_path, state)
                 self.post_count += 1
                 return message, metadata
             time.sleep(self.settings.bridge_poll_seconds)
+        try:
+            state = json.loads(session_path.read_text(encoding="utf-8")) if session_path.is_file() else {}
+        except (OSError, ValueError, json.JSONDecodeError):
+            state = {}
+        state.update({"status": "TIMED_OUT", "updated_at": time.time(), "timeout_seconds": self.settings.bridge_timeout_seconds})
+        _write_json(session_path, state)
         raise BrainTimeout(f"Codex bridge response timed out after {self.settings.bridge_timeout_seconds:.0f}s")
 
     def run_agent_loop(
@@ -693,9 +842,16 @@ class WebsiteBrainProvider:
         while turns < options.max_steps and tool_budget > 0:
             turns += 1
             try:
-                message, _ = self._chat_once(messages=messages, tools=tools, input_payload=input_payload)
+                bridge_payload = (
+                    {**input_payload, "_bridge_turn": turns}
+                    if self.settings.codex_bridge_mode
+                    else input_payload
+                )
+                message, _ = self._chat_once(messages=messages, tools=tools, input_payload=bridge_payload)
             except BrainNotConfigured:
                 return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BRAIN_NOT_CONFIGURED", "BRAIN_NOT_CONFIGURED")
+            except BrainCancelled as error:
+                return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BRAIN_CANCELLED", error.code)
             except BrainError:
                 return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "BRAIN_ERROR", "BRAIN_ERROR")
             calls = message.get("tool_calls") or []
@@ -875,7 +1031,7 @@ class WebsiteBrainProvider:
 __all__ = [
     "MODEL_MODES",
     "AgentLoopOptions", "AgentLoopResult", "AgentToolError",
-    "BrainAccessDecision", "BrainError", "BrainInvalidSchema", "BrainNotConfigured", "BrainRateLimited",
+    "BrainAccessDecision", "BrainCancelled", "BrainError", "BrainInvalidSchema", "BrainNotConfigured", "BrainRateLimited",
     "BrainRequestFailed", "BrainSettings", "BrainTimeout", "VisionInputRequired",
     "VisionProviderNotConfigured", "VisionSettings", "WebsiteBrainProvider",
 ]

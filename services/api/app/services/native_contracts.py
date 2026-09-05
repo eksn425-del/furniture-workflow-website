@@ -120,6 +120,13 @@ class BrainProductDecision(BaseModel):
     dimension_source: Literal["OFFICIAL_STRUCTURED", "OFFICIAL_PAGE", "AI_ESTIMATED", "UNKNOWN"] = "AI_ESTIMATED"
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reason_codes: list[str] = Field(default_factory=list, max_length=16)
+    # Visual-quality facts are optional so older/remote models remain
+    # protocol-compatible; when supplied they let the executor distinguish a
+    # simple contextual background from a multi-subject/occluded image.
+    background_quality: Literal["CLEAN", "SIMPLE", "LIFESTYLE", "DISTRACTING", "UNKNOWN"] = "UNKNOWN"
+    subject_count: int | None = Field(default=None, ge=0, le=32)
+    occlusion_level: Literal["NONE", "LOW", "HIGH", "UNKNOWN"] = "UNKNOWN"
+    product_completeness: Literal["COMPLETE", "PARTIAL", "UNKNOWN"] = "UNKNOWN"
     source_image_vision_consistent: bool | None = None
     reviewed_media_sha256: str = ""
 

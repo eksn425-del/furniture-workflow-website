@@ -58,6 +58,10 @@ COUNT_RE = re.compile(r"(?<![\w])([0-9][0-9,]*)\s*(?:items?|products?|results?|�
 TAIL_COUNT_RE = re.compile(r"(?<![\w])([0-9][0-9,]*)\s*$")
 PRODUCT_RE = re.compile(r"/(?:products?|product-page|p|item|sku)/[^/?#]+", re.I)
 ASSET_RE = re.compile(r"\.(?:css|js|png|jpe?g|gif|svg|webp|ico|pdf|xml|zip)(?:$|[?#])", re.I)
+# Keep the browser enrichment bounded even when a retailer exposes hundreds
+# of navigation links.  The operator may raise WEBSITE_L2_COUNT_PROBES for a
+# deliberate longer run, but the default must fit the formal scan watchdog and
+# leave a truthful PARTIAL receipt for the remaining unknown counts.
 MAX_COUNT_PROBES = 120
 BROWSER_ESCALATION_HTTP_STATUSES = frozenset({401, 403, 405, 430})
 CATEGORY_WORDS = {
@@ -990,7 +994,7 @@ class NativeSiteAnalyzer:
             ordered = sorted(categories, key=lambda item: (item.level != 1, item.path))
             # 浏览器补证一次批量覆盖全部 UNKNOWN（上限 MAX_COUNT_PROBES），
             # 不再每轮只补 4 个导致用户需要反复手动续扫。
-            l2_probe_limit = max(1, min(MAX_COUNT_PROBES, int(os.getenv("WEBSITE_L2_COUNT_PROBES", "120"))))
+            l2_probe_limit = max(1, min(MAX_COUNT_PROBES, int(os.getenv("WEBSITE_L2_COUNT_PROBES", "8"))))
             probe_urls = [
                 category.source_url
                 for category in ordered[:l2_probe_limit]
@@ -1038,7 +1042,16 @@ class NativeSiteAnalyzer:
                     evidence=count_probe_blocker.get("evidence") if isinstance(count_probe_blocker.get("evidence"), dict) else None,
                 )
                 brain_metadata["access"] = access_brain
-            scan_evidence: dict[str, object] = {"acquisition": "L2_BROWSER", "browser_session_dir": str(Path(session_dir).resolve()), "signals": signals, "magento_graphql_taxonomy": magento_taxonomy_evidence, "magento_graphql_counts": magento_count_evidence}
+            scan_evidence: dict[str, object] = {
+                "acquisition": "L2_BROWSER",
+                "browser_session_dir": str(Path(session_dir).resolve()),
+                "signals": signals,
+                "magento_graphql_taxonomy": magento_taxonomy_evidence,
+                "magento_graphql_counts": magento_count_evidence,
+                "l2_probe_limit": l2_probe_limit,
+                "l2_probe_requested": len(probe_urls),
+                "l2_probe_completed": len(probed_pages) if "probed_pages" in locals() else 0,
+            }
             if count_probe_blocker is not None:
                 scan_evidence["count_probe_blocker"] = count_probe_blocker
             receipt = self._receipt(

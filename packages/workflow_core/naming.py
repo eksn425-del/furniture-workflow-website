@@ -9,6 +9,7 @@ provided from governed evidence and must be members of the shared vocabulary.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -335,11 +336,21 @@ def compose_brand_official_name(
     if str(product_type or "").strip():
         try:
             verified = standardize_product_type(product_type)
-        except NamingReviewRequired:
-            verified = ""
+        except NamingReviewRequired as error:
+            # An explicitly supplied generated type is evidence, not free
+            # text.  Silently dropping it would make the public name look
+            # governed while retaining an ungoverned brain attribute.
+            raise NamingReviewRequired(f"type_outside_formal_vocabulary:{product_type}") from error
         if verified and not _key(official).endswith(_key(verified)):
             type_text = verified
-    attrs = [str(item).strip() for item in (style, color, material) if str(item or "").strip()]
+    attrs: list[str] = []
+    for field, value in (("style", style), ("color", color), ("material", material)):
+        if not str(value or "").strip():
+            continue
+        try:
+            attrs.append(canonicalize_attribute(value, field))
+        except ValueError as error:
+            raise NamingReviewRequired(str(error)) from error
     words = [canonical_brand, official] + attrs
     if type_text:
         words.append(type_text)
@@ -351,6 +362,55 @@ def compose_brand_official_name(
         required_type=type_text,
         removable_phrases=tuple(attrs) + ("New", "Exclusive", "Collection", "Premium", "Signature", "Limited Edition"),
     )
+
+
+def disambiguate_product_name(
+    value: object,
+    *,
+    identity: object,
+    distinguishing: object = "",
+    max_chars: int = MAX_FINAL_NAME_CHARS,
+) -> str:
+    """Add a stable identity suffix without changing the source authority.
+
+    Names can collide when two variants share an official title.  The suffix
+    is derived from a verified SKU/variant when available, otherwise from the
+    durable identity key; it is therefore stable across retries and resumes.
+    """
+
+    base = _name_text(value)
+    token_source = str(distinguishing or "").strip()
+    token = re.sub(r"[^A-Za-z0-9]+", "-", token_source).strip("-").upper()
+    if not token:
+        token = hashlib.sha256(str(identity or "").encode("utf-8")).hexdigest()[:8].upper()
+    # Public-name safety rejects literal ``SKU-...``/``MODEL-...`` tokens.
+    # Preserve the distinguishing value deterministically while using a
+    # neutral variant marker in the user-facing name.
+    if token.startswith(("SKU-", "MODEL-")):
+        token = "V-" + token.split("-", 1)[1]
+    token = token[:16]
+    suffix = f" ({token})"
+    if len(suffix) >= max_chars:
+        raise NamingReviewRequired("product_name_disambiguation_suffix_too_long")
+    budget = max_chars - len(suffix)
+    try:
+        shortened = shorten_name_to_limit(
+            base,
+            max_chars=budget,
+            removable_phrases=("New", "Exclusive", "Collection", "Premium", "Signature", "Limited Edition"),
+        )
+    except NamingReviewRequired:
+        words = base.split()
+        shortened = ""
+        for word in words:
+            candidate = f"{shortened} {word}".strip()
+            if len(candidate) <= budget:
+                shortened = candidate
+            else:
+                break
+        if not shortened:
+            raise NamingReviewRequired("product_name_disambiguation_no_room")
+    return f"{shortened}{suffix}"
 
 
 def _type_candidates(evidence: object) -> list[str]:
@@ -510,6 +570,7 @@ __all__ = [
     "VOCABULARY_PATH",
     "canonicalize_attribute",
     "compose_brand_official_name",
+    "disambiguate_product_name",
     "compose_official_name",
     "compose_product_name",
     "shorten_name_to_limit",

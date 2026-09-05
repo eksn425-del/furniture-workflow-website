@@ -147,6 +147,27 @@ def profile_capability_evidence_valid(payload: Mapping[str, Any] | None) -> bool
     return all(capability.get(field) is True for field in fields)
 
 
+def profile_capability_reusable(payload: Mapping[str, Any] | None, capability_name: str) -> bool:
+    """Return whether one verified capability can be reused independently.
+
+    A failed dimensions probe must not invalidate an otherwise verified product
+    discovery strategy.  The full-profile helper above remains available for
+    callers that require all six capabilities at once.
+    """
+
+    if not isinstance(payload, Mapping) or str(payload.get("status") or "").upper() != "VALIDATED":
+        return False
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), Mapping) else {}
+    bounded = evidence.get("bounded_verification") if isinstance(evidence.get("bounded_verification"), Mapping) else {}
+    capability = bounded.get("capability_evidence") if isinstance(bounded.get("capability_evidence"), Mapping) else evidence.get("capability_evidence")
+    return isinstance(capability, Mapping) and capability.get(str(capability_name)) is True
+
+
+def profile_capability_status(payload: Mapping[str, Any] | None) -> dict[str, bool]:
+    fields = ("taxonomy_strategy", "product_discovery_strategy", "pagination_strategy", "pdp_strategy", "image_strategy", "dimension_strategy")
+    return {field: profile_capability_reusable(payload, field) for field in fields}
+
+
 def profile_drift_reasons(
     payload: Mapping[str, Any] | None,
     *,
@@ -179,6 +200,6 @@ def profile_drift_reasons(
 
 
 __all__ = [
-    "SECRET_KEYS", "build_site_profile", "profile_capability_evidence_valid", "profile_drift_reasons", "profile_is_reusable", "profile_version_for",
+    "SECRET_KEYS", "build_site_profile", "profile_capability_evidence_valid", "profile_capability_reusable", "profile_capability_status", "profile_drift_reasons", "profile_is_reusable", "profile_version_for",
     "validate_site_profile",
 ]
