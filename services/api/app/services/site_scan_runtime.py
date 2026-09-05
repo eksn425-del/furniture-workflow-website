@@ -28,7 +28,7 @@ from app.models import (
     SiteTaxonomySnapshot,
     utc_now,
 )
-from app.services.site_profile import build_site_profile, validate_site_profile
+from app.services.site_profile import build_site_profile, profile_capability_evidence_valid, validate_site_profile
 
 
 class SiteScanRuntimeService:
@@ -202,6 +202,10 @@ class SiteScanRuntimeService:
 
     def _execute(self, scan_id: str) -> None:
         session = self.database.session_factory()
+        # This value is read after the DB session closes.  Initialize it in
+        # the worker scope so a first scan, null profile, malformed JSON or a
+        # non-object profile all follow the same explicit ``None`` path.
+        existing_profile_payload: dict[str, Any] | None = None
         try:
             scan = session.get(SiteScanRun, scan_id)
             if scan is None or scan.status in {"READY", "PARTIAL", "FAILED", "HUMAN_REQUIRED", "ROBOTS_DENIED", "TEMPORARY_FAILURE", "ACCESS_CHANGE_REQUIRED", "SESSION_CONTINUITY_BROKEN", "BRAIN_NOT_CONFIGURED", "BROWSER_RUNTIME_NOT_INSTALLED"}:
@@ -376,6 +380,10 @@ class SiteScanRuntimeService:
                 try:
                     profile_contract = validate_site_profile(raw_profile, allow_draft=True)
                     profile_payload = profile_contract.model_dump(mode="json")
+                    if str(profile_payload.get("status") or "").upper() == "VALIDATED" and not profile_capability_evidence_valid(profile_payload):
+                        profile_payload["status"] = "DRAFT"
+                        profile_payload["validated_at"] = None
+                        profile_payload["last_success_at"] = None
                 except (TypeError, ValueError):
                     profile_payload = None
             else:
@@ -391,7 +399,7 @@ class SiteScanRuntimeService:
                         source_type=site.source_kind,
                         platform=str((receipt.get("evidence") or {}).get("l0", {}).get("platform") if isinstance((receipt.get("evidence") or {}).get("l0"), dict) else "UNKNOWN"),
                         evidence={"signals": receipt.get("evidence") or {}, "last_taxonomy_snapshot_id": snapshot_id},
-                        status="VALIDATED" if receipt.get("verified") else "DRAFT",
+                        status="DRAFT",
                         confidence=1.0 if receipt.get("verified") else 0.0,
                     )
                 except (TypeError, ValueError):
@@ -400,10 +408,42 @@ class SiteScanRuntimeService:
             profile_payload["source_url"] = scan.source_url
             profile_payload["site_key"] = site.site_key
             profile = session.get(SiteProfile, site.site_key)
+            persisted_profile = True
+            existing_profile_payload: dict[str, Any] | None = None
+            if profile is not None and profile.profile_json:
+                try:
+                    parsed_existing = json.loads(profile.profile_json)
+                    if isinstance(parsed_existing, dict):
+                        existing_profile_payload = parsed_existing
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_profile_payload = None
+            incoming_status = str(profile_payload.get("status") or "DRAFT").upper()
+            existing_status = str((existing_profile_payload or {}).get("status") or getattr(profile, "status", "DRAFT")).upper()
+            # A late/failed scan must never downgrade a reusable profile.  A
+            # successful replacement is promoted only if the row still refers
+            # to the version this scan observed (optimistic concurrency); this
+            # prevents an older worker from relabelling a newer profile STALE.
+            if profile is not None and existing_status == "VALIDATED" and incoming_status != "VALIDATED":
+                profile_payload = existing_profile_payload or profile_payload
+                persisted_profile = False
+            elif profile is not None and existing_profile_payload:
+                incoming_previous = str(
+                    ((receipt.get("brain") or {}).get("site_profile_migrated_from") if isinstance(receipt.get("brain"), dict) else "")
+                    or ""
+                )
+                incoming_profile_version = str(profile_payload.get("profile_version") or "")
+                existing_version = str(existing_profile_payload.get("profile_version") or "")
+                try:
+                    newer_row = bool(profile.updated_at and scan.started_at and profile.updated_at.replace(tzinfo=UTC) > scan.started_at.replace(tzinfo=UTC))
+                except (AttributeError, TypeError, ValueError):
+                    newer_row = False
+                if newer_row and incoming_profile_version != existing_version and incoming_previous != existing_version:
+                    profile_payload = existing_profile_payload
+                    persisted_profile = False
             if profile is None:
                 profile = SiteProfile(site_key=site.site_key, source_url=scan.source_url, profile_json=json.dumps(profile_payload, ensure_ascii=False), rules_version="website-site-profile.v1", status=str(profile_payload.get("status") or "DRAFT"))
                 session.add(profile)
-            else:
+            elif persisted_profile:
                 profile.profile_json = json.dumps(profile_payload, ensure_ascii=False)
                 profile.rules_version = "website-site-profile.v1"
                 profile.status = str(profile_payload.get("status") or "DRAFT")
@@ -422,6 +462,7 @@ class SiteScanRuntimeService:
                 "category_count": len(categories),
                 "site_profile_version": profile_payload.get("profile_version"),
                 "site_profile_status": profile_payload.get("status"),
+                "site_profile_persisted": persisted_profile,
                 "site_profile_reused": bool((receipt.get("brain") or {}).get("site_profile_reused")) if isinstance(receipt.get("brain"), dict) else False,
             }, ensure_ascii=False)
             scan.finished_at = utc_now()

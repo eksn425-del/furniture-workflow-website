@@ -1209,7 +1209,7 @@ def test_provider_capacity_wait_preserves_attempt_ledger_and_resumes(monkeypatch
     session = resumed.database.session_factory()
     try:
         ledger = session.scalar(select(ProductionProviderTask).where(ProductionProviderTask.job_id == contract["job_id"]))
-        assert ledger and ledger.post_attempts == 2 and ledger.status == "DELIVERED"
+        assert ledger and ledger.post_attempts == 2 and ledger.billable_attempts == 1 and ledger.status == "DELIVERED"
     finally:
         session.close()
 

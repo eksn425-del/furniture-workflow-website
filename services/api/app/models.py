@@ -437,6 +437,11 @@ class ProductionJob(Base):
     candidate_pool_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     ready_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     provider_qualification_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Immutable site-intelligence snapshot selected on the first production
+    # launch; later rescans require an explicit migration instead of silently
+    # changing a resumed job's extraction contract.
+    site_profile_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    site_profile_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
@@ -547,6 +552,10 @@ class ProductionProviderTask(Base):
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     post_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Network create attempts are not the same as billable provider creates:
+    # capacity responses prove that no task was created and must not consume
+    # the approved paid-call budget.
+    billable_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     poll_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, TypeVar
+from uuid import uuid4
 
 import requests
 from pydantic import BaseModel, ValidationError
@@ -13,7 +16,51 @@ from pydantic import BaseModel, ValidationError
 from app.services.native_contracts import BrainAccessDecision, BrainProductDecision, BrainSourceDecision, BrainTaxonomyResponse
 
 
-MODEL_MODES = frozenset({"LOCAL_AGENT", "MULTIMODAL_SINGLE_MODEL", "TEXT_BRAIN_PLUS_VISION"})
+MODEL_MODES = frozenset({
+    "LOCAL_AGENT", "MULTIMODAL_SINGLE_MODEL", "TEXT_BRAIN_PLUS_VISION",
+    "CODEX_DEVELOPMENT_BRIDGE",
+})
+
+_TRACE_SECRET_PARTS = frozenset({
+    "cookie", "token", "password", "secret", "authorization", "credential", "api_key", "apikey",
+})
+
+
+def _safe_trace_value(value: object, *, key: str = "") -> object:
+    """Return a bounded, secret-free bridge trace value.
+
+    The development bridge is intentionally file-backed so a Codex operator can
+    inspect the same request the Website emitted.  It must never become a
+    covert cookie/credential transport or persist arbitrary session state.
+    """
+    normalized = key.casefold().replace("-", "_")
+    if normalized in _TRACE_SECRET_PARTS or any(part in normalized for part in _TRACE_SECRET_PARTS):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(k): _safe_trace_value(v, key=str(k)) for k, v in list(value.items())[:128]}
+    if isinstance(value, (list, tuple)):
+        return [_safe_trace_value(item, key=key) for item in list(value)[:128]]
+    if isinstance(value, str):
+        text = value[:20_000]
+        text = re.sub(r"([?&](?:token|cookie|auth|password|secret|session|credential|api[_-]?key)=)[^&#\s]+", r"\1[REDACTED]", text, flags=re.I)
+        # Public HTML frequently embeds analytics/config snippets such as
+        # ``window.BRAZE_API_KEY = ...`` or ``{"apiKey":"..."}``.  They are
+        # not business evidence and must not leak into the durable bridge
+        # request when a tool returns a visible text snippet.
+        text = re.sub(
+            r"((?:api[_-]?key|access[_-]?key|client[_-]?secret|secret|password|authorization|credential)\s*[:=]\s*)(?:\\?[\"'])?[^\\s,;}\"']+",
+            r"\1[REDACTED]",
+            text,
+            flags=re.I,
+        )
+        # The value may have been represented as an escaped JSON string; do
+        # not leave its closing quote (or the first token fragment) behind.
+        text = re.sub(r"\[REDACTED\](?:\\?[\"'])", "[REDACTED]", text)
+        text = re.sub(r"\b(?:sk|pk|rk)_[A-Za-z0-9_-]{8,}\b", "[REDACTED_TOKEN]", text)
+        return text
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:2_000]
 
 
 class BrainError(RuntimeError):
@@ -61,6 +108,9 @@ class BrainSettings:
     local_agent_override: bool = False
     agent_enabled: bool = True
     agent_max_steps: int = 6
+    bridge_root: str = ""
+    bridge_timeout_seconds: float = 180.0
+    bridge_poll_seconds: float = 0.25
     mode_source: str = "explicit"
 
     @classmethod
@@ -86,6 +136,7 @@ class BrainSettings:
             mode_source = "local_review_override"
         if normalized_mode not in MODEL_MODES:
             normalized_mode = "TEXT_BRAIN_PLUS_VISION"
+        bridge_root = os.getenv("CODEX_BRIDGE_ROOT", "").strip()
         return cls(
             api_key=os.getenv("WEBSITE_BRAIN_API_KEY", "").strip(),
             base_url=os.getenv("WEBSITE_BRAIN_BASE_URL", "").strip().rstrip("/"),
@@ -98,16 +149,25 @@ class BrainSettings:
             local_agent_override=requested_mode,
             agent_enabled=os.getenv("WEBSITE_BRAIN_AGENT_ENABLED", "true").strip().casefold() not in {"0", "false", "off", "no"},
             agent_max_steps=max(1, min(int(os.getenv("WEBSITE_BRAIN_AGENT_MAX_STEPS", "6")), 20)),
+            bridge_root=bridge_root,
+            bridge_timeout_seconds=max(5.0, min(float(os.getenv("CODEX_BRIDGE_TIMEOUT_SECONDS", "180")), 900.0)),
+            bridge_poll_seconds=max(0.05, min(float(os.getenv("CODEX_BRIDGE_POLL_SECONDS", "0.25")), 5.0)),
             mode_source=mode_source,
         )
 
     @property
     def configured(self) -> bool:
+        if self.model_mode == "CODEX_DEVELOPMENT_BRIDGE":
+            return bool(self.bridge_root)
         return bool(self.api_key and self.base_url and self.model)
 
     @property
     def local_agent_mode(self) -> bool:
         return self.model_mode == "LOCAL_AGENT"
+
+    @property
+    def codex_bridge_mode(self) -> bool:
+        return self.model_mode == "CODEX_DEVELOPMENT_BRIDGE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +284,8 @@ class WebsiteBrainProvider:
             "vision_input": (
                 "LOCAL_AGENT_EXPLICIT_REVIEW"
                 if self.settings.local_agent_mode
+                else "CODEX_BRIDGE_REQUEST_WITH_IMAGE_EVIDENCE"
+                if self.settings.codex_bridge_mode
                 else "IMAGE_URL_IN_BRAIN_REQUEST"
                 if self.settings.model_mode == "MULTIMODAL_SINGLE_MODEL"
                 else "INDEPENDENT_VISION_RECEIPT"
@@ -243,6 +305,8 @@ class WebsiteBrainProvider:
     def review_provider(self) -> str:
         if self.settings.local_agent_mode:
             return "LOCAL_AGENT"
+        if self.settings.codex_bridge_mode:
+            return "CODEX_DEVELOPMENT_BRIDGE"
         if self.settings.model_mode == "MULTIMODAL_SINGLE_MODEL":
             return "MULTIMODAL_BRAIN"
         return "TEXT_BRAIN_PLUS_VISION"
@@ -449,6 +513,8 @@ class WebsiteBrainProvider:
         tool calling). Handles rate limiting, retries, backoff and receipt
         metadata once, so the agent loop does not duplicate that bookkeeping.
         """
+        if self.settings.codex_bridge_mode:
+            return self._bridge_once(messages=messages, tools=tools, input_payload=input_payload)
         if not self.settings.configured:
             raise BrainNotConfigured("WEBSITE_BRAIN_API_KEY/BASE_URL/MODEL are required")
         request_body: dict[str, object] = {
@@ -512,6 +578,86 @@ class WebsiteBrainProvider:
                 metadata["input_hash"] = hashlib.sha256(json.dumps(input_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
             return message, metadata
         raise last_error or BrainRequestFailed("Website Brain request failed")
+
+    def _bridge_once(
+        self,
+        *,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None,
+        input_payload: dict[str, object] | None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Exchange one real Website Brain turn with the Codex operator.
+
+        The Website writes a request and waits for a matching response.  The
+        response is never generated from a canned fallback: it must be an
+        operator/model message that passes the same tool/schema validation as a
+        remote Brain response.  This is deliberately a single transport mode,
+        not a second agent engine.
+        """
+        root_text = str(self.settings.bridge_root or "").strip()
+        if not root_text:
+            raise BrainNotConfigured("CODEX_BRIDGE_ROOT is required for CODEX_DEVELOPMENT_BRIDGE")
+        root = Path(root_text).resolve()
+        pending = root / "pending"
+        responses = root / "responses"
+        pending.mkdir(parents=True, exist_ok=True)
+        responses.mkdir(parents=True, exist_ok=True)
+        request_id = f"bridge_{int(time.time() * 1000)}_{uuid4().hex}"
+        payload = {
+            "schema_version": "website-codex-bridge-request.v1",
+            "request_id": request_id,
+            "created_at": time.time(),
+            "model_mode": self.settings.model_mode,
+            "task": "website_brain_turn",
+            "messages": _safe_trace_value(messages),
+            "tools": _safe_trace_value(tools or []),
+            "input_payload": _safe_trace_value(input_payload or {}),
+            "policy": {
+                "temperature": 0,
+                "same_site_tools_only": True,
+                "public_read_only": True,
+                "no_hidden_rescue": True,
+                "response_file": f"responses/{request_id}.json",
+            },
+        }
+        request_path = pending / f"{request_id}.json"
+        response_path = responses / f"{request_id}.json"
+        request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        deadline = time.monotonic() + self.settings.bridge_timeout_seconds
+        while time.monotonic() < deadline:
+            if response_path.is_file():
+                try:
+                    response_payload = json.loads(response_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    raise BrainInvalidSchema("Codex bridge response is not valid JSON") from error
+                if not isinstance(response_payload, dict) or response_payload.get("request_id") != request_id:
+                    raise BrainInvalidSchema("Codex bridge response request_id mismatch")
+                message = response_payload.get("message")
+                if not isinstance(message, dict) or str(message.get("role") or "assistant") != "assistant":
+                    raise BrainInvalidSchema("Codex bridge response must contain an assistant message")
+                metadata = response_payload.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                metadata = {
+                    **metadata,
+                    "status": "CODEX_BRIDGE_RESPONSE",
+                    "review_provider": "CODEX_DEVELOPMENT_BRIDGE",
+                    "model_mode": self.settings.model_mode,
+                    "request_id": request_id,
+                    "input_hash": hashlib.sha256(
+                        json.dumps(input_payload or {}, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+                    ).hexdigest(),
+                    "provider_posts": self.post_count,
+                    "bridge_request_path": str(request_path),
+                    "bridge_response_path": str(response_path),
+                }
+                try:
+                    request_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self.post_count += 1
+                return message, metadata
+            time.sleep(self.settings.bridge_poll_seconds)
+        raise BrainTimeout(f"Codex bridge response timed out after {self.settings.bridge_timeout_seconds:.0f}s")
 
     def run_agent_loop(
         self,
@@ -675,7 +821,12 @@ class WebsiteBrainProvider:
 
     def _messages(self, prompt: str, input_payload: dict[str, object]) -> list[dict[str, object]]:
         user_text = json.dumps(input_payload, ensure_ascii=False, sort_keys=True)
-        if self.settings.model_mode == "MULTIMODAL_SINGLE_MODEL":
+        # The development bridge is handled by the current Codex operator,
+        # so it receives the same explicit image URL evidence as a remote
+        # multimodal model. The bridge request also carries the captured
+        # local media path in its sanitized evidence payload; no hidden image
+        # or fallback is synthesized here.
+        if self.settings.model_mode in {"MULTIMODAL_SINGLE_MODEL", "CODEX_DEVELOPMENT_BRIDGE"}:
             evidence = self._evidence(input_payload)
             image_url = str(evidence.get("image_url") or evidence.get("selected_media_url") or "").strip()
             if image_url:

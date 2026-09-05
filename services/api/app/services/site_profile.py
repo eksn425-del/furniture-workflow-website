@@ -11,7 +11,7 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.services.native_contracts import SiteProfileContract
 from app.services.strategy_catalog import StrategyPlan, default_strategy_plan, validate_strategy_plan
@@ -29,6 +29,18 @@ def _validate_public_source_url(value: str) -> None:
     parsed = urlsplit(str(value).strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("site_profile_source_url_must_be_public_http_url")
+
+
+def _safe_public_url(value: str) -> str:
+    if not str(value).strip():
+        return ""
+    parsed = urlsplit(str(value).strip())
+    sensitive = ("token", "cookie", "auth", "password", "secret", "session", "credential", "api_key", "apikey")
+    query = urlencode([
+        (key, item) for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if not any(part in str(key).casefold().replace("-", "_") for part in sensitive)
+    ], doseq=True)
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", query, ""))
 
 
 def _contains_secret_key(value: object) -> bool:
@@ -70,7 +82,7 @@ def build_site_profile(
     payload = {
         "schema_version": "website-site-profile.v1",
         "site_key": str(site_key).strip(),
-        "source_url": str(source_url).strip(),
+        "source_url": _safe_public_url(str(source_url).strip()),
         "source_type": str(source_type or "UNKNOWN").strip().upper(),
         "platform": str(platform or "UNKNOWN").strip().upper(),
         **selected,
@@ -99,6 +111,8 @@ def validate_site_profile(payload: Mapping[str, Any], *, allow_draft: bool = Tru
         raise ValueError("site_profile_strategy_invalid:" + ",".join(errors))
     profile = SiteProfileContract.model_validate(payload)
     _validate_public_source_url(profile.source_url)
+    if profile.source_url != _safe_public_url(profile.source_url):
+        raise ValueError("site_profile_sensitive_query_parameter_forbidden")
     if not allow_draft and profile.status != "VALIDATED":
         raise ValueError("site_profile_not_validated")
     return profile
@@ -114,6 +128,23 @@ def profile_is_reusable(payload: Mapping[str, Any] | None, *, site_key: str, pla
     if profile.site_key != site_key or profile.status != "VALIDATED":
         return False
     return not platform or profile.platform in {"UNKNOWN", str(platform).upper()}
+
+
+def profile_capability_evidence_valid(payload: Mapping[str, Any] | None) -> bool:
+    """Require evidence for every reusable strategy capability.
+
+    Strategy names alone are configuration, not a verified SiteProfile.  Older
+    rows without this receipt remain safe DRAFT/STALE and are relearned.
+    """
+    if not isinstance(payload, Mapping) or str(payload.get("status") or "").upper() != "VALIDATED":
+        return False
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), Mapping) else {}
+    bounded = evidence.get("bounded_verification") if isinstance(evidence.get("bounded_verification"), Mapping) else {}
+    capability = bounded.get("capability_evidence") if isinstance(bounded.get("capability_evidence"), Mapping) else evidence.get("capability_evidence")
+    if not isinstance(capability, Mapping):
+        return False
+    fields = ("taxonomy_strategy", "product_discovery_strategy", "pagination_strategy", "pdp_strategy", "image_strategy", "dimension_strategy")
+    return all(capability.get(field) is True for field in fields)
 
 
 def profile_drift_reasons(
@@ -148,6 +179,6 @@ def profile_drift_reasons(
 
 
 __all__ = [
-    "SECRET_KEYS", "build_site_profile", "profile_drift_reasons", "profile_is_reusable", "profile_version_for",
+    "SECRET_KEYS", "build_site_profile", "profile_capability_evidence_valid", "profile_drift_reasons", "profile_is_reusable", "profile_version_for",
     "validate_site_profile",
 ]

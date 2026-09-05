@@ -14,7 +14,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from workers.scrape.http_client import (
@@ -289,6 +289,15 @@ _IMAGE_NEGATIVE_RE = re.compile(
     r"thumbnail|thumb|sprite|icon|logo|placeholder|alternate|alt[-_ ]?view)",
     re.I,
 )
+# Label-first form used by many accessible HTML tables: ``W 30 in x D 32 in
+# x H 34 in``.  Keep it explicit so arbitrary numbers in prose are not
+# mistaken for product dimensions.
+LABELLED_DIMENSION_RE = re.compile(
+    r"[w宽]\s*(?P<w>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*[x×*]\s*"
+    r"[d深]\s*(?P<d>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*[x×*]\s*"
+    r"[h高]\s*(?P<h>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?",
+    re.I,
+)
 _IMAGE_POSITIVE_RE = re.compile(r"(?:main|primary|hero|product|gallery|detail|front)", re.I)
 
 
@@ -361,7 +370,7 @@ def rank_product_images(
         "BROWSER_GALLERY": 88,
         "OG_IMAGE": 60,
     }
-    for candidate in candidates:
+    for candidate_index, candidate in enumerate(candidates):
         raw_url = str(candidate.get("url") or "").strip()
         if not raw_url:
             continue
@@ -394,8 +403,11 @@ def rank_product_images(
             "score": score,
             "accepted": accepted,
             "reasons": reasons,
+            "gallery_index": candidate_index,
         })
-    ranked.sort(key=lambda item: (-int(item["score"]), str(item["url"])))
+    # Keep source/gallery order for equal scores.  URL lexical order can move a
+    # later recommended SKU ahead of the product's first gallery image.
+    ranked.sort(key=lambda item: (-int(item["score"]), int(item.get("gallery_index") or 0)))
     return ranked[:24]
 
 
@@ -835,7 +847,7 @@ class NativeBrowserCollector:
 
 def _parse_dimension_text(visible: str) -> tuple[dict[str, float], str]:
     """从页面可见文本解析 Overall/紧凑/间距式尺寸，返回 (dimensions, unit)。"""
-    for pattern in (OVERALL_DIMENSION_RE, WIDTH_HEIGHT_DEPTH_RE, DIMENSION_SPACED_RE, DIMENSION_RE):
+    for pattern in (OVERALL_DIMENSION_RE, WIDTH_HEIGHT_DEPTH_RE, DIMENSION_SPACED_RE, DIMENSION_RE, LABELLED_DIMENSION_RE):
         match = pattern.search(visible)
         if match:
             dimensions = {
@@ -878,12 +890,14 @@ class ProductAcquisitionEngine:
         request_budget: int = 120,
         client_factory=SafeHttpClient,
         site_profile: Mapping[str, Any] | None = None,
+        agent_recovery: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.source_url = _canonical_url(source_url)
         self.site_key = site_key
         self.source_type = source_type if source_type in SOURCE_TYPES else "UNKNOWN"
         self.site_profile = dict(site_profile) if isinstance(site_profile, Mapping) else {}
         self.site_profile_reusable = str(self.site_profile.get("status") or "").upper() == "VALIDATED" and str(self.site_profile.get("site_key") or site_key) == site_key
+        self.agent_recovery = agent_recovery
         self.categories = self._compact_scopes(categories)
         self.workspace = Path(workspace).resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -1275,7 +1289,11 @@ class ProductAcquisitionEngine:
                 seen_pages = [str(value) for value in cursor.get("seen_page_urls") or []]
                 if current_page_url in seen_pages:
                     cursor["next_url"] = None
-                    cursor["exhausted"] = True
+                    # A repeated cursor is a pagination fault, not proof that
+                    # the catalogue ended.  Keep it resumable/visible as
+                    # PAGINATION_UNVERIFIED so an Agent or operator can choose
+                    # a different continuation strategy.
+                    cursor["exhausted"] = False
                     cursor["pagination_status"] = "REPEATED_CURSOR"
                     continue
                 html, acquisition = self._get_html(current_page_url)
@@ -1370,6 +1388,56 @@ class ProductAcquisitionEngine:
             payload["discovery_status"] = "PAGINATION_UNVERIFIED"
         elif not any(isinstance(cursor, dict) and not cursor.get("exhausted") for cursor in cursors.values()):
             payload["discovery_status"] = "EXHAUSTED"
+        # Generic-core pagination faults may be handed to the same configured
+        # Website Brain/Agent session.  The callback must return real tool
+        # evidence (products/next cursor); no prefilled PASS is accepted.
+        if payload.get("discovery_status") == "PAGINATION_UNVERIFIED" and self.agent_recovery and not payload.get("agent_recovery_attempted"):
+            payload["agent_recovery_attempted"] = True
+            before_recovery_count = len(products)
+            recovery = self.agent_recovery({
+                "source_url": self.source_url,
+                "cursors": cursors,
+                "products_seen": len(products),
+                "reason": "PAGINATION_UNVERIFIED",
+            }) or {}
+            recovery_payload = dict(recovery) if isinstance(recovery, dict) else {"status": "INVALID_RESPONSE"}
+            recovered_products = recovery.get("products") if isinstance(recovery, dict) else []
+            recovery_evidence_products: list[dict[str, Any]] = []
+            for item in recovered_products if isinstance(recovered_products, list) else []:
+                if isinstance(item, AcquiredProduct):
+                    self._store_product(payload, item)
+                    recovery_evidence_products.append(asdict(item))
+                elif isinstance(item, dict):
+                    try:
+                        product = AcquiredProduct(**item)
+                    except (TypeError, ValueError):
+                        continue
+                    self._store_product(payload, product)
+                    recovery_evidence_products.append(asdict(product))
+            if isinstance(recovery, dict) and "products" in recovery:
+                # Checkpoints are JSON evidence, never an in-memory object
+                # graph.  The durable product record above remains the source
+                # of truth for subsequent discovery/resume.
+                recovery_payload["products"] = recovery_evidence_products
+            payload["agent_recovery"] = recovery_payload
+            next_url = str(recovery.get("next_url") or "").strip() if isinstance(recovery, dict) else ""
+            if next_url:
+                for cursor in cursors.values():
+                    if isinstance(cursor, dict) and cursor.get("visited") and not cursor.get("exhausted"):
+                        cursor["next_url"] = next_url
+                        cursor["pagination_status"] = "AGENT_RECOVERED_CURSOR"
+                        break
+                payload["discovery_status"] = "AGENT_RECOVERED"
+            elif bool(recovery.get("explicit_end")) if isinstance(recovery, dict) else False:
+                for cursor in cursors.values():
+                    if isinstance(cursor, dict) and cursor.get("visited") and not cursor.get("exhausted"):
+                        cursor["exhausted"] = True
+                        cursor["pagination_status"] = "EXPLICIT_END"
+                        break
+                payload["discovery_status"] = "EXHAUSTED"
+            if len(payload.get("products") or {}) > before_recovery_count or next_url:
+                self._write(payload)
+                return
         self._write(payload)
 
     def _discover_magento_products(
@@ -1576,7 +1644,10 @@ class ProductAcquisitionEngine:
             media_binding_status="COMPATIBLE",
             media_binding_confidence=0.9,
             scope_status="PASS",
-            dimension_lookup_state="OFFICIAL_FOUND" if dimensions else "OFFICIAL_ABSENT_CONFIRMED",
+            # An empty description is an incomplete lookup, not proof that the
+            # catalogue has no dimensions.  Only an explicit completed absence
+            # review may unlock an AI estimate later in the pipeline.
+            dimension_lookup_state="OFFICIAL_FOUND" if dimensions else "OFFICIAL_LOOKUP_INCOMPLETE",
         )
 
     @staticmethod

@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from uuid import uuid4
 
 from app.services.brain_provider import (
@@ -28,6 +28,7 @@ from app.services.product_acquisition import (
     NativeBrowserCollector,
     ProductAcquisitionEngine,
     classify_source_type,
+    _first_text,
     _parse_dimension_text,
     rank_product_images,
 )
@@ -66,6 +67,13 @@ CATEGORY_WORDS = {
     "家具", "客厅", "卧室", "餐厅", "办公", "户外", "椅", "沙发", "桌", "床", "灯", "地毯", "收纳", "装饰",
 }
 BLOCKED_SEGMENTS = {"account", "login", "signin", "cart", "checkout", "search", "blog", "news", "privacy", "terms", "help"}
+
+
+def _visible_html_text(page_html: str) -> str:
+    """Extract bounded visible text without persisting inline config/scripts."""
+
+    without_nonvisual = re.sub(r"<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>", " ", page_html, flags=re.I | re.S)
+    return " ".join(re.sub(r"<[^>]+>", " ", html_lib.unescape(without_nonvisual)).split())
 # 营销/主题页路径段：这些不是真实商品类目，混进类目清单会污染两级结构。
 MARKETING_SEGMENTS = {
     "collection", "collections", "sale", "clearance", "new-arrivals", "best-sellers", "featured",
@@ -110,7 +118,11 @@ def normalize_site_url(value: str) -> str:
     parsed = urlsplit(value.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("URL must be a public http(s) URL without credentials")
-    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
+    safe_query = urlencode([
+        (key, item) for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if not any(part in str(key).casefold().replace("-", "_") for part in ("token", "cookie", "auth", "password", "secret", "session", "credential", "api_key", "apikey"))
+    ], doseq=True)
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", safe_query, ""))
 
 
 def site_key_for(value: str) -> str:
@@ -814,7 +826,11 @@ class NativeSiteAnalyzer:
             # 数量补全：优先一级类目（页面少、信息密度高），再补二级类目；
             # 一次扫描尽量覆盖全部 UNKNOWN，避免要求用户多次续扫。
             ordered = sorted(categories, key=lambda item: (item.level != 1, item.path))
-            unknown_targets = [category for category in ordered[:MAX_COUNT_PROBES] if category.count_kind == "UNKNOWN"]
+            try:
+                count_probe_limit = max(1, min(MAX_COUNT_PROBES, int(os.getenv("WEBSITE_L1_COUNT_PROBES", "24"))))
+            except (TypeError, ValueError):
+                count_probe_limit = 24
+            unknown_targets = [category for category in ordered[:count_probe_limit] if category.count_kind == "UNKNOWN"]
             if unknown_targets:
                 # 预算按待补证类目数自适应，而不是固定小预算导致 PARTIAL。
                 probe_client = self.client_factory(
@@ -851,7 +867,7 @@ class NativeSiteAnalyzer:
                 except BrainError as error:
                     brain_metadata["source_status"] = {"status": error.code}
             if ambiguous:
-                brain_result, brain_metadata = self._brain_agent_taxonomy(normalized, signals, categories, client)
+                brain_result, brain_metadata = self._brain_agent_taxonomy(normalized, signals, categories, client, output_dir=root)
                 if brain_result is not None:
                     brain_metadata["output"] = brain_result.model_dump(mode="json")
                     categories = self._merge_brain(categories, brain_result)
@@ -867,6 +883,10 @@ class NativeSiteAnalyzer:
             if profile_drift == ["PROFILE_MARKED_STALE"] and profile_reusable:
                 profile_reusable = False
             profile_payload = brain_metadata.get("site_profile") if isinstance(brain_metadata.get("site_profile"), dict) else None
+            new_profile_validated = bool(
+                isinstance(profile_payload, Mapping)
+                and str(profile_payload.get("status") or "").upper() == "VALIDATED"
+            )
             if profile_payload is None and profile_reusable and not profile_drift:
                 profile_payload = dict(existing_profile) if isinstance(existing_profile, Mapping) else None
             if profile_payload is None:
@@ -881,11 +901,19 @@ class NativeSiteAnalyzer:
                     confidence=max((item.confidence for item in categories), default=0.0),
                     previous=existing_profile if isinstance(existing_profile, Mapping) else None,
                 )
-            if profile_drift:
+            # Drift belongs to the profile that was used as the input snapshot.
+            # If this scan has just produced a newly validated replacement, do
+            # not relabel that new version STALE because the old version had a
+            # different platform/strategy.  The previous version is retained in
+            # the evidence lineage for audit, while only a failed/incomplete
+            # replacement remains stale.
+            if profile_drift and not new_profile_validated:
                 profile_payload["status"] = "STALE"
             brain_metadata["site_profile_reused"] = profile_reusable and not profile_drift
-            if profile_drift:
+            if profile_drift and not new_profile_validated:
                 brain_metadata["site_profile_drift"] = profile_drift
+            elif profile_drift and new_profile_validated:
+                brain_metadata["site_profile_migrated_from"] = str(existing_profile.get("profile_version") or "") if isinstance(existing_profile, Mapping) else ""
             scan_evidence = {"l0": signals, "http": client.telemetry(), "sitemaps": sitemap_urls, "sitemap_hits": len(sitemap_hits), "magento_graphql_taxonomy": magento_taxonomy_evidence, "magento_graphql_counts": magento_count_evidence}
             agent_trace = brain_metadata if str(brain_metadata.get("status") or "").startswith("AGENT") else brain_metadata.get("agent_loop") if isinstance(brain_metadata.get("agent_loop"), dict) else {}
             receipt = self._receipt(normalized, site_key, live=True, status=status, categories=categories, evidence=scan_evidence, brain=brain_metadata, site_profile=profile_payload, agent_trace=agent_trace, blocker=None if status == "READY" else {"code": str(status), "message": self._blocker_message(str(status))}, source_type=source_type)
@@ -1176,6 +1204,8 @@ class NativeSiteAnalyzer:
         count_results: dict[str, dict[str, object]] | None = None,
         strategy_results: dict[str, object] | None = None,
         profile_result: dict[str, object] | None = None,
+        browser_session_dir: Path | None = None,
+        browser_output_dir: Path | None = None,
     ) -> Callable[[str, dict[str, object]], dict[str, object]]:
         def execute(name: str, args: dict[str, object]) -> dict[str, object]:
             try:
@@ -1187,6 +1217,8 @@ class NativeSiteAnalyzer:
                     count_results=count_results,
                     strategy_results=strategy_results,
                     profile_result=profile_result,
+                    browser_session_dir=browser_session_dir,
+                    browser_output_dir=browser_output_dir,
                 )
             except RequestBudgetExceeded as error:
                 raise AgentToolError("REQUEST_BUDGET_EXCEEDED", str(error)) from error
@@ -1204,6 +1236,8 @@ class NativeSiteAnalyzer:
         count_results: dict[str, dict[str, object]] | None = None,
         strategy_results: dict[str, object] | None = None,
         profile_result: dict[str, object] | None = None,
+        browser_session_dir: Path | None = None,
+        browser_output_dir: Path | None = None,
     ) -> dict[str, object]:
         if name not in {"validate_strategy", "finish_site_profile"}:
             raw_url = str(args.get("url") or (source_url if name == "list_categories" else "")).strip()
@@ -1223,8 +1257,7 @@ class NativeSiteAnalyzer:
             html = client.get_html(url)
             parser = _NavigationParser()
             parser.feed(html)
-            visible = re.sub(r"<[^>]+>", " ", html)
-            visible = " ".join(visible.split())
+            visible = _visible_html_text(html)
             nav = [
                 {"href": urljoin(url, anchor["href"]), "label": anchor["text"]}
                 for anchor in parser.anchors[:40]
@@ -1242,9 +1275,18 @@ class NativeSiteAnalyzer:
                 raise AgentToolError("BAD_ARGS", "list_categories requires url")
             html = client.get_html(url)
             cats, _ = self._l0_l1(url, html)
+            if not cats:
+                # A direct category URL is itself bounded taxonomy evidence;
+                # do not promote an empty strategy name, but retain the
+                # explicitly requested scope when navigation markup is absent.
+                fallback = self._source_scope_category(url)
+                if fallback is not None:
+                    self._enrich_count(fallback, html)
+                    cats = [fallback]
             outcome = {"url": url, "categories": [c.model_dump(mode="json") for c in cats[:30]], "strategy": "NAV_TREE", "bounded": True}
             if strategy_results is not None:
                 strategy_results["taxonomy_strategy"] = "NAV_TREE"
+                strategy_results.setdefault("_evidence", {})["taxonomy_strategy"] = outcome
             return outcome
         if name == "get_count":
             url = str(args.get("url") or "").strip()
@@ -1284,6 +1326,7 @@ class NativeSiteAnalyzer:
             outcome = {"url": url, "strategy": strategy, "products": links[:limit], "product_count": len(links[:limit]), "bounded": True}
             if strategy_results is not None:
                 strategy_results["product_discovery_strategy"] = strategy
+                strategy_results.setdefault("_evidence", {})["product_discovery_strategy"] = outcome
             return outcome
         if name == "inspect_product":
             url = str(args.get("url") or "").strip()
@@ -1291,7 +1334,7 @@ class NativeSiteAnalyzer:
                 raise AgentToolError("BAD_ARGS", "inspect_product requires url")
             html = client.get_html(url)
             products = [item for item in _json_ld_values(html) if str(item.get("@type") or "").casefold() == "product"]
-            visible = " ".join(re.sub(r"<[^>]+>", " ", html_lib.unescape(html)).split())
+            visible = _visible_html_text(html)
             dimensions, unit = _parse_dimension_text(visible)
             outcome = {
                 "url": url,
@@ -1305,6 +1348,7 @@ class NativeSiteAnalyzer:
             }
             if strategy_results is not None:
                 strategy_results["pdp_strategy"] = outcome["pdp_strategy"]
+                strategy_results.setdefault("_evidence", {})["pdp_strategy"] = outcome
             return outcome
         if name == "inspect_pagination":
             url = str(args.get("url") or "").strip()
@@ -1324,6 +1368,7 @@ class NativeSiteAnalyzer:
             outcome = {"url": url, "next_url": next_url, "explicit_end": bool(explicit_end), "strategy": strategy, "bounded": True}
             if strategy_results is not None:
                 strategy_results["pagination_strategy"] = strategy
+                strategy_results.setdefault("_evidence", {})["pagination_strategy"] = outcome
             return outcome
         if name == "list_product_images":
             url = str(args.get("url") or "").strip()
@@ -1343,23 +1388,37 @@ class NativeSiteAnalyzer:
             }
             if strategy_results is not None:
                 strategy_results["image_strategy"] = outcome["image_strategy"]
+                strategy_results.setdefault("_evidence", {})["image_strategy"] = outcome
             return outcome
         if name == "inspect_dimensions":
             url = str(args.get("url") or "").strip()
             if not url:
                 raise AgentToolError("BAD_ARGS", "inspect_dimensions requires url")
             html = client.get_html(url)
-            visible = " ".join(re.sub(r"<[^>]+>", " ", html_lib.unescape(html)).split())
+            visible = _visible_html_text(html)
             dimensions, unit = _parse_dimension_text(visible)
             state = "OFFICIAL_FOUND" if dimensions else "OFFICIAL_LOOKUP_INCOMPLETE"
-            outcome = {"url": url, "dimensions": dimensions, "dimension_unit": unit, "dimension_lookup_state": state, "strategy": "PDP_DIMENSION_TEXT" if dimensions else "SPECIFICATION_PANEL"}
+            outcome = {
+                "url": url,
+                "dimensions": dimensions,
+                "dimension_unit": unit,
+                "dimension_lookup_state": state,
+                "checked_pages": [url],
+                "completed": True,
+                "official_absent": False,
+                "strategy": "PDP_DIMENSION_TEXT" if dimensions else "SPECIFICATION_PANEL",
+            }
             if strategy_results is not None:
                 strategy_results["dimension_strategy"] = outcome["strategy"]
+                strategy_results.setdefault("_evidence", {})["dimension_strategy"] = outcome
             return outcome
         if name == "validate_strategy":
             valid, errors = validate_strategy_plan(args)
             if strategy_results is not None:
                 strategy_results["strategy_validated"] = valid
+                strategy_results.setdefault("_evidence", {})["strategy_catalog"] = {
+                    "valid": valid, "errors": errors, "catalog_checked": True,
+                }
             return {"valid": valid, "errors": errors, "catalog": strategy_catalog_payload()}
         if name == "finish_site_profile":
             platform = str(args.get("platform") or "UNKNOWN").strip().upper()
@@ -1371,12 +1430,44 @@ class NativeSiteAnalyzer:
             valid, errors = validate_strategy_plan(plan_payload)
             if not valid:
                 raise AgentToolError("UNSUPPORTED_STRATEGY_REQUIRED", ",".join(errors))
+            evidence_map = strategy_results.get("_evidence") if isinstance(strategy_results, dict) else {}
+            evidence_map = evidence_map if isinstance(evidence_map, dict) else {}
+
+            def _capability_evidence_ok(field: str, evidence: object) -> bool:
+                if not isinstance(evidence, dict):
+                    return False
+                if field == "taxonomy_strategy":
+                    return bool(evidence.get("categories"))
+                if field == "product_discovery_strategy":
+                    try:
+                        product_count = int(evidence.get("product_count") or 0)
+                    except (TypeError, ValueError):
+                        product_count = 0
+                    return bool(evidence.get("products")) or product_count > 0
+                if field == "pagination_strategy":
+                    # A terminal page is valid only when the tool explicitly
+                    # observed an end control.  A next cursor is equally valid.
+                    return bool(evidence.get("next_url")) or bool(evidence.get("explicit_end"))
+                if field == "pdp_strategy":
+                    return bool(evidence.get("has_product_identity")) and bool(evidence.get("name"))
+                if field == "image_strategy":
+                    selected = evidence.get("selected")
+                    return isinstance(selected, dict) and bool(selected.get("accepted")) and bool(selected.get("url"))
+                if field == "dimension_strategy":
+                    return bool(evidence.get("dimensions")) and str(evidence.get("dimension_lookup_state") or "").upper() == "OFFICIAL_FOUND"
+                return False
+
             verification = {
                 field: strategy_results.get(field) == selected
                 for field, selected in plan_payload.items()
             } if strategy_results is not None else {field: False for field in plan_payload}
             verification["strategy_catalog_valid"] = bool(strategy_results and strategy_results.get("strategy_validated") is True)
-            fully_verified = valid and all(verification.values())
+            capability_verification = {
+                field: _capability_evidence_ok(field, evidence_map.get(field))
+                for field in plan_payload
+            }
+            verification["capability_evidence"] = capability_verification
+            fully_verified = valid and all(verification.values()) and all(capability_verification.values())
             try:
                 profile = build_site_profile(
                     site_key=site_key_for(source_url),
@@ -1392,6 +1483,7 @@ class NativeSiteAnalyzer:
                     evidence={
                         **(args.get("evidence") if isinstance(args.get("evidence"), dict) else {}),
                         "bounded_verification": verification,
+                        "capability_evidence": evidence_map,
                     },
                 )
                 validated = validate_site_profile(profile, allow_draft=not fully_verified).model_dump(mode="json")
@@ -1402,7 +1494,36 @@ class NativeSiteAnalyzer:
                 profile_result.update(validated)
             return validated
         if name == "escalate_browser":
-            return {"status": "BROWSER_REQUIRED", "url": str(args.get("url") or ""), "reason": "agent requested visible browser escalation; not treated as a CAPTCHA claim"}
+            target = str(args.get("url") or source_url).strip()
+            session_dir = Path(browser_session_dir or (self.output_root / "_control" / "browser_sessions" / site_key_for(source_url))).resolve()
+            output_dir = Path(browser_output_dir or (self.output_root / "_control" / "agent_browser" / site_key_for(source_url))).resolve()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                page_html = NativeBrowserCollector(session_dir).get_html(target)
+                return {
+                    "status": "BROWSER_FETCHED",
+                    "url": target,
+                    "browser_target": target,
+                    "session_dir": str(session_dir),
+                    "resume_token": hashlib.sha256(f"{site_key_for(source_url)}|{session_dir}".encode()).hexdigest()[:20],
+                    "html_bytes": len(page_html.encode("utf-8")),
+                    "evidence": {"acquisition": "L2_BROWSER", "same_session": True, "visible_target": target},
+                }
+            except BrowserHumanRequired as error:
+                return {
+                    "status": "HUMAN_REQUIRED", "url": error.url or target,
+                    "browser_target": error.url or target, "session_dir": str(error.session_dir),
+                    "resume_token": hashlib.sha256(f"{site_key_for(source_url)}|{error.session_dir}".encode()).hexdigest()[:20],
+                    "reason_code": error.reason_code, "evidence": error.evidence,
+                }
+            except (BrowserTemporaryFailure, BrowserAccessDenied) as error:
+                return {
+                    "status": "BROWSER_RESUME_REQUIRED", "url": getattr(error, "url", target) or target,
+                    "browser_target": getattr(error, "url", target) or target,
+                    "session_dir": str(getattr(error, "session_dir", session_dir)),
+                    "resume_token": hashlib.sha256(f"{site_key_for(source_url)}|{session_dir}".encode()).hexdigest()[:20],
+                    "reason_code": getattr(error, "reason_code", type(error).__name__.upper()),
+                }
         raise AgentToolError("UNKNOWN_TOOL", f"unknown agent tool {name!r}")
 
     @staticmethod
@@ -1433,6 +1554,8 @@ class NativeSiteAnalyzer:
         signals: dict[str, object],
         categories: list[TaxonomyCategoryContract],
         client: SafeHttpClient,
+        *,
+        output_dir: Path | None = None,
     ) -> tuple[BrainTaxonomyResponse | None, dict[str, object]]:
         """Run the Brain as an agent to build the taxonomy; fall back to rules."""
         if (
@@ -1481,6 +1604,7 @@ class NativeSiteAnalyzer:
                     count_results=count_results,
                     strategy_results=strategy_results,
                     profile_result=profile_result,
+                    browser_output_dir=output_dir,
                 ),
                 options=AgentLoopOptions(
                     response_schema=BrainTaxonomyResponse,
@@ -1510,7 +1634,13 @@ class NativeSiteAnalyzer:
             "provider_posts": result.provider_posts,
             "agent_run_id": f"agent_{uuid4().hex}",
             "task": "taxonomy_and_site_profile",
-            "selected_strategies": {**default_plan, **strategy_results},
+            "selected_strategies": {
+                field: strategy_results.get(field, default_plan.get(field))
+                for field in (
+                    "taxonomy_strategy", "product_discovery_strategy", "pagination_strategy",
+                    "pdp_strategy", "image_strategy", "dimension_strategy",
+                )
+            },
             "input_evidence_sha256": hashlib.sha256(json.dumps(input_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
         }
         stop_code = str(result.stop_code or result.stopped_reason)

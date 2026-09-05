@@ -308,14 +308,36 @@ class ProductionRuntimeService:
             session.flush()
         site = session.get(SiteRegistryRecord, job.site_key)
         site_profile: dict[str, Any] | None = None
-        profile_row = session.get(SiteProfile, job.site_key)
-        if profile_row is not None and profile_row.profile_json:
+        migration_requested = bool(policy.get("migrate_site_profile") or policy.get("site_profile_migration_requested"))
+        frozen_raw = None if migration_requested else job.site_profile_snapshot_json or policy.get("site_profile_snapshot_json")
+        if frozen_raw:
             try:
-                parsed_profile = json.loads(profile_row.profile_json)
-                if isinstance(parsed_profile, dict):
-                    site_profile = parsed_profile
+                parsed_frozen = json.loads(frozen_raw) if isinstance(frozen_raw, str) else frozen_raw
+                if isinstance(parsed_frozen, dict):
+                    site_profile = parsed_frozen
+                    if not job.site_profile_snapshot_json:
+                        job.site_profile_snapshot_json = json.dumps(site_profile, ensure_ascii=False, sort_keys=True)
+                        job.site_profile_version = str(site_profile.get("profile_version") or "") or None
             except (TypeError, ValueError, json.JSONDecodeError):
                 site_profile = None
+        if site_profile is None and not frozen_raw:
+            profile_row = session.get(SiteProfile, job.site_key)
+            if profile_row is not None and profile_row.profile_json:
+                try:
+                    parsed_profile = json.loads(profile_row.profile_json)
+                    if isinstance(parsed_profile, dict):
+                        site_profile = parsed_profile
+                        # Freeze at first launch.  ``_contract`` runs inside
+                        # the launch transaction, so a resume cannot observe a
+                        # later SiteProfile unless the operator explicitly
+                        # clears/migrates this snapshot.
+                        job.site_profile_snapshot_json = json.dumps(site_profile, ensure_ascii=False, sort_keys=True)
+                        job.site_profile_version = str(site_profile.get("profile_version") or "") or None
+                        policy["site_profile_snapshot_json"] = job.site_profile_snapshot_json
+                        policy["site_profile_version"] = job.site_profile_version
+                        job.policy_json = json.dumps(policy, ensure_ascii=False)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    site_profile = None
         contract = {
             "schema_version": "job-contract.v3",
             "job_id": job.job_id,
@@ -339,6 +361,9 @@ class ProductionRuntimeService:
             "allow_shortfall_delivery": bool(policy.get("allow_shortfall_delivery", False)),
             "source_type": site.source_kind if site else "UNKNOWN",
             "site_profile": site_profile,
+            "site_profile_version": str((site_profile or {}).get("profile_version") or job.site_profile_version or ""),
+            "site_profile_frozen": bool(site_profile is not None),
+            "site_profile_migration_requested": migration_requested,
             "provider": job.provider,
             "authorization": {
                 "approve_paid_generation": job.provider.upper() != "OFF" and job.provider_safety == "PRODUCTION_READY",
@@ -504,12 +529,18 @@ class ProductionRuntimeService:
             if isinstance(payload.get(key), int):
                 setattr(job, attribute, int(payload[key]))
         ledger_posts = session.scalar(
-            select(func.coalesce(func.sum(ProductionProviderTask.post_attempts), 0)).where(
+            select(func.coalesce(func.sum(ProductionProviderTask.billable_attempts), 0)).where(
                 ProductionProviderTask.job_id == job_id
             )
         )
+        unknown_posts = session.scalar(
+            select(func.count(ProductionProviderTask.ledger_id)).where(
+                ProductionProviderTask.job_id == job_id,
+                ProductionProviderTask.status == "SUBMISSION_UNKNOWN",
+            )
+        ) or 0
         event_posts = payload.get("provider_calls") if isinstance(payload.get("provider_calls"), int) else 0
-        job.provider_calls = max(job.provider_calls, int(event_posts), int(ledger_posts or 0))
+        job.provider_calls = max(job.provider_calls, int(event_posts), int(ledger_posts or 0) + int(unknown_posts))
         if isinstance(payload.get("ready_count"), int):
             job.ready_count = int(payload["ready_count"])
         if event_type == "TARGET_SHORTAGE":

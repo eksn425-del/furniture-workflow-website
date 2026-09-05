@@ -20,7 +20,13 @@ from sqlalchemy import select
 
 from app.database import Database
 from app.models import ProductionProviderTask, ProductionRegistryEntry, utc_now
-from app.services.brain_provider import BrainError, BrainNotConfigured, WebsiteBrainProvider
+from app.services.brain_provider import (
+    AgentLoopOptions,
+    AgentToolError,
+    BrainError,
+    BrainNotConfigured,
+    WebsiteBrainProvider,
+)
 from app.services.product_acquisition import (
     AcquiredProduct,
     BrowserAccessDenied,
@@ -65,9 +71,26 @@ from packages.workflow_core.statuses import ItemState
 from workers.modeling_provider import Lux3DClient, is_capacity_rejection
 from workers.blender_adapter import BlenderAdapterError, ModelDimensionConflict, resolve_blender_adapter, validate_glb
 from workers.scrape.http_client import NetworkPolicyError, RobotsDenied, SafeHttpClient
+from pydantic import BaseModel, ConfigDict, Field
 
 
 Emit = Callable[[str, str, str, int | None, int | None, dict[str, Any] | None], None]
+
+
+class PaginationAgentRecovery(BaseModel):
+    """Strict output of the same Website Brain used by taxonomy discovery.
+
+    The model may select URLs only from tool evidence.  Product payloads are
+    deliberately absent: the production collector fetches and parses every
+    selected PDP itself before anything enters the candidate pool.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    product_urls: list[str] = Field(default_factory=list, max_length=24)
+    next_url: str = ""
+    explicit_end: bool = False
+    reasoning: str = ""
 
 _L2_HUMAN_REQUIRED_REASONS = frozenset({
     L2_BROWSER_REQUIRED,
@@ -228,6 +251,89 @@ _SUPPORTED_DIMENSION_UNITS = frozenset({
     "in", "inch", "inches",
     "ft", "foot", "feet",
 })
+
+_DIMENSION_TO_INCHES = {
+    "in": 1.0, "inch": 1.0, "inches": 1.0,
+    "ft": 12.0, "foot": 12.0, "feet": 12.0,
+    "cm": 1.0 / 2.54, "centimeter": 1.0 / 2.54, "centimeters": 1.0 / 2.54,
+    "mm": 1.0 / 25.4, "millimeter": 1.0 / 25.4, "millimeters": 1.0 / 25.4,
+    "m": 39.37007874015748, "meter": 39.37007874015748, "meters": 39.37007874015748,
+}
+
+
+def _normalized_dimension_unit(value: object) -> str:
+    unit = str(value or "").strip().casefold()
+    aliases = {"\"": "in", "″": "in", "inches": "in", "inch": "in", "feet": "ft", "foot": "ft", "centimeters": "cm", "centimeter": "cm", "millimeters": "mm", "millimeter": "mm", "meters": "m", "meter": "m"}
+    unit = aliases.get(unit, unit)
+    return unit if unit in _SUPPORTED_DIMENSION_UNITS else "source_unit"
+
+
+def _dimension_to_inches(value: object, unit: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    factor = _DIMENSION_TO_INCHES.get(_normalized_dimension_unit(unit))
+    return number * factor if factor is not None else None
+
+
+def _normalize_dimension_lookup(result: object) -> dict[str, Any]:
+    """Normalize L2 dimension adapters without treating an empty parse as absence."""
+    if isinstance(result, dict):
+        raw_dimensions = result.get("dimensions") if isinstance(result.get("dimensions"), dict) else {}
+        raw_axes = result.get("axes") if isinstance(result.get("axes"), dict) else {}
+        # Preserve per-axis provenance/units when an adapter supplies both a
+        # compact dimensions map and richer axis records.  The compact map is
+        # only a value fallback; it must never overwrite an axis-specific unit.
+        raw = {axis: raw_axes.get(axis, raw_dimensions.get(axis)) for axis in ("width", "depth", "height") if axis in raw_axes or axis in raw_dimensions}
+        unit = result.get("dimension_unit") or result.get("unit") or ""
+        state = str(result.get("dimension_lookup_state") or result.get("lookup_status") or "").upper()
+        completed = bool(result.get("completed") or result.get("lookup_completed"))
+        checked_pages = result.get("checked_pages") if isinstance(result.get("checked_pages"), list) else []
+        official_absent = bool(result.get("official_absent")) and completed
+    elif isinstance(result, tuple) and len(result) >= 2:
+        raw, unit = result[0], result[1]
+        state, completed, checked_pages, official_absent = "", False, [], False
+    else:
+        raw, unit, state, completed, checked_pages, official_absent = {}, "", "", False, [], False
+    axes: dict[str, dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for axis in ("width", "depth", "height"):
+            value = raw.get(axis)
+            if isinstance(value, dict):
+                axis_value = value.get("value")
+                axis_unit = value.get("unit") or unit
+                axis_source = value.get("source") or "OFFICIAL_PAGE"
+                axis_evidence = value.get("evidence") or []
+            else:
+                axis_value = value
+                axis_unit = unit
+                axis_source = "OFFICIAL_PAGE"
+                axis_evidence = []
+            try:
+                if axis_value not in (None, "") and float(axis_value) > 0:
+                    normalized_unit = _normalized_dimension_unit(axis_unit)
+                    axes[axis] = {
+                        "value": float(axis_value),
+                        "unit": normalized_unit,
+                        "source": str(axis_source).upper(),
+                        "evidence": axis_evidence if isinstance(axis_evidence, list) else [axis_evidence],
+                    }
+            except (TypeError, ValueError):
+                continue
+    if not state:
+        state = "OFFICIAL_FOUND" if axes and len(axes) == 3 else "OFFICIAL_LOOKUP_INCOMPLETE"
+    if state == "OFFICIAL_ABSENT_CONFIRMED" and not official_absent:
+        state = "OFFICIAL_LOOKUP_INCOMPLETE"
+    return {
+        "axes": axes,
+        "dimensions": {axis: item["value"] for axis, item in axes.items()},
+        "dimension_unit": _normalized_dimension_unit(unit) if unit else (next(iter(axes.values()))["unit"] if axes else ""),
+        "dimension_lookup_state": state,
+        "completed": completed,
+        "checked_pages": checked_pages,
+        "official_absent": official_absent,
+    }
 
 
 def _candidate_from_product(contract: dict[str, Any], product: AcquiredProduct) -> CandidateRecord:
@@ -417,17 +523,35 @@ class WebsiteStageAdapter:
                 "media_path": existing,
                 "media_sha256": candidate.lineage.get("media_sha256"),
             })
-        url = str(candidate.lineage.get("image_url") or candidate.preview_url or "")
-        if not url:
+        primary_url = str(candidate.lineage.get("image_url") or candidate.preview_url or "")
+        candidate_urls = [primary_url]
+        for item in candidate.lineage.get("image_candidates") or []:
+            if isinstance(item, dict) and item.get("accepted") and item.get("url"):
+                value = str(item["url"])
+                if value not in candidate_urls:
+                    candidate_urls.append(value)
+        candidate_urls = candidate_urls[:8]
+        if not primary_url:
             return StageOutcome(StageDecision.REJECTED, "MEDIA_URL_MISSING")
-        try:
-            result = self.media_client_factory(source_url=url, request_budget=8, timeout=30, request_delay=0).get_media(url)
-        except Exception as error:
-            return StageOutcome(StageDecision.REJECTED, f"MEDIA_FETCH_FAILED:{type(error).__name__}")
-        raw = result.content
-        valid_magic = raw.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF8")) or (len(raw) > 12 and raw[8:12] in {b"WEBP", b"avif"})
-        if len(raw) < 1024 or not valid_magic:
-            return StageOutcome(StageDecision.REJECTED, "MEDIA_INVALID_OR_TOO_SMALL")
+        result = None
+        raw = b""
+        selected_url = ""
+        rejected_media: list[dict[str, str]] = []
+        for url in candidate_urls:
+            try:
+                fetched = self.media_client_factory(source_url=url, request_budget=8, timeout=30, request_delay=0).get_media(url)
+                payload = fetched.content
+                valid_magic = payload.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF8")) or (len(payload) > 12 and payload[8:12] in {b"WEBP", b"avif"})
+                if len(payload) < 1024 or not valid_magic:
+                    rejected_media.append({"url": url, "reason": "MEDIA_INVALID_OR_TOO_SMALL"})
+                    continue
+                result, raw, selected_url = fetched, payload, url
+                break
+            except Exception as error:
+                rejected_media.append({"url": url, "reason": f"MEDIA_FETCH_FAILED:{type(error).__name__}"})
+        if result is None:
+            return StageOutcome(StageDecision.REJECTED, "MEDIA_FETCH_FAILED", {"media_candidates_tried": rejected_media})
+        url = selected_url
         suffix = ".jpg" if "jpeg" in result.content_type else ".png" if "png" in result.content_type else ".webp"
         target = self.media_root / f"{candidate.candidate_id}{suffix}"
         target.write_bytes(raw)
@@ -440,6 +564,8 @@ class WebsiteStageAdapter:
             "image_decodable": True,
             "selected_media_url": url,
             "media_role": "MAIN_PRODUCT",
+            "media_rebind_attempts": rejected_media,
+            "media_content_sha256_rebound": True,
         }
         self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
         if self.source_policy.media_policy == "STRICT_MAIN_PRODUCT" and binding_status == "UNKNOWN":
@@ -461,6 +587,9 @@ class WebsiteStageAdapter:
             "category_group": candidate.category_group,
             "image_url": candidate.lineage.get("image_url"),
             "media_sha256": candidate.lineage.get("media_sha256"),
+            "media_bytes": candidate.lineage.get("media_bytes"),
+            "media_content_type": candidate.lineage.get("content_type") or candidate.lineage.get("media_content_type"),
+            "media_path": candidate.lineage.get("media_path"),
             "source_dimensions": candidate.lineage.get("source_dimensions"),
             "selected_media_url": candidate.lineage.get("selected_media_url") or candidate.lineage.get("image_url") or candidate.preview_url,
             "identity_fields": candidate.lineage.get("identity_fields") or {},
@@ -567,7 +696,7 @@ class WebsiteStageAdapter:
     def _stage_date(self, candidate: CandidateRecord) -> StageOutcome:
         return StageOutcome(StageDecision.ACCEPTED, "DATE_POLICY_NOT_RESTRICTED", {"date_policy": "SOURCE_CURRENT_PUBLIC_CATALOG"})
 
-    def _extract_dimensions_bounded(self, url: str, session_dir: Path, timeout: float = 60.0) -> tuple[dict[str, float], str]:
+    def _extract_dimensions_bounded(self, url: str, session_dir: Path, timeout: float = 60.0) -> object:
         """带硬超时的官网尺寸提取。
 
         Playwright 同步事件循环在个别站点（导航/加载事件永不返回）可能永久阻塞，
@@ -601,6 +730,16 @@ class WebsiteStageAdapter:
         axes = ("width", "depth", "height")
         raw_values = candidate.lineage.get("source_dimensions") or {}
         values = {axis: raw_values.get(axis) for axis in axes}
+        raw_unit = _normalized_dimension_unit(candidate.lineage.get("dimension_unit"))
+        axis_evidence: dict[str, dict[str, Any]] = {
+            axis: {
+                "value": values[axis],
+                "unit": raw_unit,
+                "source": "OFFICIAL_PAGE",
+                "evidence": [{"role": "source_dimensions", "source_url": candidate.canonical_url}],
+            }
+            for axis in axes if values.get(axis) not in (None, "")
+        }
         source_hint = str(candidate.lineage.get("dimension_source") or "").strip().upper()
         source_aliases = {
             "EXPLICIT_PAGE_TEXT": "OFFICIAL_PAGE",
@@ -631,11 +770,9 @@ class WebsiteStageAdapter:
             # lookup first.  This ordering is deliberate: an AI estimate is
             # legal only after an explicit official-absence result (or an
             # operator-authorized override), never merely because it exists.
-            browser_dims: dict[str, float] = {}
-            browser_unit = ""
             try:
                 session_dir = Path(str(self.acquisition.browser_session_dir))
-                browser_dims, browser_unit = self._extract_dimensions_bounded(str(candidate.canonical_url), session_dir)
+                lookup = _normalize_dimension_lookup(self._extract_dimensions_bounded(str(candidate.canonical_url), session_dir))
             except BrowserHumanRequired as error:
                 candidate.lineage["dimension_lookup_state"] = "OFFICIAL_LOOKUP_BLOCKED"
                 return StageOutcome(
@@ -667,8 +804,15 @@ class WebsiteStageAdapter:
             except BrowserRuntimeMissing:
                 candidate.lineage["dimension_lookup_state"] = "OFFICIAL_LOOKUP_INCOMPLETE"
                 raise
-            if all(browser_dims.get(axis) for axis in axes):
-                values = {axis: browser_dims[axis] for axis in axes}
+            browser_dims = lookup.get("dimensions") or {}
+            browser_unit = str(lookup.get("dimension_unit") or "")
+            for axis, item in (lookup.get("axes") or {}).items():
+                # L2 evidence wins only for axes it actually observed; a
+                # partial official L1 payload is merged per axis instead of
+                # being replaced by a single unit/value tuple.
+                axis_evidence[axis] = item
+                values[axis] = item.get("value")
+            if len(axis_evidence) == len(axes):
                 source = "OFFICIAL_PAGE"
                 lookup_state = "OFFICIAL_FOUND"
                 candidate.lineage["dimension_source_detail"] = "L2_BROWSER_DIMENSIONS_TAB"
@@ -686,8 +830,11 @@ class WebsiteStageAdapter:
                             "dimension_lookup_state": lookup_state,
                             "dimension_access_status": "INCOMPLETE",
                         })
-                else:
+                elif bool(lookup.get("official_absent")) and bool(lookup.get("completed")):
                     lookup_state = "OFFICIAL_ABSENT_CONFIRMED"
+                    candidate.lineage["dimension_lookup_state"] = lookup_state
+                else:
+                    lookup_state = "OFFICIAL_LOOKUP_INCOMPLETE"
                     candidate.lineage["dimension_lookup_state"] = lookup_state
             else:
                 lookup_state = "OFFICIAL_LOOKUP_INCOMPLETE"
@@ -702,37 +849,50 @@ class WebsiteStageAdapter:
             # AI height/full-axis values are accepted only after the official
             # lookup proved absence, or when the operator explicitly opted in.
             ai_allowed = lookup_state == "OFFICIAL_ABSENT_CONFIRMED" or override
-            ai_height = decision.get("height") if est_source == "AI_ESTIMATED" else None
             ai_values = {axis: decision.get(axis) for axis in axes}
-            if ai_allowed and ai_height:
-                values = {
-                    axis: values.get(axis) or (float(ai_height) if axis == "height" else None)
-                    for axis in axes
-                }
-                source = "AI_ESTIMATED_OVERRIDE" if override and lookup_state != "OFFICIAL_ABSENT_CONFIRMED" else "AI_ESTIMATED"
-                candidate.lineage["dimension_source_detail"] = "AI_HEIGHT_AFTER_OFFICIAL_ABSENCE" if source == "AI_ESTIMATED" else "AI_HEIGHT_EXPLICIT_OVERRIDE"
-                candidate.lineage["dimension_estimation"] = True
-                candidate.lineage["dimension_override_authorized"] = bool(source == "AI_ESTIMATED_OVERRIDE")
-                candidate.lineage["dimension_lookup_state"] = lookup_state or "OFFICIAL_ABSENT_CONFIRMED"
-                unit = str(decision.get("dimension_unit") or "in").strip().casefold()
-                candidate.lineage["dimension_unit"] = unit if unit in _SUPPORTED_DIMENSION_UNITS else "in"
-            elif ai_allowed and all(ai_values.get(axis) for axis in axes):
-                values = ai_values
+            if ai_allowed and est_source == "AI_ESTIMATED" and all(ai_values.get(axis) for axis in axes):
+                ai_unit = _normalized_dimension_unit(decision.get("dimension_unit") or "in")
+                for axis in axes:
+                    if axis not in axis_evidence:
+                        axis_evidence[axis] = {
+                            "value": ai_values[axis], "unit": ai_unit,
+                            "source": "AI_ESTIMATED",
+                            "evidence": [{"role": "brain_estimate_after_explicit_official_absence"}],
+                        }
+                values = {axis: axis_evidence[axis]["value"] for axis in axes}
                 source = "AI_ESTIMATED_OVERRIDE" if override else "AI_ESTIMATED"
-                candidate.lineage["dimension_source_detail"] = "BRAIN_AXES_AFTER_OFFICIAL_LOOKUP"
+                candidate.lineage["dimension_source_detail"] = "AI_AFTER_EXPLICIT_OFFICIAL_ABSENCE"
                 candidate.lineage["dimension_estimation"] = True
                 candidate.lineage["dimension_override_authorized"] = bool(override)
                 candidate.lineage["dimension_lookup_state"] = lookup_state or "OFFICIAL_ABSENT_CONFIRMED"
-                if decision.get("dimension_unit"):
-                    candidate.lineage["dimension_unit"] = decision.get("dimension_unit")
+                candidate.lineage["dimension_unit"] = ai_unit
+        if len(axis_evidence) < len(axes):
+            # A partial official lookup is never a deliverable dimension set;
+            # even an explicit override must provide all three positive axes.
+            return StageOutcome(StageDecision.PENDING if not override else StageDecision.REJECTED, "DIMENSIONS_OFFICIAL_LOOKUP_INCOMPLETE", {
+                "dimension_lookup_state": lookup_state or "OFFICIAL_LOOKUP_INCOMPLETE",
+                "dimension_access_status": "INCOMPLETE",
+                "observed_axes": sorted(axis_evidence),
+            })
         governed: dict[str, int] = {}
+        normalized_axes: dict[str, dict[str, Any]] = {}
         try:
             for axis in axes:
-                raw = values.get(axis)
-                if raw in (None, ""):
-                    continue
-                governed[axis] = round_dimension(raw)
-        except ValueError:
+                item = axis_evidence.get(axis) or {}
+                raw = item.get("value", values.get(axis))
+                unit = _normalized_dimension_unit(item.get("unit") or candidate.lineage.get("dimension_unit") or "in")
+                normalized = _dimension_to_inches(raw, unit)
+                if normalized is None:
+                    normalized = float(raw)
+                governed[axis] = round_dimension(normalized)
+                normalized_axes[axis] = {
+                    **item,
+                    "value": float(raw),
+                    "unit": unit,
+                    "normalized_value": normalized,
+                    "normalized_unit": "in",
+                }
+        except (TypeError, ValueError):
             return StageOutcome(StageDecision.REJECTED, "DIMENSIONS_MISSING_OR_INVALID")
         if not governed:
             return StageOutcome(StageDecision.REJECTED, "DIMENSIONS_MISSING_OR_INVALID")
@@ -740,8 +900,9 @@ class WebsiteStageAdapter:
         evidence = {
             "dimensions": governed,
             "target_dimensions": target_dimensions,
+            "dimension_axes": normalized_axes,
             "dimension_source": source or "UNKNOWN",
-            "dimension_unit": candidate.lineage.get("dimension_unit") or "source_unit",
+            "dimension_unit": "in",
             "dimension_source_detail": candidate.lineage.get("dimension_source_detail") or source,
             "dimension_estimation": bool(candidate.lineage.get("dimension_estimation")),
             "dimension_lookup_state": lookup_state or ("OFFICIAL_FOUND" if source.startswith("OFFICIAL") else "UNKNOWN"),
@@ -886,10 +1047,24 @@ class WebsiteStageAdapter:
         # The final value and the governed name remain the V3 direct-brand
         # result; this is only a compatibility alias for the lineage field.
         legacy_decision_source = "SOURCE_NAME_FIRST" if decision_source == "DIRECT_BRAND_OFFICIAL" else decision_source
+        official_name_authority = decision_source in {
+            "DIRECT_BRAND_OFFICIAL", "OFFICIAL_NAME_WITH_VISION_VERIFY",
+            "OFFICIAL_NAME_FROM_URL_SLUG", "SOURCE_NAME_FIRST",
+        } or "OFFICIAL" in decision_source
+        generated_attribute_name = not official_name_authority
+        existing_names = {
+            str(item.product_name).casefold()
+            for item in self.pool.records()
+            if item.candidate_id != candidate.candidate_id and item.product_name
+        }
         self.pool.enrich_candidate(candidate.candidate_id, product_name=governed_name, lineage={
             "governed_name": governed_name,
             "naming_decision_source": legacy_decision_source,
             "naming_governance": decision_source,
+            "name_authority": "OFFICIAL_SOURCE_OR_SERIES" if official_name_authority else "GOVERNED_ATTRIBUTE_COMPOSITION",
+            "generated_attribute_name": generated_attribute_name,
+            "name_collision_with_other_identity": governed_name.casefold() in existing_names,
+            "name_truncated": len(governed_name) >= name_limit,
             "source_name_reliable": reliable,
             "platform_brand_excluded": source_type == "MARKETPLACE",
             "source_policy_host": self.source_policy.source_host,
@@ -1054,18 +1229,20 @@ class WebsiteStageAdapter:
             ledgers = list(session.scalars(select(ProductionProviderTask).where(
                 ProductionProviderTask.job_id == self.contract["job_id"],
             )))
-            # The approved limit is a hard *call* budget, not only a
-            # concurrency reservation.  Completed/failed attempts remain
-            # counted, while a PREPARED ledger with no POST yet reserves one
-            # imminent slot.  SUBMISSION_UNKNOWN is already represented by
-            # post_attempts and therefore cannot be retried automatically.
+            # The approved limit is a hard *billable-call* budget.  Transport
+            # attempts remain in post_attempts for audit, but CAPACITY_WAIT
+            # responses have billable_attempts=0 and do not burn the budget.
             chargeable_states = {"ACTIVE", "CREATE_IN_FLIGHT", "SUBMISSION_UNKNOWN", "PROVIDER_SUCCESS", "DELIVERED"}
             consumed_calls = sum(
-                max(0, int(item.post_attempts or 0))
+                max(0, int(getattr(item, "billable_attempts", 0) or 0))
                 for item in ledgers
                 if item.provider_task_id
                 or item.status in chargeable_states
                 or item.checkpoint_state in chargeable_states
+            )
+            consumed_calls += sum(
+                1 for item in ledgers
+                if item.status == "SUBMISSION_UNKNOWN" or item.checkpoint_state == "SUBMISSION_UNKNOWN"
             )
             # Every new create attempt reserves one slot.  A retry after a
             # capacity response is still allowed when the approved budget has
@@ -1100,6 +1277,7 @@ class WebsiteStageAdapter:
             self.provider_posts += 1
             task_id, error = self.provider_client.create_task(image_path, idempotency_key=key)
             if task_id:
+                ledger.billable_attempts = max(1, int(getattr(ledger, "billable_attempts", 0) or 0))
                 ledger.provider_task_id = task_id
                 ledger.status = ledger.checkpoint_state = "ACTIVE"
                 ledger.submitted_at = utc_now()
@@ -1277,6 +1455,10 @@ class ProductionPipeline:
         self.database.create_schema()
         self.blender_adapter = blender_adapter if blender_adapter is not None else resolve_blender_adapter(contract)
         self.media_client_factory = media_client_factory
+        # Construct the shared Website Brain before the acquisition engine so
+        # pagination recovery can use the same configured bridge/provider.  It
+        # is still one agent loop; no second Agent Engine is introduced.
+        self.brain = brain or WebsiteBrainProvider()
         browser = contract.get("browser_session") or {}
         acquisition_kwargs: dict[str, Any] = {
             "source_url": str(contract["source_url"]),
@@ -1294,10 +1476,167 @@ class ProductionPipeline:
             factory_params = {}
         if accepts_kwargs or "site_profile" in factory_params:
             acquisition_kwargs["site_profile"] = contract.get("site_profile")
+        if accepts_kwargs or "agent_recovery" in factory_params:
+            acquisition_kwargs["agent_recovery"] = self._agent_recover_pagination
         self.acquisition = acquisition_factory(**acquisition_kwargs)
-        self.brain = brain or WebsiteBrainProvider()
         self.provider_client = provider_client if provider_client is not None else self._provider_client()
         self.pool = CandidatePoolStore(self.workspace / "candidate_pool.json", order_id=str(contract["job_id"]), job_id=str(contract["job_id"]))
+
+    def _agent_recover_pagination(self, context: dict[str, Any]) -> dict[str, Any]:
+        """Use the configured Website Brain to recover a generic pagination fault.
+
+        Every candidate URL and continuation comes from a real read-only tool
+        call on the same acquisition client/session.  The model only chooses
+        among those observed URLs; PDP parsing and identity construction remain
+        in the production collector.  If the company Brain is unavailable, the
+        response is an explicit NOT_CONFIGURED/ERROR receipt, never a success.
+        """
+
+        if not self.brain.settings.configured or not self.brain.settings.agent_enabled:
+            return {
+                "status": "BRAIN_NOT_CONFIGURED",
+                "provider_posts": self.brain.post_count,
+                "reason": "pagination recovery requires configured Website Brain or CODEX_DEVELOPMENT_BRIDGE",
+            }
+        source_url = str(context.get("source_url") or self.contract.get("source_url") or "").strip()
+        if not source_url:
+            return {"status": "INVALID_SOURCE_URL"}
+        observed: dict[str, dict[str, Any]] = {}
+
+        def _same_site(candidate: str) -> bool:
+            try:
+                return (urlsplit(candidate).hostname or "").casefold() == (urlsplit(source_url).hostname or "").casefold()
+            except Exception:
+                return False
+
+        def execute(name: str, args: dict[str, object]) -> dict[str, object]:
+            if name not in {"inspect_pagination", "discover_products"}:
+                raise AgentToolError("UNKNOWN_TOOL", f"unsupported pagination recovery tool: {name}")
+            target = str(args.get("url") or source_url).strip()
+            if not _same_site(target):
+                raise AgentToolError("CROSS_SITE_URL", "pagination recovery is restricted to the persisted source host")
+            html, acquisition_mode = self.acquisition._get_html(target)
+            next_url, explicit_end = ProductAcquisitionEngine._pagination_cursor(source_url, target, html)
+            links = ProductAcquisitionEngine._product_links(target, html)
+            if target not in observed:
+                observed[target] = {
+                    "url": target,
+                    "next_url": next_url,
+                    "explicit_end": explicit_end,
+                    "product_urls": links[:24],
+                    "acquisition": acquisition_mode,
+                    "html_sha256": hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest(),
+                }
+            result = dict(observed[target])
+            result["tool"] = name
+            return result
+
+        input_payload = {
+            "source_url": source_url,
+            "reason": str(context.get("reason") or "PAGINATION_UNVERIFIED"),
+            "products_seen": int(context.get("products_seen") or 0),
+            "observed_cursors": [
+                {
+                    "source_url": item.get("source_url"),
+                    "next_url": item.get("next_url"),
+                    "pagination_status": item.get("pagination_status"),
+                    "pages_fetched": item.get("pages_fetched"),
+                }
+                for item in (context.get("cursors") or {}).values()
+                if isinstance(item, dict)
+            ],
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect_pagination",
+                    "description": "Fetch one same-site public page and return only observed continuation evidence.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string"}},
+                        "required": ["url"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "discover_products",
+                    "description": "Fetch one same-site public page and return product links actually present in that page.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string"}},
+                        "required": ["url"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+        prompt = (
+            "Recover one generic pagination fault for the persisted public site. "
+            "Call inspect_pagination or discover_products before finish. "
+            "In finish, product_urls and next_url MUST be copied verbatim from tool evidence; "
+            "never invent URLs or products. Set explicit_end only when a tool explicitly proves the end. "
+            "Return {product_urls: [], next_url: '', explicit_end: false, reasoning: ''}."
+        )
+        try:
+            result = self.brain.run_agent_loop(
+                system_prompt=prompt,
+                input_payload=input_payload,
+                tools=tools,
+                tool_executor=execute,
+                options=AgentLoopOptions(
+                    response_schema=PaginationAgentRecovery,
+                    finish_tool_name="finish",
+                    max_steps=min(4, self.brain.settings.agent_max_steps),
+                    max_tool_calls=8,
+                ),
+            )
+        except BrainError as error:
+            return {"status": error.code, "provider_posts": self.brain.post_count}
+        receipt: dict[str, Any] = {
+            "status": "AGENT_READY" if result.validated is not None else result.stopped_reason,
+            "stop_code": result.stop_code or result.stopped_reason,
+            "turns": result.turns,
+            "provider_posts": result.provider_posts,
+            "tool_calls": result.tool_calls,
+            "observed_pages": list(observed.values()),
+        }
+        validated = result.validated
+        if validated is None:
+            return receipt
+        selected_urls: list[str] = []
+        for value in validated.product_urls:
+            candidate = str(value).strip()
+            if candidate and candidate not in selected_urls and _same_site(candidate):
+                selected_urls.append(candidate)
+        recovered: list[AcquiredProduct] = []
+        scope = {
+            "category_id": str((context.get("cursors") or {}).get(next(iter((context.get("cursors") or {})), ""), {}).get("category_id") or "scope_source"),
+            "canonical_name": "Agent recovered scope",
+            "source_url": source_url,
+        }
+        for product_url in selected_urls[:24]:
+            try:
+                html, acquisition_mode = self.acquisition._get_html(product_url)
+                product = self.acquisition._product_from_html(product_url, html, scope, acquisition_mode)
+            except Exception:
+                product = None
+            if product is not None and self.acquisition._is_product_detail_url(product_url, product):
+                recovered.append(product)
+        next_url = str(validated.next_url or "").strip()
+        if next_url and not _same_site(next_url):
+            next_url = ""
+        receipt.update({
+            "products": recovered,
+            "next_url": next_url,
+            "explicit_end": bool(validated.explicit_end),
+            "reasoning": validated.reasoning,
+            "selected_product_urls": selected_urls,
+        })
+        return receipt
 
     def _provider_client(self) -> Lux3DClient | None:
         if str(self.contract.get("provider") or "OFF").casefold() != "lux3d":
@@ -1694,6 +2033,69 @@ class ProductionPipeline:
                 # and the operator would need to press resume repeatedly for
                 # the same already-reviewed product.
                 if before_tick != _candidate_progress_signature(self.pool.records()):
+                    progressed_records = [item for item in self.pool.records() if item.state not in TERMINAL_ITEM_STATES]
+                    dimension_blocker = next(
+                        (
+                            item for item in sorted(progressed_records, key=lambda value: (value.created_at, value.candidate_id))
+                            if item.state is ItemState.DIMENSION_PENDING and (
+                                str(item.rejection_reason or "").startswith("DIMENSIONS_")
+                                or str(item.rejection_reason or "").startswith("DIMENSION_")
+                                or str(item.rejection_reason or "") in {"TEMPORARY_PAGE_FAILURE", "BROWSER_NAVIGATION_FAILED"}
+                            )
+                        ),
+                        None,
+                    )
+                    if dimension_blocker is not None:
+                        reason_code = str(dimension_blocker.rejection_reason or "DIMENSION_LOOKUP_INCOMPLETE")
+                        self.emit(
+                            "JOB_BLOCKED",
+                            "DIMENSION_LOOKUP",
+                            f"{reason_code}：官方尺寸证据暂不完整，已保存 checkpoint；补充同一站点尺寸证据后恢复同一 Job",
+                            self.pool.success_count(),
+                            target,
+                            {
+                                "blocker": reason_code,
+                                "candidate_id": dimension_blocker.candidate_id,
+                                "record_id": dimension_blocker.record_id,
+                                "url": dimension_blocker.canonical_url,
+                                "provider_calls": adapter.provider_posts,
+                                "resume_safe": True,
+                            },
+                        )
+                        return 2
+                    brain_blocker = next(
+                        (
+                            item for item in sorted(progressed_records, key=lambda value: (value.created_at, value.candidate_id))
+                            if item.state is ItemState.VISUAL_PENDING and str(item.rejection_reason or "") in {
+                                "BRAIN_NOT_CONFIGURED", "VISION_PROVIDER_NOT_CONFIGURED", "BRAIN_ERROR", "BRAIN_TIMEOUT",
+                            }
+                        ),
+                        None,
+                    )
+                    if brain_blocker is not None:
+                        reason_code = str(brain_blocker.rejection_reason)
+                        local_agent_mode = bool(getattr(getattr(self.brain, "settings", None), "local_agent_mode", False))
+                        blocker = "LOCAL_AGENT_REVIEW_REQUIRED" if local_agent_mode and reason_code == "BRAIN_NOT_CONFIGURED" else reason_code
+                        message = (
+                            "LOCAL_AGENT_REVIEW_REQUIRED：本地 Agent 已就绪，但当前候选没有显式复核证据；补充复核后恢复同一 Job"
+                            if blocker == "LOCAL_AGENT_REVIEW_REQUIRED"
+                            else f"{reason_code}：需要补充 Website Brain/vision 证据后恢复同一 Job"
+                        )
+                        self.emit(
+                            "JOB_BLOCKED",
+                            "BRAIN_DECISION",
+                            message,
+                            self.pool.success_count(),
+                            target,
+                            {
+                                "blocker": blocker,
+                                "candidate_id": brain_blocker.candidate_id,
+                                "record_id": brain_blocker.record_id,
+                                "provider_calls": adapter.provider_posts,
+                                "resume_safe": True,
+                            },
+                        )
+                        return 2
                     continue
                 active_records = [item for item in self.pool.records() if item.state not in TERMINAL_ITEM_STATES]
                 pending_reasons = {str(item.rejection_reason or "") for item in active_records}
@@ -1725,14 +2127,49 @@ class ProductionPipeline:
                         },
                     )
                     return 2
-                if "BRAIN_NOT_CONFIGURED" in pending_reasons:
+                dimension_pending = next(
+                    (
+                        item for item in sorted(active_records, key=lambda value: (value.created_at, value.candidate_id))
+                        if item.state is ItemState.DIMENSION_PENDING and (
+                            str(item.rejection_reason or "").startswith("DIMENSIONS_")
+                            or str(item.rejection_reason or "").startswith("DIMENSION_")
+                            or str(item.rejection_reason or "") in {"TEMPORARY_PAGE_FAILURE", "BROWSER_NAVIGATION_FAILED"}
+                        )
+                    ),
+                    None,
+                )
+                if dimension_pending is not None:
+                    reason_code = str(dimension_pending.rejection_reason or "DIMENSION_LOOKUP_INCOMPLETE")
+                    self.emit(
+                        "JOB_BLOCKED",
+                        "DIMENSION_LOOKUP",
+                        f"{reason_code}：官方尺寸证据暂不完整，已保存 checkpoint；补充同一站点尺寸证据后恢复同一 Job",
+                        self.pool.success_count(),
+                        target,
+                        {
+                            "blocker": reason_code,
+                            "candidate_id": dimension_pending.candidate_id,
+                            "record_id": dimension_pending.record_id,
+                            "url": dimension_pending.canonical_url,
+                            "provider_calls": adapter.provider_posts,
+                            "resume_safe": True,
+                        },
+                    )
+                    return 2
+                brain_pending = pending_reasons.intersection({
+                    "BRAIN_NOT_CONFIGURED",
+                    "VISION_PROVIDER_NOT_CONFIGURED",
+                    "BRAIN_ERROR",
+                    "BRAIN_TIMEOUT",
+                })
+                if brain_pending:
                     local_agent_mode = bool(getattr(getattr(self.brain, "settings", None), "local_agent_mode", False))
-                    blocker = "LOCAL_AGENT_REVIEW_REQUIRED" if local_agent_mode else "BRAIN_NOT_CONFIGURED"
+                    blocker = "LOCAL_AGENT_REVIEW_REQUIRED" if local_agent_mode and "BRAIN_NOT_CONFIGURED" in brain_pending else sorted(brain_pending)[0]
                     message = (
                         "LOCAL_AGENT_REVIEW_REQUIRED：本地 Agent 已就绪，但当前候选没有显式复核证据；"
                         "补充复核后恢复同一 Job"
                         if local_agent_mode
-                        else "WEBSITE_BRAIN_* 未配置；需要 Qwen3.6 决策的候选保持暂停"
+                        else f"{blocker}：需要补充 Website Brain/vision 证据后恢复同一 Job"
                     )
                     self.emit("JOB_BLOCKED", "BRAIN_DECISION", message, 0, target, {"blocker": blocker, "provider_calls": adapter.provider_posts, "resume_safe": True})
                     return 2

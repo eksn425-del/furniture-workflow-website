@@ -10,7 +10,7 @@ import socket
 import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -23,6 +23,17 @@ USER_AGENT = os.getenv(
 MAX_DOCUMENT_BYTES = 15_000_000
 MAX_MEDIA_BYTES = 25_000_000
 MAX_REDIRECTS = 5
+_SENSITIVE_QUERY_PARTS = frozenset({"token", "auth", "authorization", "cookie", "session", "password", "secret", "api_key", "apikey", "credential"})
+
+
+def _safe_query(query: str) -> str:
+    values = []
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        normalized = key.casefold().replace("-", "_")
+        if normalized in _SENSITIVE_QUERY_PARTS or any(part in normalized for part in _SENSITIVE_QUERY_PARTS):
+            continue
+        values.append((key, value))
+    return urlencode(values, doseq=True)
 
 
 def _windows_system_proxies() -> dict[str, str]:
@@ -118,7 +129,7 @@ def validate_public_url(url: str) -> str:
         ip = ipaddress.ip_address(address[4][0])
         if not ip.is_global:
             raise NetworkPolicyError("URL resolves to a private or reserved address")
-    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", _safe_query(parsed.query), ""))
 
 
 @dataclass(slots=True)
@@ -155,6 +166,7 @@ class SafeHttpClient:
         self.redirect_count = 0
         self._cache: dict[tuple[str, str], FetchResult] = {}
         self._robots: dict[str, tuple[RobotFileParser, list[str], float]] = {}
+        self._robots_state: dict[str, str] = {}
         self._last_request_at: dict[str, float] = {}
 
     def telemetry(self) -> dict:
@@ -163,6 +175,7 @@ class SafeHttpClient:
             "request_budget": self.request_budget,
             "cache_hits": self.cache_hits,
             "redirect_count": self.redirect_count,
+            "robots": dict(self._robots_state),
         }
 
     def get_html(self, url: str) -> str:
@@ -214,7 +227,8 @@ class SafeHttpClient:
             result = cached
         else:
             parser, _, delay = self._robots_for(target)
-            if not parser.can_fetch(USER_AGENT, target):
+            origin = f"{urlsplit(target).scheme}://{urlsplit(target).netloc}"
+            if self._robots_state.get(origin) == "ROBOTS_DENIED":
                 raise RobotsDenied(f"robots.txt disallows URL: {target}")
             self._consume_budget()
             self._respect_delay(f"{urlsplit(target).scheme}://{urlsplit(target).netloc}", max(delay, self.request_delay))
@@ -296,7 +310,8 @@ class SafeHttpClient:
             self.cache_hits += 1
             return cached
         parser, _, delay = self._robots_for(url)
-        if not parser.can_fetch(USER_AGENT, url):
+        origin = f"{urlsplit(url).scheme}://{urlsplit(url).netloc}"
+        if self._robots_state.get(origin) == "ROBOTS_DENIED":
             raise RobotsDenied(f"robots.txt disallows URL: {url}")
         result = self._send(url, max_bytes=max_bytes, delay=max(delay, self.request_delay))
         self._cache[cache_key] = result
@@ -327,17 +342,23 @@ class SafeHttpClient:
             crawl_delay = parser.crawl_delay(USER_AGENT) or parser.crawl_delay("*")
             if crawl_delay is not None:
                 delay = max(delay, min(float(crawl_delay), 10.0))
+            self._robots_state[origin] = "ROBOTS_ALLOWED"
         except HttpStatusError as error:
-            if error.status_code not in {401, 403, 404}:
-                raise
-            # RFC-style permissive fallback only when robots is unavailable;
-            # a 401/403 robots response still denies the site.
-            parser.parse(["User-agent: *", "Disallow: /"] if error.status_code in {401, 403} else [])
+            # Only an explicit 401/403 robots response is a denial.  404, 5xx,
+            # 429 and similar failures are availability signals and must not be
+            # turned into a false ROBOTS_DENIED result.
+            if error.status_code in {401, 403}:
+                parser.parse(["User-agent: *", "Disallow: /"])
+                self._robots_state[origin] = "ROBOTS_DENIED"
+            else:
+                parser.parse([])
+                self._robots_state[origin] = "ROBOTS_UNAVAILABLE"
         except (requests.RequestException, OSError, TimeoutError):
-            # robots.txt 网络不可达（连接超时/DNS 失败等）：按 RFC 9309 降级为
-            # “无已知限制”继续抓取，而不是让整个站点扫描失败。
-            # 401/403 的明确拒绝在上面分支处理，这里只处理拿不到响应的情况。
-            pass
+            # robots.txt 网络不可达（连接超时/DNS 失败等）：明确记录
+            # ROBOTS_UNAVAILABLE，按“无已知限制”继续抓取；不能让空 parser
+            # 的默认行为伪装成拒绝。
+            parser.parse([])
+            self._robots_state[origin] = "ROBOTS_UNAVAILABLE"
         self._robots[origin] = (parser, list(dict.fromkeys(sitemaps)), delay)
         return self._robots[origin]
 

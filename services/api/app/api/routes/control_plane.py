@@ -799,6 +799,7 @@ def get_control_job(job_id: str, request: Request) -> dict:
                 "error_code": item.error_code,
                 "error_message": item.error_message,
                 "post_attempts": item.post_attempts,
+                "billable_attempts": item.billable_attempts,
                 "poll_attempts": item.poll_attempts,
                 "updated_at": item.updated_at.isoformat() if item.updated_at else None,
             } for item in provider_tasks],

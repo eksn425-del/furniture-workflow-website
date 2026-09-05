@@ -11,6 +11,9 @@ from app.models import Base
 
 
 class Database:
+    # Keep the public schema marker stable for existing deployments; the
+    # additive columns below are idempotently migrated under the same v8
+    # compatibility contract.
     SCHEMA_VERSION = "workflow-schema.v8-production-launch-retry"
 
     def __init__(self, database_path: Path) -> None:
@@ -106,10 +109,15 @@ class Database:
                 "provider_qualification_version": "VARCHAR(64)",
                 "is_brand_library": "BOOLEAN NOT NULL DEFAULT 0",
                 "brand_name": "VARCHAR(120) NOT NULL DEFAULT ''",
+                "site_profile_version": "VARCHAR(128)",
+                "site_profile_snapshot_json": "TEXT",
             })
             self._add_missing_columns(connection, "provider_safety_checks", {
                 "qualification_receipt_json": "TEXT",
                 "authorization_hash": "VARCHAR(64)",
+            })
+            self._add_missing_columns(connection, "production_provider_tasks", {
+                "billable_attempts": "INTEGER NOT NULL DEFAULT 0",
             })
             connection.execute(text(
                 "CREATE TABLE IF NOT EXISTS schema_migrations ("
