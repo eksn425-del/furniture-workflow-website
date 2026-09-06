@@ -106,3 +106,5 @@ Blender CLI 导入、世界包围盒测量、统一缩放、导出后重新导�
 ## GitHub 状态
 
 本轮没有 push。原因是固定试用条件（3 个不同站点的真实 Ready）未满足；保留本地 checkpoint 与本轮代码，origin/main 历史不变。达到门槛并完成同样回归后，才按原授权普通合并/推送，不 force push。
+
+本轮本地收口提交：`Complete Codex bridge trial hardening and evidence`（具体 SHA 以交付时 `git log -1` 为准，当前工作树干净）；远端 `origin/main` 未改变。
