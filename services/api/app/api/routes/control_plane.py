@@ -1817,7 +1817,7 @@ def update_control_job(job_id: str, payload: ControlJobEdit, request: Request) -
             goal = " ".join(str(payload.goal).split())
             if goal:
                 job.goal = goal
-        if payload.target_value is not None or payload.provider is not None or payload.category_allocation is not None or payload.allocation_strategy is not None or payload.spillover is not None or payload.category_quotas is not None:
+        if payload.target_value is not None or payload.provider is not None or payload.category_allocation is not None or payload.allocation_strategy is not None or payload.spillover is not None or payload.category_quotas is not None or payload.dimension_anchor_policy is not None or payload.dimension_anchor_axis is not None or payload.allow_non_anchor_dimension_error is not None:
             # 生产一旦启动，交付目标与 Provider 必须严格按任务开始时确定的要求执行，
             # 不允许中途改写目标数量或切换建模提供方，避免与运行中的生产契约偏离。
             running = session.scalar(
@@ -1846,7 +1846,13 @@ def update_control_job(job_id: str, payload: ControlJobEdit, request: Request) -
             policy["spillover"] = payload.spillover
         if payload.category_quotas is not None:
             policy["category_quotas"] = {str(key): int(value) for key, value in payload.category_quotas.items() if str(key).strip()}
-        if any(value is not None for value in (payload.category_allocation, payload.allocation_strategy, payload.spillover, payload.category_quotas)):
+        if payload.dimension_anchor_policy is not None:
+            policy["dimension_anchor_policy"] = payload.dimension_anchor_policy
+        if payload.dimension_anchor_axis is not None:
+            policy["dimension_anchor_axis"] = payload.dimension_anchor_axis
+        if payload.allow_non_anchor_dimension_error is not None:
+            policy["allow_non_anchor_dimension_error"] = bool(payload.allow_non_anchor_dimension_error)
+        if any(value is not None for value in (payload.category_allocation, payload.allocation_strategy, payload.spillover, payload.category_quotas, payload.dimension_anchor_policy, payload.dimension_anchor_axis, payload.allow_non_anchor_dimension_error)):
             job.policy_json = json.dumps(policy, ensure_ascii=False)
             if job.status not in {"RUNNING", "PROVIDER_RUNNING"}:
                 job.status = "POLICY_READY"
@@ -1861,6 +1867,9 @@ def update_control_job(job_id: str, payload: ControlJobEdit, request: Request) -
             "allocation_strategy": payload.allocation_strategy is not None,
             "spillover": payload.spillover is not None,
             "category_quotas": payload.category_quotas is not None,
+            "dimension_anchor_policy": payload.dimension_anchor_policy is not None,
+            "dimension_anchor_axis": payload.dimension_anchor_axis is not None,
+            "allow_non_anchor_dimension_error": payload.allow_non_anchor_dimension_error is not None,
         })
         _audit(session, "EDIT_JOB", "production_job", job.job_id, actor="operator")
         session.commit()

@@ -604,6 +604,9 @@ class ControlJobEdit(BaseModel):
     allocation_strategy: Literal["SEQUENTIAL", "EVEN", "PROPORTIONAL", "CUSTOM"] | None = None
     spillover: Literal["ASK", "AUTO_IF_EXPLICIT", "STOP"] | None = None
     category_quotas: dict[str, int] | None = None
+    dimension_anchor_policy: Literal["FULL_ONLY", "ALLOW_PARTIAL_ANCHOR", "SINGLE_AXIS_ANCHOR", "EXPLICIT_ANCHOR"] | None = None
+    dimension_anchor_axis: Literal["width", "depth", "height"] | None = None
+    allow_non_anchor_dimension_error: bool | None = None
 
     @field_validator("category_quotas")
     @classmethod

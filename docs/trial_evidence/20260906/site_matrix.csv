@@ -1,0 +1,46 @@
+index,name,url,trial_status,scan_id,scan_status,taxonomy_stage,ready_stage,download_stage,notes
+01,Anthropologie,https://www.anthropologie.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+02,Arhaus,https://www.arhaus.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+03,Article,https://www.article.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+04,Castlery,https://www.castlery.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+05,Interior Define,https://www.interiordefine.com/,ACCESS_BLOCKED,scan_6072ea4ae58249478d20b88d17b7fb40,TEMPORARY_FAILURE,,,本轮真实 live 扫描 HTTP 阶段 60s 超时；历史 READY 不计入本轮
+06,Ligne Roset,https://www.ligne-roset.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+07,MacKenzie-Childs,https://www.mackenzie-childs.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+08,Nathan James,https://nathanjames.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+09,POLYWOOD,https://www.polywood.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+10,RH,https://rh.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+11,Room & Board,https://www.roomandboard.com/,END_TO_END_PASS,scan_3f35adf81255434d91054f1931aecd29,PARTIAL,PARTIAL,READY_FOR_MODELING,END_TO_END_PASS,同一 Job 复用 Sawyer 3304300；扫描数量 UNKNOWN 但网站真实下载1件
+12,Rove Concepts,https://www.roveconcepts.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+13,Sixpenny,https://sixpenny.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+14,Walker Edison,https://walkeredison.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+15,IAAH / India Art n Design,https://www.indiaartndesign.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+16,Kayu,https://kayu.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+17,Fabuliv,https://fabuliv.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+18,Globally Indian,https://globallyindian.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+19,Indikasa,https://indikasa.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+20,Iris,https://www.irisus.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+21,Hometown,https://www.hometown.in/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+22,Featherlite,https://featherlitefurniture.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+23,Interio,https://www.interio.in/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+24,Durian,https://www.durian.in/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+25,Indian Nest,https://indiannest.in/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+26,Furnishka,https://furnishka.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+27,LoveNspire,https://www.lovenspire.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+28,Indian Hub,https://indianhub.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+29,DesignConnected,https://www.designconnected.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+30,Archive3D,https://archive3d.net/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+31,GrabCAD,https://grabcad.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+32,CGTrader,https://www.cgtrader.com/,ACCESS_BLOCKED,scan_6b4e05e3ffe94677b204a3e667389ecc,TEMPORARY_FAILURE,,,L2 浏览器阶段 60s 超时；没有写入分类或 Ready
+33,Free3D,https://free3d.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+34,Archibase,https://archibaseplanet.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+35,3DExport,https://3dexport.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+36,3D Warehouse,https://3dwarehouse.sketchup.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+37,Sweet Home 3D,https://www.sweethome3d.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+38,NASA 3D,https://nasa3d.arc.nasa.gov/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+39,3DXO,https://3dxo.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+40,MyMiniFactory,https://www.myminifactory.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+41,Poly Haven,https://polyhaven.com/,ACCESS_BLOCKED,scan_f1530207708b40feb362aa0e7f768954,TEMPORARY_FAILURE,,,HTTP 阶段 60s 超时；没有写入分类或 Ready
+42,Alessi,https://www.alessi.com/,ACCESS_BLOCKED,scan_6f594d526d4a4055982c67d3190d1282,TEMPORARY_FAILURE,,,HTTP 阶段 60s 超时；同一会话可恢复重试
+43,Safavieh,https://safavieh.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+44,Driade,https://www.driade.com/,NOT_RUN,,,,,,本轮未启动；固定45站分母保留
+45,West Elm,https://www.westelm.com/,ACCESS_BLOCKED,scan_8ff9de0680e74e7999d16ef535b43a81,TEMPORARY_FAILURE,,,live=true 浏览器导航失败；另有 offline 请求被正确拒绝为 LIVE_SCAN_REQUIRED

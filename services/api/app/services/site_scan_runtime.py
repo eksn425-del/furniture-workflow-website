@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import inspect
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -31,6 +32,15 @@ from app.models import (
 from app.services.site_profile import build_site_profile, profile_capability_evidence_valid, profile_capability_status, validate_site_profile
 
 
+class SiteScanTimeoutError(TimeoutError):
+    """Raised when a native site analyzer exceeds the Website-owned budget."""
+
+    def __init__(self, phase: str, timeout_seconds: float) -> None:
+        self.phase = phase
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"site scan {phase} exceeded {timeout_seconds:g}s")
+
+
 class SiteScanRuntimeService:
     MAX_HTTP_SCANS = 2
     _browser_lock = threading.Lock()
@@ -42,6 +52,43 @@ class SiteScanRuntimeService:
         self.executor = ThreadPoolExecutor(max_workers=self.MAX_HTTP_SCANS, thread_name_prefix="site-scan")
         self._scheduled: set[str] = set()
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _analyzer_timeout_seconds() -> float:
+        """Return a bounded timeout for one native analyzer phase.
+
+        The analyzer may use a network client or a headed browser whose own
+        retry budget is not visible to this service.  A service-level budget
+        keeps one inaccessible retailer from occupying the persistent worker
+        forever.  The worker thread is daemonized on timeout; any late result
+        is deliberately discarded rather than persisted as a false success.
+        """
+
+        try:
+            raw = float(os.getenv("WEBSITE_SITE_SCAN_TIMEOUT_SECONDS", "120"))
+        except (TypeError, ValueError):
+            raw = 120.0
+        return max(10.0, min(raw, 900.0))
+
+    def _run_analyzer_bounded(self, phase: str, callable_, *args, **kwargs):
+        timeout_seconds = self._analyzer_timeout_seconds()
+        result: list[Any] = []
+        error: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                result.append(callable_(*args, **kwargs))
+            except BaseException as exc:  # re-raise on the Website worker thread
+                error.append(exc)
+
+        worker = threading.Thread(target=invoke, name=f"site-scan-{phase}", daemon=True)
+        worker.start()
+        worker.join(timeout_seconds)
+        if worker.is_alive():
+            raise SiteScanTimeoutError(phase, timeout_seconds)
+        if error:
+            raise error[0]
+        return result[0] if result else None
 
     def start(self, *, site_key: str, source_url: str, job_id: str | None, live: bool) -> dict[str, Any]:
         session = self.database.session_factory()
@@ -156,18 +203,24 @@ class SiteScanRuntimeService:
             try:
                 scan = session.get(SiteScanRun, scan_id)
                 if scan:
-                    scan.status = "FAILED"
-                    scan.error_code = type(error).__name__.upper()
+                    timed_out = isinstance(error, SiteScanTimeoutError)
+                    scan.status = "TEMPORARY_FAILURE" if timed_out else "FAILED"
+                    scan.error_code = "SITE_SCAN_TIMEOUT" if timed_out else type(error).__name__.upper()
                     scan.error_message = str(error)[:1000]
                     scan.finished_at = utc_now()
                     scan.heartbeat_at = utc_now()
+                    browser = session.get(BrowserSession, scan.browser_session_id) if scan.browser_session_id else None
+                    if browser:
+                        browser.status = scan.status
+                        browser.challenge_code = scan.error_code
+                        browser.challenge_message = scan.error_message
                     if scan.job_id:
                         job = session.get(ProductionJob, scan.job_id)
                         if job:
                             job.status = "WAITING_REVIEW"
                             job.current_stage = "SITE_SCAN"
-                            job.last_reason = f"站点扫描失败：{type(error).__name__}"
-                            self._job_event(session, job, "SITE_SCAN_FAILED", "FAILED", job.last_reason, {"scan_id": scan_id, "reason_code": scan.error_code})
+                            job.last_reason = "站点扫描超时，已保留同一会话和检查点，可恢复重试" if timed_out else f"站点扫描失败：{type(error).__name__}"
+                            self._job_event(session, job, "SITE_SCAN_TIMEOUT" if timed_out else "SITE_SCAN_FAILED", scan.status, job.last_reason, {"scan_id": scan_id, "reason_code": scan.error_code})
                     session.commit()
             finally:
                 session.close()
@@ -232,9 +285,9 @@ class SiteScanRuntimeService:
         except (TypeError, ValueError):
             analyze_parameters = {}
         if "profile" in analyze_parameters:
-            receipt = self.analyzer.analyze(source_url, live=live, output_dir=output_dir, profile=existing_profile_payload)
+            receipt = self._run_analyzer_bounded("http", self.analyzer.analyze, source_url, live=live, output_dir=output_dir, profile=existing_profile_payload)
         else:
-            receipt = self.analyzer.analyze(source_url, live=live, output_dir=output_dir)
+            receipt = self._run_analyzer_bounded("http", self.analyzer.analyze, source_url, live=live, output_dir=output_dir)
         blocker = receipt.get("blocker") if isinstance(receipt.get("blocker"), dict) else {}
         blocker_code = str(blocker.get("code") or "")
         if self._needs_browser_enrichment(receipt) and browser is not None:
@@ -251,7 +304,7 @@ class SiteScanRuntimeService:
             finally:
                 session.close()
             with self._browser_lock:
-                receipt = self.analyzer.analyze_browser(source_url, output_dir=output_dir, session_dir=Path(browser.user_data_dir))
+                receipt = self._run_analyzer_bounded("browser", self.analyzer.analyze_browser, source_url, output_dir=output_dir, session_dir=Path(browser.user_data_dir))
         self._persist(scan_id, receipt, output_dir)
 
     def _persist(self, scan_id: str, receipt: dict[str, Any], output_dir: Path) -> None:

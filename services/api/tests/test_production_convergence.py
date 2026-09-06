@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.api.routes.control_plane import _job_categories, approve_job, get_candidate_for_review, get_control_site, list_control_sites, record_local_agent_review
 from app.database import Database
 from app.models import (
+    BrowserSession,
     ProductionJob,
     ProductionJobEvent,
     ProductionProviderTask,
@@ -546,6 +547,49 @@ def test_site_scan_persists_across_navigation_and_service_restart(tmp_path: Path
             session.close()
     finally:
         second.shutdown()
+        database.dispose()
+
+
+def test_site_scan_timeout_is_durable_and_retryable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class HangingAnalyzer:
+        @staticmethod
+        def analyze(source_url: str, *, live: bool, output_dir: Path) -> dict:
+            time.sleep(0.25)
+            return {"status": "READY", "verified": True, "categories": []}
+
+    # Keep this unit test fast while exercising the same service-level timeout
+    # path used by the production launcher (whose default is 120 seconds).
+    monkeypatch.setattr(SiteScanRuntimeService, "_analyzer_timeout_seconds", staticmethod(lambda: 0.05))
+    database = Database(tmp_path / "system" / "control.sqlite3")
+    database.create_schema()
+    session = database.session_factory()
+    try:
+        session.add(SiteRegistryRecord(site_key="slow.test", domain="slow.test", display_name="Slow Shop"))
+        session.commit()
+    finally:
+        session.close()
+
+    runtime = SiteScanRuntimeService(database, tmp_path / "output", HangingAnalyzer())
+    started = runtime.start(site_key="slow.test", source_url="https://slow.test/", job_id=None, live=True)
+    deadline = time.monotonic() + 2
+    current = started
+    while current["status"] in {"QUEUED", "ANALYZING", "L2_BROWSER"} and time.monotonic() < deadline:
+        time.sleep(0.01)
+        current = runtime.status(started["scan_id"]) or current
+    try:
+        assert current["status"] == "TEMPORARY_FAILURE"
+        assert current["error_code"] == "SITE_SCAN_TIMEOUT"
+        assert current["finished_at"]
+        session = database.session_factory()
+        try:
+            scan = session.get(SiteScanRun, started["scan_id"])
+            assert scan is not None and scan.status == "TEMPORARY_FAILURE"
+            browser = session.get(BrowserSession, scan.browser_session_id)
+            assert browser is not None and browser.status == "TEMPORARY_FAILURE"
+        finally:
+            session.close()
+    finally:
+        runtime.shutdown()
         database.dispose()
 
 

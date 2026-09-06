@@ -204,6 +204,23 @@ def test_dimension_plan_rejects_obvious_non_uniform_deformation(tmp_path: Path) 
         plan_dimension_normalization(extract_glb_bbox(path), {"width": 2, "depth": 8, "height": 6}, "m")
 
 
+def test_dimension_plan_supports_explicit_full_target_width_anchor(tmp_path: Path) -> None:
+    path = tmp_path / "raw.glb"
+    _glb_with_position_bounds(path, (0.0, 0.0, 0.0), (2.0, 4.0, 6.0))
+    plan = plan_dimension_normalization(
+        extract_glb_bbox(path),
+        {"width": 4, "depth": 4, "height": 4},
+        "m",
+        dimension_anchor_axis="width",
+        allow_non_anchor_dimension_error=True,
+    )
+    assert plan["dimension_status"] == "PASS"
+    assert plan["dimension_anchor_axis"] == "width"
+    assert plan["scale_factor"] == 2.0
+    assert plan["non_anchor_dimension_error"]["depth"] == 2.0
+    assert plan["non_anchor_dimension_error"]["height"] == 1.0
+
+
 def test_blender_cli_final_dimension_conflict_uses_safe_domain_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     raw = tmp_path / "raw.glb"
     output = tmp_path / "normalized.glb"

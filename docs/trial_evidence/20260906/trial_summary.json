@@ -1,0 +1,41 @@
+{
+  "schema_version": "furniture-workflow-agent-trial.v1",
+  "date": "2026-09-06",
+  "fixed_denominator": 45,
+  "attempted_sites_this_trial": 7,
+  "scan_completed_sites_this_trial": 7,
+  "ready_for_modeling_sites_this_trial": 1,
+  "real_website_downloads_this_trial": 1,
+  "trial_level": "NOT_READY",
+  "trial_level_reason": "固定共同基础要求至少3个不同站点完成真实扫描、类目/数量状态、N=1 Ready；本轮只有Room & Board的既有同Job Sawyer证据完成真实下载，其余真实扫描受访问层阻断。",
+  "company_model_status": "COMPANY_MODEL_NOT_TESTED",
+  "provider_create_posts_this_trial": 0,
+  "sawyer": {
+    "job_id": "job_90bbcd1f29d645b98310ee95009861ff",
+    "candidate_id": "candidate_0798b70642b07e666b14b869",
+    "provider_task_id": "3304300",
+    "raw_glb_sha256": "0bb7baa8411a94ae7299309bc97b3c8ed186de801639615a47efa70f45914221",
+    "normalized_glb_sha256": "5138e2a8efe33e6e3c34e5b6371d99a7f351a980883446f4ba44cf26828c629e",
+    "website_delivery_zip_sha256": "156b9f2382960acd363bb98f45e964f8742d0cad776fec4e805fb4af8d37539c",
+    "website_delivery_zip_size_bytes": 3646766,
+    "source_image_sha256": "f6f57730a2d38756ed9b4f2c39b1e69419cd0e7c2398c61f4721327476cff5cd",
+    "orientation": {"status": "CONFIRMED", "front_axis": "-Y", "top_axis": "+Z", "determinant": 1.0, "source": "CODEX_DEVELOPMENT_BRIDGE"},
+    "dimension_policy": {"anchor_axis": "width", "official": {"width": 18.0, "depth": 4.0, "height": 3.0, "unit": "in"}, "uniform_scale_factor": 0.39859457063258197, "measured_m": {"width": 0.45719999074935913, "depth": 0.1182212308049202, "height": 0.08583591878414154}, "relative_error": {"width": 0.0000000202332477, "depth": 0.1635947914, "height": 0.1264556271}},
+    "reused_existing_provider_task": true,
+    "new_paid_generation": false
+  },
+  "scan_attempts": [
+    {"site": "Room & Board", "scan_id": "scan_3f35adf81255434d91054f1931aecd29", "status": "PARTIAL", "taxonomy_level": "L2", "count_state": "UNKNOWN", "trial_status": "END_TO_END_PASS"},
+    {"site": "Interior Define", "scan_id": "scan_6072ea4ae58249478d20b88d17b7fb40", "status": "TEMPORARY_FAILURE", "error_code": "SITE_SCAN_TIMEOUT", "trial_status": "ACCESS_BLOCKED"},
+    {"site": "Alessi", "scan_id": "scan_6f594d526d4a4055982c67d3190d1282", "status": "TEMPORARY_FAILURE", "error_code": "SITE_SCAN_TIMEOUT", "trial_status": "ACCESS_BLOCKED"},
+    {"site": "West Elm", "scan_id": "scan_8ff9de0680e74e7999d16ef535b43a81", "status": "TEMPORARY_FAILURE", "error_code": "BROWSER_NAVIGATION_FAILED", "trial_status": "ACCESS_BLOCKED"},
+    {"site": "Poly Haven", "scan_id": "scan_f1530207708b40feb362aa0e7f768954", "status": "TEMPORARY_FAILURE", "error_code": "SITE_SCAN_TIMEOUT", "trial_status": "ACCESS_BLOCKED"},
+    {"site": "CGTrader", "scan_id": "scan_6b4e05e3ffe94677b204a3e667389ecc", "status": "TEMPORARY_FAILURE", "error_code": "SITE_SCAN_TIMEOUT", "trial_status": "ACCESS_BLOCKED"},
+    {"site": "West Elm offline guard", "scan_id": "scan_72ddc65084344c199b8c8f2f823210b9", "status": "LIVE_SCAN_REQUIRED", "trial_status": "ACCESS_BLOCKED"}
+  ],
+  "evidence_files": {
+    "site_matrix_csv": "site_matrix.csv",
+    "sawyer_website_download": "../../../../closure_evidence_20260906/agent_trial_20260906/downloads/sawyer_website_download.zip",
+    "sawyer_extracted_glb": "../../../../closure_evidence_20260906/agent_trial_20260906/downloads/sawyer_extracted_01/Room & Board Sawyer Shower Shelf__record_0798b70642b07e666b14b869.glb"
+  }
+}

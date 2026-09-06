@@ -1010,6 +1010,21 @@ class WebsiteStageAdapter:
             or "FULL_ONLY"
         ).strip().upper()
         allow_partial_anchor = anchor_policy in {"ALLOW_PARTIAL_ANCHOR", "SINGLE_AXIS_ANCHOR", "EXPLICIT_ANCHOR"}
+        anchor_axis = str(
+            candidate.lineage.get("dimension_anchor_axis")
+            or self.contract.get("dimension_anchor_axis")
+            or ""
+        ).strip().casefold() or None
+        if anchor_axis and anchor_axis not in axes:
+            return StageOutcome(StageDecision.REJECTED, "DIMENSIONS_INVALID_ANCHOR_AXIS", {
+                "dimension_anchor_axis": anchor_axis,
+                "dimension_anchor_policy": anchor_policy,
+            })
+        allow_non_anchor_dimension_error = bool(
+            candidate.lineage.get("allow_non_anchor_dimension_error")
+            or self.contract.get("allow_non_anchor_dimension_error")
+            or anchor_policy == "EXPLICIT_ANCHOR"
+        )
         axis_evidence: dict[str, dict[str, Any]] = {
             axis: {
                 "value": values[axis],
@@ -1235,6 +1250,8 @@ class WebsiteStageAdapter:
                 else "LOOKUP_INCOMPLETE"
             ),
             "dimension_anchor_policy": anchor_policy,
+            "dimension_anchor_axis": anchor_axis,
+            "allow_non_anchor_dimension_error": allow_non_anchor_dimension_error,
             "dimension_checked_sources": candidate.lineage.get("dimension_checked_sources") or [],
             "dimension_checked_pages": candidate.lineage.get("dimension_checked_pages") or [],
             "dimension_scope_complete": bool(candidate.lineage.get("dimension_scope_complete")),
@@ -1487,6 +1504,77 @@ class WebsiteStageAdapter:
                 },
             )
             repaired += 1
+        return repaired
+
+    def reconcile_download_checkpoint(self) -> int:
+        """Reopen a prior valid raw GLB checkpoint without a new Provider POST.
+
+        Older runs could persist ``RAW_GLB_INVALID`` after the raw file had
+        already been downloaded, then leave the Provider ledger at
+        ``MODEL_DIMENSION_CONFLICT``.  Once the geometry policy is repaired,
+        the same durable file and task must be reusable.  This repair only
+        moves a candidate to the existing task's download stage when the
+        expected raw file is present and passes the container validator; it
+        never invents a task id or submits another paid request.
+        """
+
+        repaired = 0
+        session = self.database.session_factory()
+        try:
+            ledgers = {
+                str(item.candidate_id): item
+                for item in session.scalars(select(ProductionProviderTask).where(
+                    ProductionProviderTask.job_id == self.contract["job_id"],
+                ))
+            }
+            for record in self.pool.records():
+                if record.state not in {
+                    ItemState.RAW_GLB_INVALID,
+                    ItemState.MANUAL_REVIEW,
+                    ItemState.PROVIDER_FAILED,
+                    ItemState.HARD_STOP_ITEM,
+                }:
+                    continue
+                if not record.provider_task_id:
+                    continue
+                ledger = ledgers.get(record.candidate_id)
+                ledger_state = str(getattr(ledger, "checkpoint_state", "") or "").upper()
+                if ledger is None or ledger_state not in {
+                    "MODEL_DIMENSION_CONFLICT",
+                    "RAW_GLB_INVALID",
+                    "BLENDER_QA_FAILED",
+                    "DOWNLOAD_FAILED",
+                    "DELIVERED",
+                }:
+                    continue
+                filename = _safe_name(record.product_name or record.record_id) or record.record_id
+                target = self.model_root / f"{filename}__{record.record_id}.glb"
+                if not target.is_file():
+                    continue
+                valid, validation_reason = validate_glb(target)
+                if not valid:
+                    continue
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                self.pool.transition(
+                    record.candidate_id,
+                    ItemState.PROVIDER_SUCCESS,
+                    stage_field="provider_status",
+                    stage_status="SUCCESS",
+                    reason="RAW_GLB_REUSE_CHECKPOINT",
+                    disposition=FailureDisposition.WAIT_PROVIDER,
+                    retry=True,
+                    lineage={
+                        "raw_glb_path": str(target),
+                        "raw_glb_sha256": digest,
+                        "raw_glb_reused": True,
+                        "raw_glb_reuse_validation": validation_reason,
+                        "provider_task_reused": record.provider_task_id,
+                        "download_checkpoint_reconciled": True,
+                    },
+                )
+                repaired += 1
+        finally:
+            session.close()
         return repaired
 
     def _stage_catalog(self, candidate: CandidateRecord) -> StageOutcome:
@@ -1994,6 +2082,12 @@ class WebsiteStageAdapter:
                     target_dimensions=current.lineage.get("target_dimensions") or current.lineage.get("dimensions"),
                     dimension_unit=current.lineage.get("dimension_unit") or "source_unit",
                     orientation=orientation or current.lineage.get("orientation_review") or current.lineage.get("orientation"),
+                    dimension_anchor_axis=current.lineage.get("dimension_anchor_axis") or self.contract.get("dimension_anchor_axis"),
+                    allow_non_anchor_dimension_error=bool(
+                        current.lineage.get("allow_non_anchor_dimension_error")
+                        or self.contract.get("allow_non_anchor_dimension_error")
+                        or str(current.lineage.get("dimension_anchor_policy") or self.contract.get("dimension_anchor_policy") or "").upper() == "EXPLICIT_ANCHOR"
+                    ),
                 )
             except ModelDimensionConflict as error:
                 ledger.status = ledger.checkpoint_state = "MODEL_DIMENSION_CONFLICT"
@@ -2519,6 +2613,16 @@ class ProductionPipeline:
                 None,
                 None,
                 {"repaired": naming_repaired, "provider_calls": 0, "reused_media": True},
+            )
+        download_repaired = adapter.reconcile_download_checkpoint()
+        if download_repaired:
+            self.emit(
+                "DOWNLOAD_CHECKPOINT_RECONCILED",
+                "PROVIDER",
+                f"已复用 {download_repaired} 个已下载且可验证的原始 GLB；未新增 Provider 请求",
+                None,
+                None,
+                {"repaired": download_repaired, "provider_calls": 0, "reused_raw_glb": True},
             )
         granular_emitted = 0
         if not self.pool.records():

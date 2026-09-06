@@ -49,6 +49,9 @@ class BlenderQAResult:
     final_bbox: dict[str, object] | None = None
     dimension_error: dict[str, float] | None = None
     dimension_status: str = "NOT_MEASURED"
+    dimension_anchor_axis: str | None = None
+    non_anchor_dimension_error: dict[str, float] | None = None
+    dimension_anchor_policy: str = "FULL_ONLY"
     orientation_status: str = "UNKNOWN"
     orientation: dict[str, object] | None = None
     raw_sha256: str = ""
@@ -71,6 +74,9 @@ class BlenderQAResult:
             "final_bbox": self.final_bbox,
             "dimension_error": self.dimension_error,
             "dimension_status": self.dimension_status,
+            "dimension_anchor_axis": self.dimension_anchor_axis,
+            "non_anchor_dimension_error": self.non_anchor_dimension_error,
+            "dimension_anchor_policy": self.dimension_anchor_policy,
             "orientation_status": self.orientation_status,
             "orientation": self.orientation,
             "raw_sha256": self.raw_sha256,
@@ -453,6 +459,9 @@ def plan_dimension_normalization(
     raw_bbox: dict[str, object] | None,
     target_dimensions: Mapping[str, object] | None,
     dimension_unit: str = "source_unit",
+    *,
+    dimension_anchor_axis: str | None = None,
+    allow_non_anchor_dimension_error: bool = False,
 ) -> dict[str, object]:
     """Plan safe uniform normalization and reject obvious aspect-ratio conflicts."""
 
@@ -525,6 +534,51 @@ def plan_dimension_normalization(
             "dimension_status": "MEASURED_NO_TARGET",
         }
     target_model = {axis: value * float(factor_unit or 1.0) for axis, value in target.items()}
+    anchor_axis = str(dimension_anchor_axis or "").strip().casefold()
+    if anchor_axis and anchor_axis not in {"width", "depth", "height"}:
+        return {
+            "target_dimensions": target,
+            "target_dimensions_model": target_model,
+            "scale_factor": None,
+            "dimension_status": "INVALID_ANCHOR_AXIS",
+            "reason": "dimension_anchor_axis must be width, depth, or height",
+        }
+    # An explicit anchor is used for products whose official catalog gives a
+    # trusted primary span but whose depth/height may represent a different
+    # configuration or a provider reconstruction.  The geometry is still
+    # transformed by one uniform factor; only the anchor is a delivery gate.
+    # This deliberately does not weaken the default FULL_ONLY policy.
+    if anchor_axis and allow_non_anchor_dimension_error:
+        if anchor_axis not in target_model or anchor_axis not in raw_size:
+            return {
+                "target_dimensions": target,
+                "target_dimensions_model": target_model,
+                "scale_factor": None,
+                "dimension_status": "ANCHOR_MISSING",
+                "reason": "explicit dimension anchor must exist in target and measured geometry",
+            }
+        factor = target_model[anchor_axis] / raw_size[anchor_axis]
+        final_size = {axis: raw_size[axis] * factor for axis in raw_size}
+        errors = {
+            axis: abs(final_size[axis] - target_model[axis]) / target_model[axis]
+            for axis in ("width", "depth", "height")
+            if axis in target_model and axis in final_size
+        }
+        anchor_error = errors.get(anchor_axis, float("inf"))
+        non_anchor_error = {axis: value for axis, value in errors.items() if axis != anchor_axis}
+        return {
+            "target_dimensions": target,
+            "target_dimensions_model": target_model,
+            "scale_factor": factor,
+            "dimension_status": "PASS" if anchor_error <= _geometry_tolerance() else "MODEL_DIMENSION_CONFLICT",
+            "planned_final_dimensions": final_size,
+            "dimension_error": errors,
+            "non_anchor_dimension_error": non_anchor_error,
+            "dimension_anchor_axis": anchor_axis,
+            "dimension_anchor_policy": "EXPLICIT_ANCHOR",
+            "geometry_tolerance": _geometry_tolerance(),
+            "aspect_ratio_limit": _aspect_ratio_limit(),
+        }
     ratios = [target_model[axis] / raw_size[axis] for axis in ("width", "depth", "height")]
     spread = max(ratios) / min(ratios)
     if spread > _aspect_ratio_limit():
@@ -729,6 +783,8 @@ class FakeBlenderAdapter:
         target_dimensions: Mapping[str, object] | None = None,
         dimension_unit: str = "source_unit",
         orientation: Mapping[str, object] | None = None,
+        dimension_anchor_axis: str | None = None,
+        allow_non_anchor_dimension_error: bool = False,
     ) -> BlenderQAResult:
         valid, reason = validate_glb(raw_path)
         if not valid:
@@ -740,7 +796,15 @@ class FakeBlenderAdapter:
             raise BlenderAdapterError(f"normalized_glb_qa_failed:{normalized_reason}")
         raw = output_path.read_bytes()
         raw_bbox = extract_glb_bbox(output_path)
-        plan = plan_dimension_normalization(raw_bbox, target_dimensions, dimension_unit)
+        plan = plan_dimension_normalization(
+            raw_bbox,
+            target_dimensions,
+            dimension_unit,
+            dimension_anchor_axis=dimension_anchor_axis,
+            allow_non_anchor_dimension_error=allow_non_anchor_dimension_error,
+        )
+        if plan.get("dimension_status") in {"UNKNOWN_UNIT", "INVALID_ANCHOR_AXIS", "ANCHOR_MISSING", "MODEL_DIMENSION_CONFLICT"}:
+            raise ModelDimensionConflict(str(plan.get("reason") or "target dimensions cannot be normalized safely"))
         return BlenderQAResult(
             status="FIXTURE_ONLY",
             adapter=self.name,
@@ -756,6 +820,9 @@ class FakeBlenderAdapter:
             final_bbox=raw_bbox,
             dimension_error=plan.get("dimension_error"),
             dimension_status=("NOT_MEASURED_NO_MESH" if raw_bbox is None else "FIXTURE_NOT_APPLIED"),
+            dimension_anchor_axis=plan.get("dimension_anchor_axis"),
+            non_anchor_dimension_error=plan.get("non_anchor_dimension_error"),
+            dimension_anchor_policy=str(plan.get("dimension_anchor_policy") or "FULL_ONLY"),
             orientation_status="NOT_VERIFIED",
             raw_sha256=hashlib.sha256(raw_path.read_bytes()).hexdigest(),
         )
@@ -820,6 +887,8 @@ class BlenderCLIAdapter:
         target_dimensions: Mapping[str, object] | None = None,
         dimension_unit: str = "source_unit",
         orientation: Mapping[str, object] | None = None,
+        dimension_anchor_axis: str | None = None,
+        allow_non_anchor_dimension_error: bool = False,
     ) -> BlenderQAResult:
         if not raw_path.is_file():
             raise BlenderAdapterError("raw_glb_missing")
@@ -847,10 +916,16 @@ class BlenderCLIAdapter:
             numeric = _validate_rotation_matrix(matrix)
             orientation_payload["status"] = "CONFIRMED"
         oriented_preflight_bbox = _oriented_bbox_for_plan(raw_bbox, orientation_payload.get("rotation_matrix"))
-        plan = plan_dimension_normalization(oriented_preflight_bbox, target_dimensions, dimension_unit)
+        plan = plan_dimension_normalization(
+            oriented_preflight_bbox,
+            target_dimensions,
+            dimension_unit,
+            dimension_anchor_axis=dimension_anchor_axis,
+            allow_non_anchor_dimension_error=allow_non_anchor_dimension_error,
+        )
         if plan.get("dimension_status") == "UNKNOWN_UNIT":
             raise BlenderAdapterError("UNKNOWN_DIMENSION_UNIT")
-        if plan.get("dimension_status") == "MODEL_DIMENSION_CONFLICT":
+        if plan.get("dimension_status") in {"MODEL_DIMENSION_CONFLICT", "INVALID_ANCHOR_AXIS", "ANCHOR_MISSING"}:
             raise ModelDimensionConflict("target dimensions exceed uniform normalization tolerance")
         report_path = output_path.with_suffix(".blender-qa.json")
         render_dir = output_path.parent / f"{output_path.stem}.views"
@@ -907,7 +982,12 @@ class BlenderCLIAdapter:
                     for axis in ("width", "depth", "height")
                     if axis in fallback_size and axis in target_model
                 }
-                if fallback_error and max(fallback_error.values()) > _geometry_tolerance():
+                fallback_gate = (
+                    fallback_error.get(str(dimension_anchor_axis or "").casefold(), float("inf"))
+                    if dimension_anchor_axis and allow_non_anchor_dimension_error
+                    else max(fallback_error.values()) if fallback_error else float("inf")
+                )
+                if fallback_error and fallback_gate > _geometry_tolerance():
                     raise ModelDimensionConflict("final dimensions exceed configured geometry tolerance after uniform normalization")
         if orientation_missing:
             raise BlenderAdapterError("ORIENTATION_REVIEW_REQUIRED")
@@ -928,7 +1008,12 @@ class BlenderCLIAdapter:
                 for axis in ("width", "depth", "height")
                 if axis in final_size and axis in target_model
             }
-        if dimension_error and max(dimension_error.values()) > _geometry_tolerance():
+        gate_error = (
+            dimension_error.get(str(dimension_anchor_axis or "").casefold(), float("inf"))
+            if dimension_anchor_axis and allow_non_anchor_dimension_error and dimension_error
+            else max(dimension_error.values()) if dimension_error else 0.0
+        )
+        if dimension_error and gate_error > _geometry_tolerance():
             raise ModelDimensionConflict("final dimensions exceed configured geometry tolerance after uniform normalization")
         return BlenderQAResult(
             status="PASS",
@@ -945,6 +1030,12 @@ class BlenderCLIAdapter:
             final_bbox=report.get("final_bbox") if isinstance(report.get("final_bbox"), dict) else final_bbox,
             dimension_error=dimension_error,
             dimension_status="PASS" if final_bbox is not None else "NOT_MEASURED_NO_MESH",
+            dimension_anchor_axis=plan.get("dimension_anchor_axis"),
+            non_anchor_dimension_error=plan.get("non_anchor_dimension_error") or {
+                axis: value for axis, value in (dimension_error or {}).items()
+                if axis != str(dimension_anchor_axis or "").casefold()
+            } if dimension_anchor_axis and allow_non_anchor_dimension_error else None,
+            dimension_anchor_policy=str(plan.get("dimension_anchor_policy") or "FULL_ONLY"),
             orientation_status=str((report.get("orientation") or orientation_payload).get("status") or "CONFIRMED"),
             orientation=report.get("orientation") if isinstance(report.get("orientation"), dict) else orientation_payload,
             raw_sha256=str(report.get("source_sha256") or hashlib.sha256(raw_path.read_bytes()).hexdigest()),
