@@ -72,8 +72,8 @@ Blender CLI 导入、世界包围盒测量、统一缩放、导出后重新导�
 固定 45 站没有改分母。完整逐行结果见 [`trial_evidence/20260906/site_matrix.csv`](trial_evidence/20260906/site_matrix.csv)。本轮统计：
 
 - 固定分母：45
-- 本轮尝试：7 个站点（Room & Board、Interior Define、Alessi、West Elm、Poly Haven、CGTrader，另含 West Elm 的 offline guard）
-- 扫描完成：7（5 个 `TEMPORARY_FAILURE`、1 个 `PARTIAL`、1 个 `LIVE_SCAN_REQUIRED`）
+- 本轮启动：6 个不同站点、7 次 scan run（另含 West Elm 的 offline guard）
+- 扫描完成：7 次 run（5 个 `TEMPORARY_FAILURE`、1 个 `PARTIAL`、1 个 `LIVE_SCAN_REQUIRED`）
 - 本轮 `READY_FOR_MODELING` 流程：1 个候选（Sawyer）
 - 真实网页下载：1 个 Job / 1 个 GLB
 - 本轮 0 个站点达到完整“扫描+类目/数量+N=1 Ready+下载”之外的额外站点门槛；其余固定站保留 `NOT_RUN`，没有从分母删除
