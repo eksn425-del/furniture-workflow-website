@@ -1,0 +1,48 @@
+Furniture Workflow Website — 45 个测试网站网址
+基准：历史 44 站 + West Elm；与 2026-09-05/06 最新 45 站验收矩阵一致。
+
+01  Anthropologie          https://www.anthropologie.com/
+02  Arhaus                 https://www.arhaus.com/
+03  Article                https://www.article.com/
+04  Castlery               https://www.castlery.com/
+05  Interior Define        https://www.interiordefine.com/
+06  Ligne Roset            https://www.ligne-roset.com/
+07  MacKenzie-Childs       https://www.mackenzie-childs.com/
+08  Nathan James           https://nathanjames.com/
+09  POLYWOOD               https://www.polywood.com/
+10  RH                     https://rh.com/
+11  Room & Board            https://www.roomandboard.com/
+12  Rove Concepts           https://www.roveconcepts.com/
+13  Sixpenny               https://sixpenny.com/
+14  Walker Edison           https://walkeredison.com/
+15  IAAH / India Art n Design https://www.indiaartndesign.com/
+16  Kayu                   https://kayu.com/
+17  Fabuliv                https://fabuliv.com/
+18  Globally Indian         https://globallyindian.com/
+19  Indikasa               https://indikasa.com/
+20  Iris                   https://www.irisus.com/
+21  Hometown               https://www.hometown.in/
+22  Featherlite            https://featherlitefurniture.com/
+23  Interio                https://www.interio.in/
+24  Durian                 https://www.durian.in/
+25  Indian Nest            https://indiannest.in/
+26  Furnishka              https://furnishka.com/
+27  LoveNspire             https://www.lovenspire.com/
+28  Indian Hub             https://indianhub.com/
+29  DesignConnected        https://www.designconnected.com/
+30  Archive3D              https://archive3d.net/
+31  GrabCAD                https://grabcad.com/
+32  CGTrader               https://www.cgtrader.com/
+33  Free3D                 https://free3d.com/
+34  Archibase              https://archibaseplanet.com/
+35  3DExport               https://3dexport.com/
+36  3D Warehouse            https://3dwarehouse.sketchup.com/
+37  Sweet Home 3D           https://www.sweethome3d.com/
+38  NASA 3D                https://nasa3d.arc.nasa.gov/
+39  3DXO                   https://3dxo.com/
+40  MyMiniFactory          https://www.myminifactory.com/
+41  Poly Haven             https://polyhaven.com/
+42  Alessi                 https://www.alessi.com/
+43  Safavieh               https://safavieh.com/
+44  Driade                 https://www.driade.com/
+45  West Elm               https://www.westelm.com/

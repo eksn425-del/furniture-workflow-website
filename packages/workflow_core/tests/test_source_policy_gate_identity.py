@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from packages.workflow_core.naming import compose_brand_official_name, compose_official_name, compose_product_name
@@ -61,6 +62,26 @@ def test_roomandboard_page_item_can_authoritatively_bind_a_secondary_jsonld_sku(
     assert identity["jsonld_sku_role"] == "secondary_internal"
 
 
+def test_human_readable_roomandboard_slug_is_compatible_when_structured_asset_matches_item() -> None:
+    evidence = {
+        "canonical_url": "https://www.roomandboard.com/catalog/bath/bath-hardware/filmore-towel-bars",
+        "url_tail_id": "filmore-towel-bars",
+        "page_item_number": "997415",
+        "jsonld_sku": "28465",
+        "jsonld_sku_role": "secondary_internal",
+        "asset_identity": "997415",
+        "product_identity_match": True,
+        "jsonld_image_bound": True,
+    }
+    status, confidence, reasons = media_binding_status(
+        evidence,
+        media_url="https://rnb.scene7.com/is/image/roomandboard/997415?scl=1",
+        source="json_ld_image",
+    )
+    assert (status, confidence) == ("COMPATIBLE", 0.9)
+    assert reasons == ["human_readable_slug_not_sku_structured_media_bound"]
+
+
 def test_production_gate_is_strict_for_mismatch_and_unknown_binding() -> None:
     facts = {
         "identity": "roomandboard|575954|https://www.roomandboard.com/catalog/575954",
@@ -100,6 +121,16 @@ def test_all_governed_names_keep_whole_words_and_fifty_character_limit() -> None
     assert not official.endswith(" ")
     assert official.startswith("Room & Board ")
     assert official.endswith(" Bed")
+
+
+def test_official_name_keeps_dimensions_out_of_public_name_and_supports_bath_hardware() -> None:
+    name = compose_official_name(
+        source_name="Filmore 24w 3.5d 2h Towel Bar",
+        verified_type="Towel Bar",
+        brand="Room & Board",
+    )
+    assert name == "Room & Board Filmore Towel Bar"
+    assert not re.search(r"\d+(?:\.\d+)?\s*(?:w|d|h|in)\b", name, re.I)
 
 
 def test_brand_official_name_does_not_duplicate_brand_and_keeps_limit() -> None:

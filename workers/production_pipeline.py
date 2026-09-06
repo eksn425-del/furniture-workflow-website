@@ -52,6 +52,7 @@ from packages.workflow_core.candidate_pool import CandidatePoolStore, CandidateR
 from packages.workflow_core.dimensions import govern_dimensions, round_dimension
 from packages.workflow_core.locks import QuotaValidationError, make_order_policy_lock, provider_idempotency_key, stable_hash
 from packages.workflow_core.naming import (
+    NAMING_RULE_VERSION,
     NamingReviewRequired,
     compose_brand_official_name,
     compose_official_name,
@@ -69,7 +70,7 @@ from packages.workflow_core.production_gate import (
 )
 from packages.workflow_core.source_identity import normalize_identity_fields
 from packages.workflow_core.source_policy import resolve_source_policy
-from packages.workflow_core.statuses import ItemState
+from packages.workflow_core.statuses import FailureDisposition, ItemState
 from workers.modeling_provider import Lux3DClient, is_capacity_rejection
 from workers.blender_adapter import BlenderAdapterError, ModelDimensionConflict, resolve_blender_adapter, validate_glb
 from workers.scrape.http_client import NetworkPolicyError, RobotsDenied, SafeHttpClient
@@ -546,7 +547,21 @@ class WebsiteStageAdapter:
             return StageOutcome(StageDecision.REJECTED, "CATEGORY_OUTSIDE_SELECTED_SCOPE")
         if str(candidate.lineage.get("scope_status") or "").upper() == "CONFLICT":
             return StageOutcome(StageDecision.REJECTED, SCOPE_VISUAL_CONFLICT)
-        if candidate.lineage.get("identity_conflicts") and self.source_policy.source_host == "roomandboard.com":
+        identity_conflicts = {
+            str(value) for value in (candidate.lineage.get("identity_conflicts") or []) if str(value)
+        }
+        # Room & Board uses human-readable slugs while its structured product
+        # and Scene7 asset use the official page item number.  The centralized
+        # media-binding policy already downgrades that single, bound slug
+        # difference to COMPATIBLE; do not re-promote it to a hard rejection.
+        benign_slug_conflict = (
+            identity_conflicts == {"url_tail_id_page_item_number_conflict"}
+            and str(candidate.lineage.get("media_binding_status") or "").upper() == "COMPATIBLE"
+            and "human_readable_slug_not_sku_structured_media_bound" in {
+                str(value) for value in (candidate.lineage.get("media_binding_reasons") or [])
+            }
+        )
+        if identity_conflicts and self.source_policy.source_host == "roomandboard.com" and not benign_slug_conflict:
             return StageOutcome(StageDecision.REJECTED, MEDIA_IDENTITY_MISMATCH)
         if (
             str(candidate.lineage.get("media_binding_status") or "").upper() == "MISMATCH"
@@ -609,15 +624,41 @@ class WebsiteStageAdapter:
                     "media_path": None,
                     "media_sha256": None,
                     "media_checkpoint_invalidated": True,
+                    "brain_product_decision": None,
+                    "brain_receipt": None,
+                    "visual_receipt_invalidated": True,
                 })
         primary_url = str(candidate.lineage.get("image_url") or candidate.preview_url or "")
-        candidate_urls = [primary_url]
+        candidate_entries: list[tuple[str, int, int]] = []
+        seen_urls: set[str] = set()
+        rejected_urls = {
+            str(value).strip()
+            for value in candidate.lineage.get("visual_rejected_media_urls") or []
+            if str(value).strip()
+        }
         for item in candidate.lineage.get("image_candidates") or []:
             if isinstance(item, dict) and item.get("accepted") and item.get("url"):
                 value = str(item["url"])
-                if value not in candidate_urls:
-                    candidate_urls.append(value)
-        candidate_urls = candidate_urls[:8]
+                if value in seen_urls or value in rejected_urls:
+                    continue
+                seen_urls.add(value)
+                try:
+                    score = int(item.get("score") or 0)
+                except (TypeError, ValueError):
+                    score = 0
+                try:
+                    gallery_index = int(item.get("gallery_index") or 0)
+                except (TypeError, ValueError):
+                    gallery_index = 0
+                candidate_entries.append((value, gallery_index, score))
+        # A legacy/hand-authored candidate may have only image_url.  Keep it in
+        # the same ranked list, but never let it outrank an explicitly scored
+        # gallery image.
+        if primary_url and primary_url not in seen_urls and primary_url not in rejected_urls:
+            candidate_entries.append((primary_url, 10_000, 0))
+        candidate_entries.sort(key=lambda item: (-item[2], item[1], item[0]))
+        candidate_entries = candidate_entries[:8]
+        candidate_urls = [item[0] for item in candidate_entries]
         if not primary_url:
             return StageOutcome(StageDecision.REJECTED, "MEDIA_URL_MISSING")
         result = None
@@ -668,6 +709,11 @@ class WebsiteStageAdapter:
             "selected_media_url": url,
             "media_candidate_index": selected_index,
             "media_candidate_url": url,
+            "image_priority_score": candidate_entries[selected_index][2] if selected_index < len(candidate_entries) else 0,
+            "image_ranked_candidates": [
+                {"url": entry[0], "gallery_index": entry[1], "score": entry[2]}
+                for entry in candidate_entries
+            ],
             "image_decode_evidence": selected_decode,
             "media_role": "MAIN_PRODUCT",
             "media_rebind_attempts": rejected_media,
@@ -1161,10 +1207,21 @@ class WebsiteStageAdapter:
             return StageOutcome(StageDecision.REJECTED, "DIMENSIONS_MISSING_OR_INVALID")
         if not governed:
             return StageOutcome(StageDecision.REJECTED, "DIMENSIONS_MISSING_OR_INVALID")
-        target_dimensions = dict(governed)
+        # Preserve the official normalized value as the model target.  The
+        # integer map is a display/catalog projection only; feeding rounded
+        # inches into Blender would introduce avoidable size drift for cm/mm
+        # sources (and makes the source evidence impossible to reproduce).
+        target_dimensions = {
+            axis: float(item["normalized_value"])
+            for axis, item in normalized_axes.items()
+            if item.get("normalized_value") not in (None, "")
+        }
         evidence = {
             "dimensions": governed,
+            "dimensions_display": governed,
             "target_dimensions": target_dimensions,
+            "target_dimensions_display": governed,
+            "dimension_precision_policy": "NORMALIZED_SOURCE_VALUE_FOR_MODEL_DISPLAY_INTEGER_ONLY",
             "dimension_axes": normalized_axes,
             "dimension_source": source or "UNKNOWN",
             "dimension_unit": "in",
@@ -1357,6 +1414,11 @@ class WebsiteStageAdapter:
                 )
             except NamingReviewRequired as error:
                 return StageOutcome(StageDecision.REJECTED, f"NAMING_REVIEW:duplicate_name_unresolvable:{error}")
+            if governed_name.casefold() in existing_names:
+                # A final collision check is mandatory.  Do not silently
+                # append an arbitrary counter: a hash collision or duplicate
+                # identity is an auditable naming blocker.
+                return StageOutcome(StageDecision.REJECTED, "NAMING_REVIEW:duplicate_name_unresolvable:stable_identity_suffix_collision")
         self.pool.enrich_candidate(candidate.candidate_id, product_name=governed_name, lineage={
             "governed_name": governed_name,
             "naming_decision_source": legacy_decision_source,
@@ -1382,6 +1444,50 @@ class WebsiteStageAdapter:
             "final_name_char_count": len(governed_name),
             "final_name_limit": name_limit,
         })
+
+    def reconcile_naming_checkpoint(self) -> int:
+        """Re-run only the deterministic naming gate after a code-contract fix.
+
+        A checkpoint can contain candidates locked under an older naming
+        contract (or in ``NAMING_REVIEW``).  Reusing their captured media and
+        Brain receipt is safe; sending them directly to Provider is not.  Move
+        only those unsubmitted records back to the naming boundary, record the
+        contract version, and let the shared engine rebuild catalog/model input
+        hashes before any paid POST.
+        """
+
+        repaired = 0
+        for record in self.pool.records():
+            if record.state not in {ItemState.MODEL_INPUT_LOCKED, ItemState.NAMING_REVIEW}:
+                continue
+            if record.provider_task_id or record.raw_glb_path:
+                continue
+            # A capacity response is a durable Provider checkpoint, not a
+            # naming migration candidate.  Preserve its ledger/state so the
+            # next resume can query/retry the same idempotent submission.
+            if str(record.provider_status or "").upper() in {
+                "CAPACITY_WAIT", "ACTIVE", "CREATE_IN_FLIGHT", "SUBMISSION_UNKNOWN",
+            }:
+                continue
+            if str(record.lineage.get("naming_contract_reconciled") or "") == NAMING_RULE_VERSION:
+                continue
+            outcome = self._stage_naming(record)
+            if outcome.decision is not StageDecision.ACCEPTED:
+                continue
+            self.pool.transition(
+                record.candidate_id,
+                ItemState.NAMING_READY,
+                reason="NAMING_CONTRACT_RECONCILED",
+                disposition=FailureDisposition.RETRY_ITEM,
+                retry=True,
+                lineage={
+                    **dict(outcome.evidence or {}),
+                    "naming_contract_reconciled": NAMING_RULE_VERSION,
+                    "naming_checkpoint_reconciled": True,
+                },
+            )
+            repaired += 1
+        return repaired
 
     def _stage_catalog(self, candidate: CandidateRecord) -> StageOutcome:
         current = next(item for item in self.pool.records() if item.candidate_id == candidate.candidate_id)
@@ -1645,6 +1751,178 @@ class WebsiteStageAdapter:
         finally:
             session.close()
 
+    def _orientation_review(
+        self,
+        candidate: CandidateRecord,
+        raw_path: Path,
+        raw_sha256: str,
+    ) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
+        """Produce or resume a hash-bound orientation review for one raw GLB."""
+
+        existing = candidate.lineage.get("orientation_review")
+        if isinstance(existing, dict):
+            bound_hash = str(existing.get("raw_glb_sha256") or "")
+            if bound_hash == raw_sha256 and str(existing.get("status") or "").upper() == "CONFIRMED":
+                return existing, None, {"orientation_review": existing, "orientation_status": "CONFIRMED"}
+
+        view_dir = self.model_root / "orientation_views" / candidate.record_id
+        view_report: dict[str, Any]
+        try:
+            cached_report = view_dir / "orientation-views.json"
+            if cached_report.is_file():
+                view_report = json.loads(cached_report.read_text(encoding="utf-8"))
+            elif hasattr(self.blender_adapter, "render_orientation_views"):
+                view_report = self.blender_adapter.render_orientation_views(raw_path, view_dir)
+            else:
+                return None, "ORIENTATION_REVIEW_REQUIRED", {"orientation_status": "ORIENTATION_REVIEW_REQUIRED"}
+        except (OSError, ValueError, json.JSONDecodeError, BlenderAdapterError) as error:
+            evidence = {
+                "orientation_status": "ORIENTATION_REVIEW_REQUIRED",
+                "orientation_reason": f"VIEW_RENDER_FAILED:{type(error).__name__}",
+                "orientation_view_dir": str(view_dir),
+                "raw_glb_sha256": raw_sha256,
+            }
+            self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
+            candidate.lineage.update(evidence)
+            return None, "ORIENTATION_REVIEW_REQUIRED", evidence
+
+        raw_views = view_report.get("views") if isinstance(view_report, dict) else []
+        view_evidence: list[dict[str, Any]] = []
+        if isinstance(raw_views, list):
+            for raw_view in raw_views:
+                view_path = Path(str(raw_view)).resolve()
+                if not view_path.is_file():
+                    continue
+                try:
+                    view_hash = hashlib.sha256(view_path.read_bytes()).hexdigest()
+                except OSError:
+                    continue
+                view_evidence.append({
+                    "name": view_path.stem,
+                    "path": str(view_path),
+                    "sha256": view_hash,
+                    "role": "BLENDER_ORIENTATION_VIEW",
+                })
+        binding = {
+            "candidate_id": candidate.candidate_id,
+            "record_id": candidate.record_id,
+            "canonical_url": candidate.canonical_url,
+            "raw_glb_path": str(raw_path),
+            "raw_glb_sha256": raw_sha256,
+            "media_sha256": str(candidate.lineage.get("media_sha256") or ""),
+            "views": view_evidence,
+            "viewport": ["front", "top", "right", "iso"],
+            "policy": {"target_front_axis": "-Y", "target_top_axis": "+Z", "tilted_policy": "REVIEW_REQUIRED"},
+        }
+        if len(view_evidence) < 4 and str(getattr(self.blender_adapter, "name", "")).upper() != "FAKE_LOCAL_BLENDER":
+            evidence = {"orientation_status": "ORIENTATION_REVIEW_REQUIRED", "orientation_binding": binding}
+            self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
+            candidate.lineage.update(evidence)
+            return None, "ORIENTATION_REVIEW_REQUIRED", evidence
+
+        # The fake adapter is an explicitly marked test-only seam.  It keeps
+        # existing deterministic E2E tests runnable but is never accepted as
+        # real closure evidence.
+        if str(getattr(self.blender_adapter, "name", "")).upper() == "FAKE_LOCAL_BLENDER":
+            from workers.blender_adapter import orientation_rotation
+
+            review = {
+                **orientation_rotation(front_axis="-Y", top_axis="+Z"),
+                "status": "CONFIRMED",
+                "orientation_source": "TEST_FIXTURE",
+                "raw_glb_sha256": raw_sha256,
+                "media_sha256": binding["media_sha256"],
+                "candidate_id": candidate.candidate_id,
+                "view_hashes": [item["sha256"] for item in view_evidence],
+            }
+            evidence = {"orientation_status": "CONFIRMED", "orientation_review": review, "orientation_binding": binding, "orientation_source": "TEST_FIXTURE"}
+            self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
+            candidate.lineage.update(evidence)
+            return review, None, evidence
+
+        orientation_input = {
+            "candidate_id": candidate.candidate_id,
+            "raw_glb_sha256": raw_sha256,
+            "media_sha256": binding["media_sha256"],
+            "orientation_views": view_evidence,
+            "orientation_binding": binding,
+        }
+        try:
+            decision, receipt = self.brain.reason_orientation(source_url=candidate.canonical_url, evidence=orientation_input)
+        except BrainError as error:
+            evidence = {
+                "orientation_status": "ORIENTATION_REVIEW_REQUIRED",
+                "orientation_reason": error.code,
+                "orientation_binding": binding,
+                "orientation_receipt": {"status": error.code, "review_provider": self.brain.review_provider},
+            }
+            self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
+            candidate.lineage.update(evidence)
+            return None, "ORIENTATION_REVIEW_REQUIRED", evidence
+        decision_data = decision.model_dump(mode="json")
+        status = str(decision_data.get("status") or "UNKNOWN").upper()
+        try:
+            confidence = float(decision_data.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        review_hashes = {str(item).strip() for item in decision_data.get("reviewed_view_hashes") or [] if str(item).strip()}
+        expected_hashes = {str(item["sha256"]) for item in view_evidence}
+        if (
+            status != "CONFIRMED"
+            or confidence < 0.85
+            or bool(decision_data.get("requires_human_confirmation"))
+            or not expected_hashes.issubset(review_hashes)
+        ):
+            evidence = {
+                "orientation_status": "ORIENTATION_REVIEW_REQUIRED",
+                "orientation_decision": decision_data,
+                "orientation_binding": binding,
+                "orientation_receipt": receipt,
+            }
+            self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
+            candidate.lineage.update(evidence)
+            return None, "ORIENTATION_REVIEW_REQUIRED", evidence
+        try:
+            from workers.blender_adapter import orientation_rotation
+
+            review = {
+                **orientation_rotation(
+                    front_axis=decision_data.get("front_axis"),
+                    top_axis=decision_data.get("top_axis"),
+                    target_front_axis=str(decision_data.get("target_front_axis") or "-Y"),
+                    target_top_axis=str(decision_data.get("target_top_axis") or "+Z"),
+                ),
+                "status": "CONFIRMED",
+                "orientation_source": self.brain.review_provider,
+                "raw_glb_sha256": raw_sha256,
+                "media_sha256": binding["media_sha256"],
+                "candidate_id": candidate.candidate_id,
+                "view_hashes": sorted(expected_hashes),
+                "decision": decision_data,
+            }
+        except BlenderAdapterError as error:
+            evidence = {
+                "orientation_status": "ORIENTATION_REVIEW_REQUIRED",
+                "orientation_reason": str(error),
+                "orientation_decision": decision_data,
+                "orientation_binding": binding,
+                "orientation_receipt": receipt,
+            }
+            self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
+            candidate.lineage.update(evidence)
+            return None, "ORIENTATION_REVIEW_REQUIRED", evidence
+        evidence = {
+            "orientation_status": "CONFIRMED",
+            "orientation_review": review,
+            "orientation_binding": binding,
+            "orientation_receipt": receipt,
+            "orientation_decision": decision_data,
+            "orientation_source": self.brain.review_provider,
+        }
+        self.pool.enrich_candidate(candidate.candidate_id, lineage=evidence)
+        candidate.lineage.update(evidence)
+        return review, None, evidence
+
     def _stage_download(self, candidate: CandidateRecord) -> StageOutcome:
         if self.provider_client is None or not candidate.provider_task_id:
             return StageOutcome(StageDecision.HARD_STOP, "KNOWN_PROVIDER_TASK_REQUIRED")
@@ -1662,7 +1940,8 @@ class WebsiteStageAdapter:
                 result = {}
             filename = _safe_name(candidate.product_name or candidate.record_id) or candidate.record_id
             target = self.model_root / f"{filename}__{candidate.record_id}.glb"
-            if not self.provider_client.download_glb(result, candidate.provider_task_id, target):
+            raw_already_downloaded = target.is_file()
+            if not raw_already_downloaded and not self.provider_client.download_glb(result, candidate.provider_task_id, target):
                 ledger.status = ledger.checkpoint_state = "DOWNLOAD_FAILED"
                 ledger.error_code = "DOWNLOAD_FAILED"
                 session.commit()
@@ -1688,6 +1967,24 @@ class WebsiteStageAdapter:
                 ledger.error_message = "A configured Blender normalization/QA adapter is required before delivery"
                 session.commit()
                 return StageOutcome(StageDecision.HARD_STOP, "BLENDER_NOT_CONFIGURED")
+            orientation, orientation_reason, orientation_evidence = self._orientation_review(candidate, target, digest)
+            if orientation is None:
+                ledger.error_code = orientation_reason or "ORIENTATION_REVIEW_REQUIRED"
+                ledger.error_message = "Raw GLB downloaded; orientation views/review are required before Blender QA"
+                session.commit()
+                return StageOutcome(
+                    StageDecision.PENDING,
+                    orientation_reason or "ORIENTATION_REVIEW_REQUIRED",
+                    {
+                        **orientation_evidence,
+                        "raw_glb_path": str(target),
+                        "raw_glb_sha256": digest,
+                        "raw_glb_reused": raw_already_downloaded,
+                    },
+                    raw_glb_path=str(target),
+                    raw_glb_sha256=digest,
+                    raw_glb_valid=True,
+                )
             normalized_target = self.model_root / "normalized" / target.name
             try:
                 current = next(item for item in self.pool.records() if item.candidate_id == candidate.candidate_id)
@@ -1696,7 +1993,7 @@ class WebsiteStageAdapter:
                     normalized_target,
                     target_dimensions=current.lineage.get("target_dimensions") or current.lineage.get("dimensions"),
                     dimension_unit=current.lineage.get("dimension_unit") or "source_unit",
-                    orientation=current.lineage.get("orientation_review") or current.lineage.get("orientation"),
+                    orientation=orientation or current.lineage.get("orientation_review") or current.lineage.get("orientation"),
                 )
             except ModelDimensionConflict as error:
                 ledger.status = ledger.checkpoint_state = "MODEL_DIMENSION_CONFLICT"
@@ -1731,6 +2028,7 @@ class WebsiteStageAdapter:
                 StageDecision.ACCEPTED,
                 "RAW_GLB_AND_BLENDER_QA_VALIDATED",
                 {
+                    **orientation_evidence,
                     "blender_qa": qa_payload,
                     "blender_qa_status": display_qa_status,
                     "normalized_glb_path": str(qa_payload.get("normalized_path") or normalized_target),
@@ -1949,6 +2247,7 @@ class ProductionPipeline:
             "reasoning": validated.reasoning,
             "selected_product_urls": selected_urls,
         })
+
         return receipt
 
     def _provider_client(self) -> Lux3DClient | None:
@@ -2207,6 +2506,20 @@ class ProductionPipeline:
                     },
                 )
         engine = ProductionWorkflowEngine(policy=policy, pool=self.pool, adapter=adapter, completion_recorder=self._record_completion)
+        # A previous checkpoint may have reached MODEL_INPUT_LOCKED/NAMING_REVIEW
+        # under an older public-name contract.  Reconcile that deterministic
+        # boundary before the engine can consider a paid Provider submission;
+        # media, Brain receipts, and dimensions are reused unchanged.
+        naming_repaired = adapter.reconcile_naming_checkpoint()
+        if naming_repaired:
+            self.emit(
+                "QUALIFICATION_RECONCILED",
+                "NAMING",
+                f"已按 {NAMING_RULE_VERSION} 重建 {naming_repaired} 个未提交候选的公开名/模型输入",
+                None,
+                None,
+                {"repaired": naming_repaired, "provider_calls": 0, "reused_media": True},
+            )
         granular_emitted = 0
         if not self.pool.records():
             try:
@@ -2347,6 +2660,32 @@ class ProductionPipeline:
                 # the same already-reviewed product.
                 if before_tick != _candidate_progress_signature(self.pool.records()):
                     progressed_records = [item for item in self.pool.records() if item.state not in TERMINAL_ITEM_STATES]
+                    orientation_blocker = next(
+                        (
+                            item for item in sorted(progressed_records, key=lambda value: (value.created_at, value.candidate_id))
+                            if str(item.rejection_reason or "") == "ORIENTATION_REVIEW_REQUIRED"
+                        ),
+                        None,
+                    )
+                    if orientation_blocker is not None:
+                        self.emit(
+                            "JOB_BLOCKED",
+                            "ORIENTATION_REVIEW",
+                            "ORIENTATION_REVIEW_REQUIRED：原始 GLB 已下载并保留四视图，方向判断未确认；补充同一候选审核后恢复，不会重复生成",
+                            self.pool.success_count(),
+                            target,
+                            {
+                                "blocker": "ORIENTATION_REVIEW_REQUIRED",
+                                "candidate_id": orientation_blocker.candidate_id,
+                                "record_id": orientation_blocker.record_id,
+                                "raw_glb_path": orientation_blocker.lineage.get("raw_glb_path"),
+                                "raw_glb_sha256": orientation_blocker.lineage.get("raw_glb_sha256") or orientation_blocker.raw_glb_sha256,
+                                "orientation_binding": orientation_blocker.lineage.get("orientation_binding") or {},
+                                "provider_calls": adapter.provider_posts,
+                                "resume_safe": True,
+                            },
+                        )
+                        return 2
                     dimension_blocker = next(
                         (
                             item for item in sorted(progressed_records, key=lambda value: (value.created_at, value.candidate_id))
@@ -2412,6 +2751,32 @@ class ProductionPipeline:
                     continue
                 active_records = [item for item in self.pool.records() if item.state not in TERMINAL_ITEM_STATES]
                 pending_reasons = {str(item.rejection_reason or "") for item in active_records}
+                orientation_pending = next(
+                    (
+                        item for item in sorted(active_records, key=lambda value: (value.created_at, value.candidate_id))
+                        if str(item.rejection_reason or "") == "ORIENTATION_REVIEW_REQUIRED"
+                    ),
+                    None,
+                )
+                if orientation_pending is not None:
+                    self.emit(
+                        "JOB_BLOCKED",
+                        "ORIENTATION_REVIEW",
+                        "ORIENTATION_REVIEW_REQUIRED：原始 GLB 已下载并保留四视图；补充方向审核后可恢复同一 Job",
+                        self.pool.success_count(),
+                        target,
+                        {
+                            "blocker": "ORIENTATION_REVIEW_REQUIRED",
+                            "candidate_id": orientation_pending.candidate_id,
+                            "record_id": orientation_pending.record_id,
+                            "raw_glb_path": orientation_pending.lineage.get("raw_glb_path"),
+                            "raw_glb_sha256": orientation_pending.lineage.get("raw_glb_sha256") or orientation_pending.raw_glb_sha256,
+                            "orientation_binding": orientation_pending.lineage.get("orientation_binding") or {},
+                            "provider_calls": adapter.provider_posts,
+                            "resume_safe": True,
+                        },
+                    )
+                    return 2
                 l2_pending = next(
                     (
                         item for item in sorted(active_records, key=lambda value: (value.created_at, value.candidate_id))

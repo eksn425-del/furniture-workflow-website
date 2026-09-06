@@ -74,6 +74,12 @@ _MARKETING_NAME_WORDS = frozenset({
     "premium", "outdoor", "indoor", "home", "furniture", "available", "popular",
 })
 _DIMENSION_WORD = re.compile(r"^(?:\d+(?:\.\d+)?|\d+[/-]\d+)(?:in|inch|inches|cm|mm|m|w|d|h)?$", re.I)
+_DIMENSION_PHRASE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:\d+(?:\.\d+)?\s*[x×]\s*){1,3}\d+(?:\.\d+)?\s*(?:inches?|in|cm|mm|m)?"
+    r"|\d+(?:\.\d+)?\s*(?:inches?|in|cm|mm|m|w|d|h)\b",
+    re.IGNORECASE,
+)
 
 
 def _name_text(value: object) -> str:
@@ -83,6 +89,23 @@ def _name_text(value: object) -> str:
         raise NamingReviewRequired("product_name_missing")
     if "  " in text or text != text.strip():
         raise NamingReviewRequired("product_name_whitespace_invalid")
+    return text
+
+
+def _strip_dimension_phrases(value: object) -> str:
+    """Remove dimension evidence from the public name while keeping source data.
+
+    Dimensions are governed separately and must never become part of a public
+    product name (the production gate rejects dimension tokens).  This only
+    strips explicit numeric measurement phrases; series numbers and ordinary
+    words remain untouched.
+    """
+
+    text = _name_text(value)
+    text = _DIMENSION_PHRASE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -–—,;:")
+    if not text:
+        raise NamingReviewRequired("product_name_missing_after_dimension_removal")
     return text
 
 
@@ -295,7 +318,10 @@ def compose_official_name(
     """
 
     canonical_brand = _canonical_brand(brand, required=True)
-    source = _name_text(source_name)
+    # Official page titles commonly include compact dimensions such as
+    # ``18w 4d 3h``.  Those values remain authoritative in the dimension
+    # lineage, but are not allowed in the public name.
+    source = _strip_dimension_phrases(source_name)
     verified = standardize_product_type(verified_type)
     if source.casefold().startswith(f"{canonical_brand} ".casefold()):
         source = source[len(canonical_brand):].strip()
@@ -380,16 +406,14 @@ def disambiguate_product_name(
 
     base = _name_text(value)
     token_source = str(distinguishing or "").strip()
-    token = re.sub(r"[^A-Za-z0-9]+", "-", token_source).strip("-").upper()
-    if not token:
-        token = hashlib.sha256(str(identity or "").encode("utf-8")).hexdigest()[:8].upper()
-    # Public-name safety rejects literal ``SKU-...``/``MODEL-...`` tokens.
-    # Preserve the distinguishing value deterministically while using a
-    # neutral variant marker in the user-facing name.
-    if token.startswith(("SKU-", "MODEL-")):
-        token = "V-" + token.split("-", 1)[1]
-    token = token[:16]
-    suffix = f" ({token})"
+    # Never truncate a human SKU/variant prefix: two identities can share the
+    # first sixteen characters.  Derive the public suffix from the complete
+    # durable identity and the complete distinguishing evidence instead.
+    # The neutral marker avoids leaking model/SKU semantics while remaining
+    # deterministic across retries and resumptions.
+    identity_payload = f"{str(identity or '').strip()}\x1f{token_source}"
+    token = hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()[:12].upper()
+    suffix = f" (V-{token})"
     if len(suffix) >= max_chars:
         raise NamingReviewRequired("product_name_disambiguation_suffix_too_long")
     budget = max_chars - len(suffix)

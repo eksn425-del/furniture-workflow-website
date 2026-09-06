@@ -43,9 +43,9 @@ from app.models import (
     SiteEntryURL,
     utc_now,
 )
-from app.schemas import CompanyTestSiteRequest, ControlJobApproval, ControlJobCreate, ControlJobEdit, ControlJobStart, ControlJobTargetPatch, HumanReviewAction, LocalAgentProductReviewRequest
+from app.schemas import CompanyTestSiteRequest, ControlJobApproval, ControlJobCreate, ControlJobEdit, ControlJobStart, ControlJobTargetPatch, HumanReviewAction, LocalAgentProductReviewRequest, OrientationReviewRequest
 from app.services.brain_provider import BrainError, BrainNotConfigured
-from app.services.native_contracts import BrainProductDecision
+from app.services.native_contracts import BrainOrientationDecision, BrainProductDecision
 from app.services.runtime_diagnostics import collect_runtime_diagnostics
 from app.services.strategy_catalog import strategy_catalog_payload
 from app.services.site_profile import validate_site_profile
@@ -105,6 +105,9 @@ def _candidate_pool_summary(path: str) -> dict:
                 "blender_qa_status": lineage.get("blender_qa_status"),
                 "blender_qa": lineage.get("blender_qa") or {},
                 "identity_conflicts": lineage.get("identity_conflicts") or [],
+                "orientation_status": lineage.get("orientation_status") or "UNKNOWN",
+                "orientation_binding": lineage.get("orientation_binding") or {},
+                "orientation_views": (lineage.get("orientation_binding") or {}).get("views", []) if isinstance(lineage.get("orientation_binding"), dict) else [],
             })
         result = {"path": path, "job_status": raw_pool.get("job_status"), "target_count": raw_pool.get("target_count"), "state_counts": states, "items": summaries, "updated_at": raw_pool.get("updated_at")}
     _CANDIDATE_POOL_CACHE[path] = (mtime, result)
@@ -1032,6 +1035,11 @@ def _candidate_detail(record) -> dict[str, object]:
         "visual_status": record.visual_status,
         "rejection_reason": record.rejection_reason,
         "local_agent_review": capture.get("local_agent_review"),
+        "orientation_status": lineage.get("orientation_status") or "UNKNOWN",
+        "orientation_review": lineage.get("orientation_review") or {},
+        "orientation_binding": lineage.get("orientation_binding") or {},
+        "orientation_decision": lineage.get("orientation_decision") or {},
+        "orientation_views": (lineage.get("orientation_binding") or {}).get("views", []) if isinstance(lineage.get("orientation_binding"), dict) else [],
     }
 
 
@@ -1444,6 +1452,93 @@ def get_control_site(site_key: str, request: Request) -> dict:
             "scans": [{"scan_id": item.scan_id, "source_url": item.source_url, "status": item.status, "live": item.live, "taxonomy_level": item.taxonomy_level, "brain_status": item.brain_status, "provider_posts": item.provider_posts, "receipt_path": item.receipt_path, "error_code": item.error_code, "error_message": item.error_message, "started_at": item.started_at.isoformat(), "finished_at": item.finished_at.isoformat() if item.finished_at else None} for item in scans],
             "jobs": [_job_dict(item) for item in jobs],
         }
+    finally:
+        session.close()
+
+
+@router.post("/jobs/{job_id}/candidates/{candidate_id}/orientation-review")
+def record_orientation_review(job_id: str, candidate_id: str, payload: OrientationReviewRequest, request: Request) -> dict[str, object]:
+    """Persist a direction decision bound to the raw GLB and all view hashes."""
+
+    settings = request.app.state.website_brain.settings
+    if not (settings.local_agent_mode or settings.codex_bridge_mode):
+        raise HTTPException(status_code=409, detail="orientation review endpoint is reserved for the local/bridge operator")
+    session = _session(request)
+    try:
+        job = session.get(ProductionJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="production job not found")
+        if not job.candidate_pool_path:
+            raise HTTPException(status_code=404, detail="candidate pool not available")
+        try:
+            pool = CandidatePoolStore(Path(job.candidate_pool_path), order_id=job.job_id, job_id=job.job_id)
+            record = next((item for item in pool.records() if item.candidate_id == candidate_id), None)
+        except (CandidatePoolError, OSError) as error:
+            raise HTTPException(status_code=409, detail=f"candidate pool is unavailable: {type(error).__name__}") from error
+        if record is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        if str(record.rejection_reason or "") != "ORIENTATION_REVIEW_REQUIRED":
+            raise HTTPException(status_code=409, detail="candidate is not waiting for orientation review")
+        try:
+            review = BrainOrientationDecision.model_validate(payload.review)
+        except ValidationError as error:
+            raise HTTPException(status_code=422, detail="orientation review does not match the Website Brain orientation schema") from error
+        binding = record.lineage.get("orientation_binding") if isinstance(record.lineage.get("orientation_binding"), dict) else {}
+        expected = {
+            str(item.get("sha256") or "").strip()
+            for item in binding.get("views") or []
+            if isinstance(item, dict) and str(item.get("sha256") or "").strip()
+        }
+        reviewed = {str(item).strip() for item in review.reviewed_view_hashes if str(item).strip()}
+        if expected and not expected.issubset(reviewed):
+            raise HTTPException(status_code=400, detail="reviewed_view_hashes must include every stored Blender orientation view")
+        if review.status != "CONFIRMED" or review.requires_human_confirmation or review.confidence < 0.85:
+            raise HTTPException(status_code=400, detail="orientation review must be CONFIRMED with confidence >= 0.85")
+        try:
+            from workers.blender_adapter import orientation_rotation
+
+            rotation = orientation_rotation(
+                front_axis=review.front_axis,
+                top_axis=review.top_axis,
+                target_front_axis=review.target_front_axis,
+                target_top_axis=review.target_top_axis,
+            )
+        except Exception as error:
+            raise HTTPException(status_code=422, detail=f"orientation axes are invalid: {error}") from error
+        raw_sha = str(record.lineage.get("raw_glb_sha256") or record.raw_glb_sha256 or "")
+        if not raw_sha:
+            raise HTTPException(status_code=409, detail="raw GLB hash is missing; cannot bind orientation review")
+        orientation = {
+            **rotation,
+            "status": "CONFIRMED",
+            "orientation_source": "CODEX_DEVELOPMENT_BRIDGE" if settings.codex_bridge_mode else "LOCAL_AGENT",
+            "raw_glb_sha256": raw_sha,
+            "media_sha256": str(record.lineage.get("media_sha256") or ""),
+            "candidate_id": candidate_id,
+            "view_hashes": sorted(reviewed),
+            "decision": review.model_dump(mode="json"),
+        }
+        pool.enrich_candidate(candidate_id, lineage={
+            "orientation_status": "CONFIRMED",
+            "orientation_review": orientation,
+            "orientation_decision": review.model_dump(mode="json"),
+            "orientation_review_actor": payload.actor,
+            "orientation_review_receipt": {"review_provider": orientation["orientation_source"], "actor": payload.actor, "raw_glb_sha256": raw_sha},
+        })
+        job.status = "REVIEW_RESOLVED"
+        job.current_stage = "PROVIDER_DOWNLOAD"
+        job.last_reason = f"方向审核已记录（{payload.actor}）；恢复同一 Job 不会重复生成"
+        _event(session, job, "ORIENTATION_REVIEW_RECORDED", job.status, job.last_reason, {
+            "candidate_id": candidate_id,
+            "raw_glb_sha256": raw_sha,
+            "review_provider": orientation["orientation_source"],
+            "provider_calls": 0,
+            "resume_safe": True,
+        })
+        _audit(session, "ORIENTATION_REVIEW", "production_candidate", candidate_id, actor=payload.actor, result="RECORDED", payload={"job_id": job_id, "provider_calls": 0})
+        session.commit()
+        updated = next(item for item in pool.records() if item.candidate_id == candidate_id)
+        return {"status": "RECORDED", "resume_safe": True, "candidate": _candidate_detail(updated)}
     finally:
         session.close()
 

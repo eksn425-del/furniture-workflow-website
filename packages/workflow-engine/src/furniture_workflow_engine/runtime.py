@@ -501,12 +501,23 @@ class ProductionWorkflowEngine:
                 stage_status=pending_status,
                 reason=outcome.reason,
                 disposition=FailureDisposition.WAIT_PROVIDER,
+                lineage=dict(outcome.evidence or {}),
             )
             return False
         if decision is StageDecision.REJECTED:
+            # A valid downloaded GLB can still fail the strict C04/C11
+            # geometry contract when its three-axis aspect ratio cannot reach
+            # the official target by one uniform scale.  Keep that evidence as
+            # an auditable manual-review outcome; it is not a corrupt/invalid
+            # GLB and must not be reported as RAW_GLB_INVALID.
+            rejected_state = (
+                ItemState.MANUAL_REVIEW
+                if stage == "download" and str(outcome.reason or "").startswith("MODEL_DIMENSION_CONFLICT")
+                else _rejected_state(stage)
+            )
             self.pool.transition(
                 candidate.candidate_id,
-                _rejected_state(stage),
+                rejected_state,
                 stage_field=_stage_field(stage),
                 stage_status="REJECTED",
                 reason=outcome.reason or "stage rejected candidate",

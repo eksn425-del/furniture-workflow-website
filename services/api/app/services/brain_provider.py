@@ -13,7 +13,7 @@ from uuid import uuid4
 import requests
 from pydantic import BaseModel, ValidationError
 
-from app.services.native_contracts import BrainAccessDecision, BrainProductDecision, BrainSourceDecision, BrainTaxonomyResponse
+from app.services.native_contracts import BrainAccessDecision, BrainOrientationDecision, BrainProductDecision, BrainSourceDecision, BrainTaxonomyResponse
 
 
 MODEL_MODES = frozenset({
@@ -478,6 +478,36 @@ class WebsiteBrainProvider:
             })
         return decision, metadata
 
+    def reason_orientation(self, *, source_url: str, evidence: dict[str, object]) -> tuple[BrainOrientationDecision, dict[str, object]]:
+        """Judge a generated model's pose from explicit Blender view evidence.
+
+        Axis labels are discrete only when the views support them.  The prompt
+        explicitly forbids nearest-90° guessing for a tilted/ambiguous model;
+        the executor treats UNKNOWN/REVIEW_REQUIRED as a resumable gate.
+        """
+
+        prompt = (
+            "Evaluate one imported furniture GLB from the explicit Blender multi-view evidence. Return JSON ONLY. "
+            "front_axis is the product's semantic front in Blender world axes and top_axis is physical up. "
+            "The delivery contract is front -Y and top +Z. Use only the allowed discrete axes when the views prove "
+            "them. If the model is tilted, occluded, symmetric/ambiguous, or the views do not prove direction, "
+            "return status REVIEW_REQUIRED or UNKNOWN and do not snap it to the nearest 90 degrees. "
+            "Set symmetric=true only when equivalent directions are visually supported. "
+            "Return fields status, front_axis, top_axis, confidence, symmetric, equivalent_directions, "
+            "requires_human_confirmation, reviewed_view_hashes, reason_codes, semantic."
+        )
+        result, metadata = self.reason(
+            prompt=prompt,
+            input_payload={"source_url": source_url, "evidence": evidence},
+            schema=BrainOrientationDecision,
+        )
+        metadata = {
+            **metadata,
+            "orientation_input": "BLENDER_MULTI_VIEW",
+            "reviewed_view_hashes": list(result.reviewed_view_hashes),
+        }
+        return result, metadata
+
     def reason(self, *, prompt: str, input_payload: dict[str, object], schema: type[T]) -> tuple[T, dict[str, object]]:
         if self.settings.local_agent_mode:
             local_payload = self._local_payload(input_payload, schema)
@@ -936,6 +966,10 @@ class WebsiteBrainProvider:
         candidates: list[object] = []
         if schema is BrainProductDecision:
             candidates.extend(evidence.get(key) for key in ("local_agent_review", "agent_review", "local_review", "qualification"))
+        elif schema is BrainOrientationDecision:
+            candidates.extend(evidence.get(key) for key in (
+                "orientation_review", "local_agent_orientation_review", "orientation_decision", "local_review",
+            ))
         elif schema is BrainTaxonomyResponse:
             candidates.extend(evidence.get(key) for key in ("local_taxonomy", "local_agent_review", "agent_review"))
             if isinstance(evidence.get("categories"), list):
@@ -984,14 +1018,32 @@ class WebsiteBrainProvider:
         # or fallback is synthesized here.
         if self.settings.model_mode in {"MULTIMODAL_SINGLE_MODEL", "CODEX_DEVELOPMENT_BRIDGE"}:
             evidence = self._evidence(input_payload)
-            image_url = str(evidence.get("image_url") or evidence.get("selected_media_url") or "").strip()
-            if image_url:
+            image_urls: list[str] = []
+            for value in (evidence.get("image_url"), evidence.get("selected_media_url")):
+                if isinstance(value, str) and value.strip() and value.strip() not in image_urls:
+                    image_urls.append(value.strip())
+            local_view_paths: list[str] = []
+            views = evidence.get("orientation_views")
+            if isinstance(views, list):
+                for item in views:
+                    if not isinstance(item, dict):
+                        continue
+                    value = str(item.get("url") or item.get("path") or "").strip()
+                    if not value:
+                        continue
+                    if value.startswith(("http://", "https://")) and value not in image_urls:
+                        image_urls.append(value)
+                    else:
+                        local_view_paths.append(value)
+            if image_urls or local_view_paths:
+                text = user_text
+                if local_view_paths:
+                    text += "\nExplicit local Blender view paths (inspect these files; do not invent replacements):\n" + "\n".join(local_view_paths)
+                parts: list[dict[str, object]] = [{"type": "text", "text": text}]
+                parts.extend({"type": "image_url", "image_url": {"url": value}} for value in image_urls)
                 return [
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ]},
+                    {"role": "user", "content": parts},
                 ]
         return [
             {"role": "system", "content": prompt},

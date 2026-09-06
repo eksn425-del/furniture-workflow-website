@@ -131,6 +131,25 @@ class BrainProductDecision(BaseModel):
     reviewed_media_sha256: str = ""
 
 
+class BrainOrientationDecision(BaseModel):
+    """Evidence-bound pose decision for the Blender delivery contract."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["CONFIRMED", "REVIEW_REQUIRED", "UNKNOWN"] = "UNKNOWN"
+    front_axis: Literal["+X", "-X", "+Y", "-Y", "+Z", "-Z", "UNKNOWN"] = "UNKNOWN"
+    top_axis: Literal["+X", "-X", "+Y", "-Y", "+Z", "-Z", "UNKNOWN"] = "UNKNOWN"
+    target_front_axis: Literal["-Y"] = "-Y"
+    target_top_axis: Literal["+Z"] = "+Z"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    symmetric: bool = False
+    equivalent_directions: list[str] = Field(default_factory=list, max_length=12)
+    requires_human_confirmation: bool = False
+    reviewed_view_hashes: list[str] = Field(default_factory=list, max_length=16)
+    reason_codes: list[str] = Field(default_factory=list, max_length=16)
+    semantic: str = ""
+
+
 class TaxonomyReceipt(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

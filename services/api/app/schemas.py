@@ -630,6 +630,15 @@ class LocalAgentProductReviewRequest(BaseModel):
     actor: str = Field(default="local-agent", min_length=1, max_length=128)
 
 
+class OrientationReviewRequest(BaseModel):
+    """Explicit pose review bound to the stored Blender view hashes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    review: dict[str, object]
+    actor: str = Field(default="local-agent", min_length=1, max_length=128)
+
+
 class HumanReviewAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

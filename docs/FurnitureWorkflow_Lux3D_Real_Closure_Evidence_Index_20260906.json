@@ -1,0 +1,100 @@
+{
+  "schema_version": "furniture-workflow-lux3d-evidence-index.v1",
+  "generated_at": "2026-09-06",
+  "secrets_included": false,
+  "source": {
+    "workspace": "E:\\living\\FurnitureWorkflow-Website-public",
+    "branch": "codex-v3-iteration-20260904",
+    "head": "03c698c94b72b96c1d38926a327b9c7bb0a45ffd",
+    "origin_main": "7d6e098e9623f907df828b05d7a00cbad2ba4821",
+    "remote": "https://github.com/eksn425-del/furniture-workflow-website.git",
+    "working_tree_changes": true
+  },
+  "runtime": {
+    "api": "http://127.0.0.1:8000",
+    "web": "http://127.0.0.1:3000",
+    "brain_mode": "CODEX_DEVELOPMENT_BRIDGE",
+    "bridge_root": "E:\\living\\closure_evidence_20260906\\bridge_real",
+    "lux3d_host_redacted": "api.aholo3d.cn",
+    "lux3d_model": "v3.0-standard",
+    "blender_version": "4.5.11 LTS",
+    "diagnostics": {
+      "brain": "READY",
+      "lux3d": "READY",
+      "blender": "READY",
+      "l2_browser": "READY",
+      "production_worker": "READY"
+    }
+  },
+  "real_lux3d": {
+    "job_id": "job_90bbcd1f29d645b98310ee95009861ff",
+    "candidate_id": "candidate_0798b70642b07e666b14b869",
+    "record_id": "record_0798b70642b07e666b14b869",
+    "provider_task_id": "3304300",
+    "create_attempts": 1,
+    "billable_attempts": 1,
+    "unknown_create_attempts": 0,
+    "poll_attempts": 1,
+    "raw_glb_sha256": "0bb7baa8411a94ae7299309bc97b3c8ed186de801639615a47efa70f45914221",
+    "provider_result": "MODEL_DIMENSION_CONFLICT",
+    "delivery_status": "NOT_DELIVERED",
+    "raw_glb_path": "E:\\living\\closure_evidence_20260906\\website_real\\web_productions\\roomandboard.com\\job_90bbcd1f29d645b98310ee95009861ff\\04_provider\\glb\\Room & Board Sawyer Shower Shelf__record_0798b70642b07e666b14b869.glb",
+    "dimension_conflict_evidence": "E:\\living\\closure_evidence_20260906\\website_real\\web_productions\\roomandboard.com\\job_90bbcd1f29d645b98310ee95009861ff\\04_provider\\glb\\blender_dimension_conflict.evidence.json",
+    "orientation_report": "E:\\living\\closure_evidence_20260906\\website_real\\web_productions\\roomandboard.com\\job_90bbcd1f29d645b98310ee95009861ff\\04_provider\\glb\\orientation_views\\record_0798b70642b07e666b14b869\\orientation-views.json",
+    "orientation": {
+      "status": "CONFIRMED",
+      "front_axis": "-Y",
+      "top_axis": "+Z",
+      "view_names": ["front", "top", "right", "iso"],
+      "review_provider": "CODEX_DEVELOPMENT_BRIDGE"
+    }
+  },
+  "ready_pool_d": {
+    "site": "Interior Define",
+    "job_id": "acceptance_direct_d_interiordefine",
+    "provider": "OFF",
+    "target": 3,
+    "discovered": 9,
+    "visual_reviews": 9,
+    "dimension_ready": 1,
+    "dimension_pending": 8,
+    "status": "PARTIAL",
+    "blocker": "TEMPORARY_PAGE_FAILURE",
+    "run": "E:\\living\\closure_evidence_20260906\\acceptance_interiordefine_direct_d\\direct_d_run.json",
+    "pool": "E:\\living\\closure_evidence_20260906\\acceptance_interiordefine_direct_d\\candidate_pool.json"
+  },
+  "acceptance_45": {
+    "run_id": "acceptance_20260905T192959Z",
+    "site_count": 45,
+    "layer_a": {
+      "pass": 30,
+      "access_blocked": 9,
+      "environment_blocked": 1,
+      "failed": 5
+    },
+    "matrix": "E:\\living\\closure_evidence_20260906\\acceptance45_layer_a\\acceptance_acceptance_20260905T192959Z.json"
+  },
+  "representative": {
+    "previous_runner": "E:\\living\\closure_evidence_20260906\\acceptance_representative_bcde\\acceptance_acceptance_20260905T193825Z.json",
+    "bridge_rerun": "E:\\living\\closure_evidence_20260906\\acceptance_interiordefine_bridge_d\\acceptance_acceptance_20260905T194446Z.json",
+    "notes": "Interior Define direct D is the current bridge-connected rerun; prior runner statuses are preserved rather than rewritten."
+  },
+  "blender_regressions": {
+    "root": "E:\\living\\closure_evidence_20260906\\blender_real",
+    "cases": [
+      "nested_parent_rotation",
+      "shared_mesh_instances",
+      "source_front_plus_x"
+    ],
+    "status": "PASS"
+  },
+  "automation": {
+    "pytest_exit": 0,
+    "compileall_exit": 0,
+    "frontend_typecheck_exit": 0,
+    "frontend_lint_exit": 0,
+    "frontend_build_exit": 0,
+    "git_diff_check_exit": 0,
+    "credential_scan_matches": 0
+  }
+}

@@ -158,6 +158,24 @@ def _known_unit_factor(unit: object) -> float | None:
     return _UNIT_TO_MODEL.get(normalized)
 
 
+def _geometry_tolerance() -> float:
+    """Final measured-size tolerance, separate from aspect-ratio safety."""
+
+    try:
+        value = float(os.getenv("BLENDER_DIMENSION_TOLERANCE", "0.05"))
+    except (TypeError, ValueError):
+        value = 0.05
+    return min(0.15, max(0.001, value))
+
+
+def _aspect_ratio_limit() -> float:
+    try:
+        value = float(os.getenv("BLENDER_ASPECT_RATIO_LIMIT", "1.25"))
+    except (TypeError, ValueError):
+        value = 1.25
+    return max(1.0, value)
+
+
 def _read_glb_json_and_bin(path: Path) -> tuple[dict[str, object], bytes]:
     raw = path.read_bytes()
     if len(raw) < 20 or raw[:4] != b"glTF" or int.from_bytes(raw[4:8], "little") != 2:
@@ -475,10 +493,10 @@ def plan_dimension_normalization(
             target_model_partial = {axis: value * float(factor_unit or 1.0) for axis, value in anchors}
             ratios = [target_model_partial[axis] / raw_size[axis] for axis, _ in anchors]
             spread = max(ratios) / min(ratios)
-            if spread > 1.25:
+            if spread > _aspect_ratio_limit():
                 raise ModelDimensionConflict(
                     "partial target dimensions require non-uniform deformation "
-                    f"(ratio spread {spread:.3f} > 1.25)"
+                    f"(ratio spread {spread:.3f} > {_aspect_ratio_limit():.3f})"
                 )
             factor = sum(ratios) / len(ratios)
             final_size = {axis: raw_size[axis] * factor for axis in raw_size}
@@ -490,12 +508,14 @@ def plan_dimension_normalization(
                 "target_dimensions": target_partial,
                 "target_dimensions_model": target_model_partial,
                 "scale_factor": factor,
-                "dimension_status": "PASS" if max(errors.values()) <= 0.15 else "MODEL_DIMENSION_CONFLICT",
+                "dimension_status": "PASS" if max(errors.values()) <= _geometry_tolerance() else "MODEL_DIMENSION_CONFLICT",
                 "planned_final_dimensions": final_size,
                 "dimension_error": errors,
                 "partial_axes_anchored": [axis for axis, _ in anchors],
                 "single_axis_anchored": anchors[0][0] if len(anchors) == 1 else None,
                 "height_anchored": len(anchors) == 1 and anchors[0][0] == "height",
+                "geometry_tolerance": _geometry_tolerance(),
+                "aspect_ratio_limit": _aspect_ratio_limit(),
             }
     if target is None:
         return {
@@ -507,10 +527,10 @@ def plan_dimension_normalization(
     target_model = {axis: value * float(factor_unit or 1.0) for axis, value in target.items()}
     ratios = [target_model[axis] / raw_size[axis] for axis in ("width", "depth", "height")]
     spread = max(ratios) / min(ratios)
-    if spread > 1.25:
+    if spread > _aspect_ratio_limit():
         raise ModelDimensionConflict(
             "target dimensions require non-uniform deformation "
-            f"(ratio spread {spread:.3f} > 1.25)"
+            f"(ratio spread {spread:.3f} > {_aspect_ratio_limit():.3f})"
         )
     factor = sum(ratios) / len(ratios)
     final_size = {axis: raw_size[axis] * factor for axis in raw_size}
@@ -522,9 +542,11 @@ def plan_dimension_normalization(
         "target_dimensions": target,
         "target_dimensions_model": target_model,
         "scale_factor": factor,
-        "dimension_status": "PASS" if max(errors.values()) <= 0.15 else "MODEL_DIMENSION_CONFLICT",
+        "dimension_status": "PASS" if max(errors.values()) <= _geometry_tolerance() else "MODEL_DIMENSION_CONFLICT",
         "planned_final_dimensions": final_size,
         "dimension_error": errors,
+        "geometry_tolerance": _geometry_tolerance(),
+        "aspect_ratio_limit": _aspect_ratio_limit(),
     }
 
 
@@ -553,6 +575,39 @@ def _mat3_det(matrix: tuple[tuple[float, ...], ...]) -> float:
         - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
         + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
     )
+
+
+def _validate_rotation_matrix(value: object, *, error_prefix: str = "ORIENTATION_INVALID_MATRIX") -> tuple[tuple[float, ...], ...]:
+    """Validate a true proper rotation, not merely a determinant.
+
+    A matrix with determinant +1 can still contain shear or non-uniform scale.
+    The Website contract accepts only finite 3x3 orthonormal matrices with a
+    positive handedness.  Keeping this check in the Python preflight mirrors
+    the check in the real Blender script and prevents a bad payload from
+    reaching a paid-model delivery path.
+    """
+
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise BlenderAdapterError(error_prefix)
+    try:
+        matrix = tuple(tuple(float(item) for item in row) for row in value)
+    except (TypeError, ValueError):
+        raise BlenderAdapterError(error_prefix) from None
+    if any(len(row) != 3 for row in matrix):
+        raise BlenderAdapterError(error_prefix)
+    if not all(math.isfinite(item) for row in matrix for item in row):
+        raise BlenderAdapterError("ORIENTATION_MATRIX_NON_FINITE")
+    orthogonality_error = max(
+        abs(sum(matrix[row][index] * matrix[column][index] for index in range(3)) - (1.0 if row == column else 0.0))
+        for row in range(3)
+        for column in range(3)
+    )
+    if orthogonality_error > 1e-6:
+        raise BlenderAdapterError("ORIENTATION_MATRIX_NOT_ORTHOGONAL")
+    determinant = _mat3_det(matrix)
+    if not math.isfinite(determinant) or abs(determinant - 1.0) > 1e-6:
+        raise BlenderAdapterError("ORIENTATION_WOULD_MIRROR_PRODUCT")
+    return matrix
 
 
 def _oriented_bbox_for_plan(
@@ -643,9 +698,8 @@ def orientation_rotation(
         tuple(sum(target_basis[basis][row] * source_basis[basis][column] for basis in range(3)) for column in range(3))
         for row in range(3)
     )
+    matrix = _validate_rotation_matrix([list(row) for row in matrix], error_prefix="ORIENTATION_INVALID_MATRIX")
     determinant = _mat3_det(matrix)
-    if abs(determinant - 1.0) > 1e-9:
-        raise BlenderAdapterError("ORIENTATION_WOULD_MIRROR_PRODUCT")
     return {
         "source_front_axis": source_front_key,
         "source_top_axis": source_top_key,
@@ -661,6 +715,11 @@ class FakeBlenderAdapter:
     """Deterministic local adapter used only by an explicitly marked E2E run."""
 
     name = "FAKE_LOCAL_BLENDER"
+
+    def render_orientation_views(self, raw_path: Path, render_dir: Path) -> dict[str, object]:
+        # Explicitly marked fixture seam.  Production closure evidence never
+        # treats this as real visual inspection.
+        return {"status": "FIXTURE_ONLY", "source": str(raw_path), "views": []}
 
     def normalize_and_qa(
         self,
@@ -711,6 +770,48 @@ class BlenderCLIAdapter:
         self.executable = executable
         self.timeout_seconds = max(30, min(int(timeout_seconds), 1800))
 
+    def render_orientation_views(self, raw_path: Path, render_dir: Path) -> dict[str, object]:
+        """Import the raw GLB and render four unmodified orientation views."""
+
+        if not raw_path.is_file():
+            raise BlenderAdapterError("raw_glb_missing")
+        render_dir.mkdir(parents=True, exist_ok=True)
+        report_path = render_dir / "orientation-views.json"
+        helper = Path(__file__).with_name("blender_render_views.py")
+        blender_env = os.environ.copy()
+        blender_env.update({
+            "BLENDER_VIEWS_SRC": str(raw_path),
+            "BLENDER_VIEWS_OUT": str(render_dir),
+            "BLENDER_VIEWS_REPORT": str(report_path),
+        })
+        try:
+            result = subprocess.run(
+                [
+                    self.executable, "--background", "--factory-startup", "--python", str(helper), "--",
+                    "--src", str(raw_path), "--out", str(render_dir), "--report", str(report_path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout_seconds,
+                check=False,
+                env=blender_env,
+                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0),
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise BlenderAdapterError(f"blender_orientation_views_failed:{type(error).__name__}") from error
+        if not report_path.is_file():
+            raise BlenderAdapterError(f"blender_orientation_views_failed:exit_{result.returncode}")
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise BlenderAdapterError("blender_orientation_views_report_invalid") from error
+        if result.returncode != 0 or not isinstance(report, dict) or report.get("status") != "PASS":
+            detail = report.get("error") or report.get("status") or f"exit_{result.returncode}" if isinstance(report, dict) else f"exit_{result.returncode}"
+            raise BlenderAdapterError(f"blender_orientation_views_failed:{detail}")
+        return report
+
     def normalize_and_qa(
         self,
         raw_path: Path,
@@ -743,9 +844,7 @@ class BlenderCLIAdapter:
             matrix = orientation_payload.get("rotation_matrix")
             if not isinstance(matrix, list) or len(matrix) != 3 or any(not isinstance(row, list) or len(row) != 3 for row in matrix):
                 raise BlenderAdapterError("ORIENTATION_INVALID_MATRIX")
-            numeric = tuple(tuple(float(value) for value in row) for row in matrix)
-            if abs(_mat3_det(numeric) - 1.0) > 1e-6:
-                raise BlenderAdapterError("ORIENTATION_WOULD_MIRROR_PRODUCT")
+            numeric = _validate_rotation_matrix(matrix)
             orientation_payload["status"] = "CONFIRMED"
         oriented_preflight_bbox = _oriented_bbox_for_plan(raw_bbox, orientation_payload.get("rotation_matrix"))
         plan = plan_dimension_normalization(oriented_preflight_bbox, target_dimensions, dimension_unit)
@@ -808,8 +907,8 @@ class BlenderCLIAdapter:
                     for axis in ("width", "depth", "height")
                     if axis in fallback_size and axis in target_model
                 }
-                if fallback_error and max(fallback_error.values()) > 0.15:
-                    raise ModelDimensionConflict("final dimensions exceed 15% tolerance after uniform normalization")
+                if fallback_error and max(fallback_error.values()) > _geometry_tolerance():
+                    raise ModelDimensionConflict("final dimensions exceed configured geometry tolerance after uniform normalization")
         if orientation_missing:
             raise BlenderAdapterError("ORIENTATION_REVIEW_REQUIRED")
         if result.returncode != 0 or report.get("status") != "PASS":
@@ -829,8 +928,8 @@ class BlenderCLIAdapter:
                 for axis in ("width", "depth", "height")
                 if axis in final_size and axis in target_model
             }
-        if dimension_error and max(dimension_error.values()) > 0.15:
-            raise ModelDimensionConflict("final dimensions exceed 15% tolerance after uniform normalization")
+        if dimension_error and max(dimension_error.values()) > _geometry_tolerance():
+            raise ModelDimensionConflict("final dimensions exceed configured geometry tolerance after uniform normalization")
         return BlenderQAResult(
             status="PASS",
             adapter=self.name,

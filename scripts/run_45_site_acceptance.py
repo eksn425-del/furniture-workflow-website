@@ -732,10 +732,14 @@ def _run_one(
             ready_count = sum(1 for item in records if str(item.get("state") or "") in {"CATALOG_READY", "MODEL_INPUT_LOCKED", "COMPLETED"})
             row["ready_count"] = ready_count
             row["image_pass_count"] = sum(1 for item in records if bool((item.get("lineage") or {}).get("image_decodable")))
+            # D is a fixed three-item Ready Pool gate.  A site that exposes
+            # only one or two candidates is a truthful PARTIAL/shortage, not
+            # a smaller target silently re-labelled PASS.
             row["layer_d"] = {
-                "status": "PASS" if ready_count >= min(3, max(1, row["found_count"])) else "PARTIAL" if records else "NOT_RUN",
+                "status": "PASS" if ready_count >= 3 else "PARTIAL" if records else "NOT_RUN",
                 "exit_code": exit_code,
                 "provider": "OFF",
+                "target_count": 3,
                 "ready_count": ready_count,
                 "records": records,
                 "events": events[-40:],

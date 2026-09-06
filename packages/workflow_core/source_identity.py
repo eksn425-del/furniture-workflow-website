@@ -143,8 +143,6 @@ def media_binding_status(
     asset = clean(evidence.get("asset_identity")) or media_asset_identity(media_url)
     expected = [identity[key] for key in ("page_item_number", "jsonld_sku") if identity[key]]
     reasons = list(identity["identity_conflicts"])
-    if identity["identity_conflicts"]:
-        return "MISMATCH", 0.0, reasons
     source_token = clean(source).casefold()
     bound = bool(
         evidence.get("product_identity_match")
@@ -156,6 +154,22 @@ def media_binding_status(
         "json_ld_image", "json_ld_product", "jsonld_product", "product_gallery",
         "product_gallery_metadata", "browser_gallery_dom", "official_page_evidence",
     }
+    # A human-readable product slug is commonly not the SKU used by the
+    # structured page item number and image asset.  When the current
+    # structured product explicitly binds the image and the asset equals the
+    # page item number, that slug-only difference is compatible evidence, not
+    # a media identity mismatch.  Real SKU/variant conflicts remain strict.
+    if (
+        reasons == ["url_tail_id_page_item_number_conflict"]
+        and bound
+        and source_token in structured_sources
+        and asset
+        and identity.get("page_item_number")
+        and asset.casefold() == str(identity["page_item_number"]).casefold()
+    ):
+        return "COMPATIBLE", 0.9, ["human_readable_slug_not_sku_structured_media_bound"]
+    if reasons:
+        return "MISMATCH", 0.0, reasons
     if bound and source_token in structured_sources:
         if asset and expected and any(asset.casefold() == value.casefold() for value in expected):
             return "EXACT", 1.0, ["asset_identity_matches_page_product"]

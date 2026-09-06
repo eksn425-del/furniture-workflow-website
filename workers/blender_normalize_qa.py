@@ -99,11 +99,50 @@ def _bbox(objects: list[bpy.types.Object]) -> dict[str, Any] | None:
     }
 
 
+def _component_geometry(objects: list[bpy.types.Object]) -> list[dict[str, Any]]:
+    """Capture per-mesh world geometry for parent/child and material QA."""
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    result: list[dict[str, Any]] = []
+    for obj in objects:
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+        try:
+            if not mesh.vertices:
+                continue
+            points = [evaluated.matrix_world @ vertex.co for vertex in mesh.vertices]
+            minimum = Vector((min(point.x for point in points), min(point.y for point in points), min(point.z for point in points)))
+            maximum = Vector((max(point.x for point in points), max(point.y for point in points), max(point.z for point in points)))
+            center = (minimum + maximum) / 2
+            result.append({
+                "name": obj.name,
+                "parent": obj.parent.name if obj.parent else None,
+                "center": {"x": float(center.x), "y": float(center.y), "z": float(center.z)},
+                "size": {"width": float(maximum.x - minimum.x), "depth": float(maximum.y - minimum.y), "height": float(maximum.z - minimum.z)},
+                "vertex_count": len(mesh.vertices),
+            })
+        finally:
+            evaluated.to_mesh_clear()
+    return result
+
+
 def _matrix3(payload: str) -> Matrix:
     raw = json.loads(payload) if payload else [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
     if not isinstance(raw, list) or len(raw) != 3 or any(not isinstance(row, list) or len(row) != 3 for row in raw):
         raise ValueError("rotation_matrix must be 3x3")
-    matrix = Matrix([[float(value) for value in row] for row in raw])
+    try:
+        matrix = Matrix([[float(value) for value in row] for row in raw])
+    except (TypeError, ValueError):
+        raise ValueError("rotation_matrix must contain numeric values") from None
+    if any(not math.isfinite(float(matrix[row][column])) for row in range(3) for column in range(3)):
+        raise ValueError("rotation_matrix must contain finite values")
+    orthogonality_error = max(
+        abs(sum(float(matrix[row][index]) * float(matrix[column][index]) for index in range(3)) - (1.0 if row == column else 0.0))
+        for row in range(3)
+        for column in range(3)
+    )
+    if orthogonality_error > 1e-6:
+        raise ValueError(f"rotation_matrix must be orthogonal, error={orthogonality_error}")
     determinant = matrix.determinant()
     if not math.isfinite(determinant) or abs(determinant - 1.0) > 1e-6:
         raise ValueError(f"rotation_matrix must be a proper rotation, determinant={determinant}")
@@ -111,8 +150,13 @@ def _matrix3(payload: str) -> Matrix:
 
 
 def _transform_objects(objects: list[bpy.types.Object], transform: Matrix) -> None:
-    for obj in objects:
-        obj.matrix_world = transform @ obj.matrix_world
+    # Snapshot every original world matrix first.  Assigning a parent before
+    # its child otherwise changes the child's inherited world transform and a
+    # second assignment applies the pose twice.
+    original_world = [(obj, obj.matrix_world.copy()) for obj in objects]
+    for obj, world_matrix in original_world:
+        obj.matrix_world = transform @ world_matrix
+    bpy.context.view_layer.update()
 
 
 def _look_at(camera: bpy.types.Object, target: Vector) -> None:
@@ -206,6 +250,7 @@ def main() -> int:
         objects = _product_objects()
         report["raw_scene"] = _scene_metadata(objects)
         report["raw_bbox"] = _bbox(objects)
+        report["raw_components"] = _component_geometry(objects)
         if not report["raw_bbox"]:
             report["status"] = "NO_VALID_MESH"
             raise RuntimeError("no evaluated mesh geometry in imported GLB")
@@ -216,6 +261,7 @@ def main() -> int:
         _transform_objects(objects, transform)
         oriented_bbox = _bbox(objects)
         report["oriented_bbox"] = oriented_bbox
+        report["oriented_components"] = _component_geometry(objects)
         if not oriented_bbox:
             raise RuntimeError("orientation removed all mesh geometry")
         pivot = Vector((
@@ -234,6 +280,7 @@ def main() -> int:
             _transform_objects(objects, Matrix.Translation((0.0, 0.0, ground_delta)))
         final_bbox = _bbox(objects)
         report["final_bbox"] = final_bbox
+        report["final_components"] = _component_geometry(objects)
         report["pivot"] = {"x": float(pivot.x), "y": float(pivot.y), "z": float(pivot.z)}
         report["ground_delta"] = ground_delta
         if render_dir:
@@ -250,13 +297,26 @@ def main() -> int:
         reimport_objects = _product_objects()
         report["reimport_scene"] = _scene_metadata(reimport_objects)
         report["reimport_bbox"] = _bbox(reimport_objects)
+        report["reimport_components"] = _component_geometry(reimport_objects)
         if not report["reimport_bbox"]:
             raise RuntimeError("re-imported GLB has no evaluated mesh geometry")
         report["reimport_match"] = {
             axis: abs(float(report["reimport_bbox"]["size"][axis]) - float(final_bbox["size"][axis])) <= max(1e-6, abs(float(final_bbox["size"][axis])) * 1e-5)
             for axis in ("width", "depth", "height")
         }
-        report["status"] = "PASS" if all(report["reimport_match"].values()) else "REIMPORT_MISMATCH"
+        # Component geometry is compared in deterministic size/center order;
+        # Blender may add a suffix to duplicate object names during export.
+        final_components = sorted(report.get("final_components") or [], key=lambda item: (str(item.get("name") or ""), item.get("vertex_count") or 0))
+        reimport_components = sorted(report.get("reimport_components") or [], key=lambda item: (str(item.get("name") or ""), item.get("vertex_count") or 0))
+        component_match = len(final_components) == len(reimport_components)
+        if component_match:
+            for left, right in zip(final_components, reimport_components):
+                for axis in ("x", "y", "z"):
+                    component_match = component_match and abs(float(left["center"][axis]) - float(right["center"][axis])) <= 1e-5
+                for axis in ("width", "depth", "height"):
+                    component_match = component_match and abs(float(left["size"][axis]) - float(right["size"][axis])) <= max(1e-6, abs(float(left["size"][axis])) * 1e-5)
+        report["component_geometry_match"] = component_match
+        report["status"] = "PASS" if all(report["reimport_match"].values()) and component_match else "REIMPORT_MISMATCH"
     except Exception as error:
         report["error"] = f"{type(error).__name__}:{error}"
     report_path.parent.mkdir(parents=True, exist_ok=True)
