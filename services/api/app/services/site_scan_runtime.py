@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import hashlib
 import inspect
-import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -52,43 +51,6 @@ class SiteScanRuntimeService:
         self.executor = ThreadPoolExecutor(max_workers=self.MAX_HTTP_SCANS, thread_name_prefix="site-scan")
         self._scheduled: set[str] = set()
         self._lock = threading.Lock()
-
-    @staticmethod
-    def _analyzer_timeout_seconds() -> float:
-        """Return a bounded timeout for one native analyzer phase.
-
-        The analyzer may use a network client or a headed browser whose own
-        retry budget is not visible to this service.  A service-level budget
-        keeps one inaccessible retailer from occupying the persistent worker
-        forever.  The worker thread is daemonized on timeout; any late result
-        is deliberately discarded rather than persisted as a false success.
-        """
-
-        try:
-            raw = float(os.getenv("WEBSITE_SITE_SCAN_TIMEOUT_SECONDS", "120"))
-        except (TypeError, ValueError):
-            raw = 120.0
-        return max(10.0, min(raw, 900.0))
-
-    def _run_analyzer_bounded(self, phase: str, callable_, *args, **kwargs):
-        timeout_seconds = self._analyzer_timeout_seconds()
-        result: list[Any] = []
-        error: list[BaseException] = []
-
-        def invoke() -> None:
-            try:
-                result.append(callable_(*args, **kwargs))
-            except BaseException as exc:  # re-raise on the Website worker thread
-                error.append(exc)
-
-        worker = threading.Thread(target=invoke, name=f"site-scan-{phase}", daemon=True)
-        worker.start()
-        worker.join(timeout_seconds)
-        if worker.is_alive():
-            raise SiteScanTimeoutError(phase, timeout_seconds)
-        if error:
-            raise error[0]
-        return result[0] if result else None
 
     def start(self, *, site_key: str, source_url: str, job_id: str | None, live: bool) -> dict[str, Any]:
         session = self.database.session_factory()
@@ -285,9 +247,9 @@ class SiteScanRuntimeService:
         except (TypeError, ValueError):
             analyze_parameters = {}
         if "profile" in analyze_parameters:
-            receipt = self._run_analyzer_bounded("http", self.analyzer.analyze, source_url, live=live, output_dir=output_dir, profile=existing_profile_payload)
+            receipt = self.analyzer.analyze(source_url, live=live, output_dir=output_dir, profile=existing_profile_payload)
         else:
-            receipt = self._run_analyzer_bounded("http", self.analyzer.analyze, source_url, live=live, output_dir=output_dir)
+            receipt = self.analyzer.analyze(source_url, live=live, output_dir=output_dir)
         blocker = receipt.get("blocker") if isinstance(receipt.get("blocker"), dict) else {}
         blocker_code = str(blocker.get("code") or "")
         if self._needs_browser_enrichment(receipt) and browser is not None:
@@ -304,7 +266,11 @@ class SiteScanRuntimeService:
             finally:
                 session.close()
             with self._browser_lock:
-                receipt = self._run_analyzer_bounded("browser", self.analyzer.analyze_browser, source_url, output_dir=output_dir, session_dir=Path(browser.user_data_dir))
+                # Keep the slot and browser lock until the analyzer really ends.
+                # Its HTTP, browser, agent-step and bridge waits have their own
+                # budgets. A detached-thread timer must not expire the scan
+                # while an operator is answering its pending brain request.
+                receipt = self.analyzer.analyze_browser(source_url, output_dir=output_dir, session_dir=Path(browser.user_data_dir))
         self._persist(scan_id, receipt, output_dir)
 
     def _persist(self, scan_id: str, receipt: dict[str, Any], output_dir: Path) -> None:

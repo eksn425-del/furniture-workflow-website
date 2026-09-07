@@ -42,7 +42,7 @@ from app.services.production_runtime import ProductionRuntimeService
 from app.services import production_runtime as production_runtime_module
 from app.services.site_scan_runtime import SiteScanRuntimeService
 from packages.workflow_core.statuses import ItemState
-from furniture_workflow_engine import StageDecision
+from furniture_workflow_engine import StageDecision, StageOutcome
 from packages.workflow_core.candidate_pool import CandidatePoolStore, CandidateRecord
 from workers.blender_adapter import validate_glb
 from workers.production_pipeline import ProductionPipeline, WebsiteStageAdapter
@@ -550,16 +550,15 @@ def test_site_scan_persists_across_navigation_and_service_restart(tmp_path: Path
         database.dispose()
 
 
-def test_site_scan_timeout_is_durable_and_retryable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_site_scan_waits_for_analyzer_without_detached_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class HangingAnalyzer:
         @staticmethod
         def analyze(source_url: str, *, live: bool, output_dir: Path) -> dict:
             time.sleep(0.25)
             return {"status": "READY", "verified": True, "categories": []}
 
-    # Keep this unit test fast while exercising the same service-level timeout
-    # path used by the production launcher (whose default is 120 seconds).
-    monkeypatch.setattr(SiteScanRuntimeService, "_analyzer_timeout_seconds", staticmethod(lambda: 0.05))
+    # Legacy whole-scan timers must not preempt bounded brain/network waits.
+    monkeypatch.setenv("WEBSITE_SITE_SCAN_TIMEOUT_SECONDS", "0.05")
     database = Database(tmp_path / "system" / "control.sqlite3")
     database.create_schema()
     session = database.session_factory()
@@ -577,15 +576,15 @@ def test_site_scan_timeout_is_durable_and_retryable(tmp_path: Path, monkeypatch:
         time.sleep(0.01)
         current = runtime.status(started["scan_id"]) or current
     try:
-        assert current["status"] == "TEMPORARY_FAILURE"
-        assert current["error_code"] == "SITE_SCAN_TIMEOUT"
+        assert current["status"] == "READY"
+        assert current["error_code"] is None
         assert current["finished_at"]
         session = database.session_factory()
         try:
             scan = session.get(SiteScanRun, started["scan_id"])
-            assert scan is not None and scan.status == "TEMPORARY_FAILURE"
+            assert scan is not None and scan.status == "READY"
             browser = session.get(BrowserSession, scan.browser_session_id)
-            assert browser is not None and browser.status == "TEMPORARY_FAILURE"
+            assert browser is not None and browser.status == "READY"
         finally:
             session.close()
     finally:
@@ -1150,6 +1149,24 @@ def test_local_agent_review_endpoint_persists_same_image_evidence_for_resume(tmp
             session.close()
     finally:
         database.dispose()
+
+
+def test_dimension_pending_reserve_does_not_preempt_ready_target(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = _contract(tmp_path, job_id="job-reserve-dimension", target=1)
+    pipeline, events = _run_pipeline(
+        monkeypatch, tmp_path, contract=contract, products=[_product(0), _product(1)],
+    )
+    original = WebsiteStageAdapter._stage_dimension
+
+    def dimension(adapter, candidate):
+        if candidate.canonical_url.endswith("chair-1"):
+            return StageOutcome(StageDecision.PENDING, "TEMPORARY_PAGE_FAILURE")
+        return original(adapter, candidate)
+
+    monkeypatch.setattr(WebsiteStageAdapter, "_stage_dimension", dimension)
+    assert pipeline.run() == 2
+    assert any(event["type"] == "READY_POOL_COMPLETED" and event["done"] == 1 for event in events), events
+    assert not any(event["stage"] == "DIMENSION_LOOKUP" for event in events), events
 
 
 def test_up_to_n_accepts_smaller_ready_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

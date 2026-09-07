@@ -2801,7 +2801,18 @@ class ProductionPipeline:
                         ),
                         None,
                     )
-                    if dimension_blocker is not None:
+                    # A reserve candidate's incomplete dimensions must not
+                    # preempt another candidate advancing toward the target.
+                    # The no-progress branch below still reports the durable
+                    # blocker when no candidate can advance further.
+                    dimension_ready_progress = any(
+                        item.state in {
+                            ItemState.DIMENSION_READY, ItemState.NAMING_READY,
+                            ItemState.CATALOG_READY, ItemState.MODEL_INPUT_LOCKED,
+                        }
+                        for item in progressed_records
+                    )
+                    if dimension_blocker is not None and not dimension_ready_progress:
                         reason_code = str(dimension_blocker.rejection_reason or "DIMENSION_LOOKUP_INCOMPLETE")
                         self.emit(
                             "JOB_BLOCKED",
