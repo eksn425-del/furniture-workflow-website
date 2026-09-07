@@ -1004,6 +1004,10 @@ class WebsiteStageAdapter:
         # real acquisition remains blocked below and is never defaulted.
         legacy_governed_inches = "dimension_unit" not in candidate.lineage and bool(values)
         raw_unit = "in" if legacy_governed_inches else _normalized_dimension_unit(raw_unit_value)
+        if raw_unit == "source_unit":
+            # Retain historical input for audit but do not merge unitless
+            # HTML/CSS values into freshly observed official dimensions.
+            values = {axis: None for axis in axes}
         anchor_policy = str(
             candidate.lineage.get("dimension_anchor_policy")
             or self.contract.get("dimension_anchor_policy")

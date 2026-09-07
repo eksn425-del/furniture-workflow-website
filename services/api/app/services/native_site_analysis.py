@@ -70,7 +70,7 @@ CATEGORY_WORDS = {
     "bath", "bathroom", "kitchen", "entryway", "kids", "nursery",
     "家具", "客厅", "卧室", "餐厅", "办公", "户外", "椅", "沙发", "桌", "床", "灯", "地毯", "收纳", "装饰",
 }
-BLOCKED_SEGMENTS = {"account", "login", "signin", "cart", "checkout", "search", "blog", "news", "privacy", "terms", "help"}
+BLOCKED_SEGMENTS = {"account", "login", "signin", "cart", "checkout", "search", "blog", "news", "privacy", "terms", "help", "policies", "refund-policy", "shipping-policy"}
 
 
 def _visible_html_text(page_html: str) -> str:
@@ -105,7 +105,7 @@ UTILITY_PATH_WORDS = {
     "product-care", "product-recalls", "recalls", "sustainability", "terms", "terms-of-sale",
     "terms-of-use", "about", "about-us", "clearance", "fabrics", "swatches", "promo", "demo",
     "account", "login", "signin", "cart", "checkout", "search", "blog", "news", "help", "rewards",
-    "warranty", "returns", "shipping", "security", "jobs", "sitemap",
+    "warranty", "returns", "shipping", "security", "jobs", "sitemap", "policies", "refund-policy", "shipping-policy",
     "care", "contract-grade", "data-request", "data-requests", "trade-program", "financing",
     # West Elm 特有的页脚/工具/促销路径（出现在首页导航/横幅里，不是商品类目）
     "ccvalueprop", "my-boards", "registry", "shoppingcart", "void", "store-locator",
@@ -1963,7 +1963,8 @@ class NativeSiteAnalyzer:
                 continue
             # 页脚/工具/非商品页（contact-us、terms-of-sale、about-us、clearance、fabrics…）直接排除。
             if any((p := part.strip().casefold()) in UTILITY_PATH_WORDS
-                   or any(len(w) >= 5 and w in p for w in UTILITY_PATH_WORDS)
+                   or any(len(w) >= 5 and w not in {"design", "designer"}
+                          and re.search(r"(?:^|-)" + re.escape(w) + r"(?:-|$)", p) for w in UTILITY_PATH_WORDS)
                    for part in segments):
                 continue
             # 拒绝 JS 残留/纯数字/特殊符号路径段（如 /void(0)、/O_LC('')、/18889224119）：
@@ -1995,7 +1996,7 @@ class NativeSiteAnalyzer:
             if category.level == 1:
                 words = set(re.split(r"[-_]", last))
                 is_direct_scope = any(str(item.get("role") or "") == "source_scope" for item in category.evidence)
-                has_nav_scope = any(str(item.get("role") or "") == "nav_tree" for item in category.evidence)
+                has_nav_scope = any(str(item.get("role") or "") in {"nav_tree", "brain_department"} for item in category.evidence)
                 # 导航强制的一级（大标签，如 living/office）视为导航权威证据，免于家具词白名单。
                 if not (is_direct_scope or has_nav_scope) and not (words & slug_words):
                     continue
@@ -2026,10 +2027,18 @@ class NativeSiteAnalyzer:
         合并以 path 的 slug 为据，重复执行是幂等的。
         """
         level1 = [c for c in categories if c.level == 1]
+        # Explicit navigation/Brain children are real selectable scopes, not
+        # fragments to collapse into one synthetic group with summed counts.
+        explicit_children = [
+            c for c in categories if c.level == 2
+            and (_has_brain_parent(c) or _nav_tree_evidence(c) is not None)
+        ]
 
         grouped: dict[tuple[str | None, str], list[TaxonomyCategoryContract]] = {}
         for c in categories:
             if c.level != 2:
+                continue
+            if _has_brain_parent(c) or _nav_tree_evidence(c) is not None:
                 continue
             slug = c.path.rstrip("/").rsplit("/", 1)[-1]
             key = (c.parent_path, _coarse_group(slug))
@@ -2086,7 +2095,7 @@ class NativeSiteAnalyzer:
             coarse.evidence = evidence
             merged.append(coarse)
 
-        return sorted(level1 + merged, key=lambda c: (len([p for p in c.path.split("/") if p]), c.path))
+        return sorted(level1 + explicit_children + merged, key=lambda c: (len([p for p in c.path.split("/") if p]), c.path))
 
     @staticmethod
     def _dedupe_categories(categories: list[TaxonomyCategoryContract]) -> list[TaxonomyCategoryContract]:
@@ -2120,6 +2129,8 @@ class NativeSiteAnalyzer:
                 item.evidence = list(item.evidence) + list(rule.evidence)
             if item.level == 2 and item.parent_path:
                 item.evidence = list(item.evidence) + [{"role": "brain_child"}]
+            elif item.level == 1:
+                item.evidence = list(item.evidence) + [{"role": "brain_department"}]
             merged_by_url[item.source_url.rstrip("/").casefold()] = item
         # 大脑未覆盖的规则类目补上，避免遗漏。
         for url, rule in rules_by_url.items():

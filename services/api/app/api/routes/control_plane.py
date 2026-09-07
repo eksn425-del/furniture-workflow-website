@@ -376,11 +376,15 @@ def _default_provider_call_limit(job: ProductionJob) -> int:
     return max(1, base)
 
 
-def _category_dict(category: SiteCategory) -> dict:
+def _category_dict(category: SiteCategory, *, parent_paths: dict[str, str] | None = None) -> dict:
     # Prefer persisted hierarchy; retain path fallback for pre-v7 rows.
     segments = [part for part in category.path.split("/") if part]
     level = int(category.level or (2 if len(segments) >= 2 else 1))
-    parent_path = "/" + segments[0] if level == 2 else None
+    parent_path = None
+    if level == 2:
+        parent_path = (parent_paths or {}).get(str(category.parent_category_id or ""))
+        if parent_path is None and len(segments) >= 2:
+            parent_path = "/" + segments[0]
     evidence = json.loads(category.evidence_json) if category.evidence_json else []
     scope_urls: list[str] = []
     if category.source_url:
@@ -787,7 +791,7 @@ def get_control_job(job_id: str, request: Request) -> dict:
         return {
             "job": _job_dict(job),
             "run": run_status,
-            "categories": [_category_dict(item) for item in categories],
+            "categories": [_category_dict(item, parent_paths={c.category_id: c.path for c in categories}) for item in categories],
             "artifacts": [_artifact_dict(item) for item in artifacts],
             "site_scan": request.app.state.site_scan_runtime.status(latest_scan.scan_id) if latest_scan else None,
             "candidate_pool": candidate_pool,
@@ -1273,7 +1277,7 @@ def list_control_sites(request: Request) -> dict:
                 "latest_scan_finished_at": latest_scan.finished_at.isoformat() if latest_scan and latest_scan.finished_at else None,
                 "latest_scan_error_code": latest_scan.error_code if latest_scan else None,
                 "latest_scan_error_message": latest_scan.error_message if latest_scan else None,
-                "categories": [_category_dict(c) for c in categories],
+                "categories": [_category_dict(c, parent_paths={p.category_id: p.path for p in categories}) for c in categories],
                 "updated_at": site.updated_at.isoformat() if site.updated_at else None,
             })
         return {"schema_version": "website-sites.v1", "items": items, "total": len(items)}
@@ -1440,7 +1444,7 @@ def get_control_site(site_key: str, request: Request) -> dict:
             "site": {"site_key": site.site_key, "domain": site.domain, "display_name": site.display_name, "source_kind": site.source_kind, "source_health": site.source_health, "acquisition_mode": site.acquisition_mode, "status": site.status, "profile_version": site.profile_version, "last_verified_at": site.last_verified_at.isoformat() if site.last_verified_at else None, "created_at": site.created_at.isoformat(), "updated_at": site.updated_at.isoformat()},
             "profile": profile_payload,
             "entry_urls": [{"url": item.url, "first_seen_at": item.first_seen_at.isoformat(), "last_seen_at": item.last_seen_at.isoformat(), "last_status": item.last_status, "last_taxonomy_snapshot_id": item.last_taxonomy_snapshot_id} for item in entries],
-            "categories": [_category_dict(item) for item in categories],
+            "categories": [_category_dict(item, parent_paths={c.category_id: c.path for c in categories}) for item in categories],
             "taxonomy_state": taxonomy["taxonomy_state"],
             "taxonomy_available": taxonomy["taxonomy_available"],
             "count_state": taxonomy["count_state"],

@@ -1151,6 +1151,59 @@ def test_local_agent_review_endpoint_persists_same_image_evidence_for_resume(tmp
         database.dispose()
 
 
+def test_dimension_parser_rejects_css_and_requires_physical_units() -> None:
+    from app.services.product_acquisition import _parse_dimension_text_structured
+    result = _parse_dimension_text_structured("width:100%;height:18px; width=100&height=18", url="https://example.test/product")
+    assert result["axes"] == {}
+    assert result["dimension_lookup_state"] == "LOOKUP_INCOMPLETE"
+    result = _parse_dimension_text_structured("width:100%;height:18px; Width: 12 cm Height: 18 cm", url="https://example.test/product")
+    assert result["dimensions"] == {"width": 12.0, "height": 18.0}
+
+
+def test_flat_category_url_uses_persisted_parent_in_api() -> None:
+    from app.api.routes.control_plane import _category_dict
+    child = SiteCategory(category_id="child", site_key="example.test", native_name="Vases",
+                         canonical_name="Vases", path="/vases", level=2,
+                         parent_category_id="department", evidence_json="[]")
+    assert _category_dict(child, parent_paths={"department": "/home"})["parent_path"] == "/home"
+    assert _category_dict(child)["parent_path"] is None
+
+
+def test_brain_navigation_preserves_departments_and_distinct_children() -> None:
+    from app.services.native_site_analysis import NativeSiteAnalyzer
+    from app.services.native_contracts import BrainTaxonomyResponse
+
+    def category(slug, name, level, parent=None):
+        return dict(native_name=name, canonical_name=name, path="/collections/" + slug,
+                    source_url="https://example.test/collections/" + slug,
+                    level=level, parent_path=parent, count_value=10, count_kind="EXACT")
+
+    brain = BrainTaxonomyResponse(categories=[
+        category("home", "Homeware", 1),
+        category("designer-tea-coffee", "Tea & Coffee", 1),
+        category("vases", "Vases", 2, "/collections/home"),
+        category("clocks", "Clocks", 2, "/collections/home"),
+    ])
+    merged = NativeSiteAnalyzer._merge_brain([], brain)
+    assert len(merged) == 4
+    assert {item.path for item in merged} == {"/home", "/vases", "/clocks", "/designer-tea-coffee"}
+    assert all(item.count_value == 10 for item in merged)
+    assert {item.parent_path for item in merged if item.level == 2} == {"/home"}
+
+
+def test_policy_links_are_not_taxonomy_or_restored_by_merge() -> None:
+    from app.services.native_site_analysis import NativeSiteAnalyzer, _looks_like_category
+    from app.services.native_contracts import BrainTaxonomyResponse
+
+    root = "https://example.test/"
+    policy = root + "policies/refund-policy"
+    assert not _looks_like_category(policy, "Returns & Refunds policy", root)
+    assert _looks_like_category(root + "collections/bathroom", "Bathroom Accessories", root)
+    stale = NativeSiteAnalyzer._category(policy, "Returns & Refunds policy", None, [], 0.5)
+    merged = NativeSiteAnalyzer._merge_brain([stale], BrainTaxonomyResponse(categories=[]))
+    assert not merged
+
+
 def test_dimension_pending_reserve_does_not_preempt_ready_target(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     contract = _contract(tmp_path, job_id="job-reserve-dimension", target=1)
     pipeline, events = _run_pipeline(

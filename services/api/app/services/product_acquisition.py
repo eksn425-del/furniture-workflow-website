@@ -108,7 +108,7 @@ HEIGHT_DIAMETER_RE = re.compile(
     r"(?P<diam>\d+(?:\.\d+)?)\s*(?:in|inch|\"|cm|mm)?\s*(?:diam(?:eter)?|dia)\.?\b",
     re.I,
 )
-DIMENSION_TAB_LABELS = ("dimensions", "尺寸", "specifications", "规格")
+DIMENSION_TAB_LABELS = ("dimensions", "尺寸", "specifications", "规格", "more information", "product details")
 # Keep the token boundary strict: a bare ``in`` in prose must not be mistaken
 # for an inch unit, while the common metre spelling remains supported.
 DIMENSION_UNIT_RE = re.compile(r"(?<![A-Za-z])(?:in|inch|inches|cm|mm|m)(?![A-Za-z])|[\"″]", re.I)
@@ -841,10 +841,24 @@ class NativeBrowserCollector:
                             break
                         except Exception:
                             continue
-                body = page.content()
+                visible = page.locator("body").inner_text(timeout=5000)
+                resolved_url, page_title = page.url, page.title()
                 context.close()
-                visible = html_lib.unescape(re.sub(r"<[^>]+>", " ", body))
-                return _parse_dimension_text_structured(visible, url=url)
+                result = _parse_dimension_text_structured(visible, url=url)
+                # Keep bounded, Website-collected evidence for incomplete lookups;
+                # developer/brain review must not need an invisible second fetch.
+                snippets = [visible[max(0, m.start() - 100):m.end() + 240]
+                            for m in re.finditer(r"dimensions?|height|width|depth|diameter|measurements?", visible, re.I)][:30]
+                receipt_dir = self.session_dir / "dimension_receipts"
+                receipt_dir.mkdir(parents=True, exist_ok=True)
+                receipt_path = receipt_dir / (hashlib.sha256(url.encode()).hexdigest() + ".json")
+                receipt = {"schema_version": "website-dimension-receipt.v1",
+                           "url": url, "resolved_url": resolved_url, "page_title": page_title,
+                           "visible_text_prefix": visible[:12000], "visible_snippets": snippets, "result": result}
+                temporary = receipt_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
+                temporary.replace(receipt_path)
+                return result
         except (BrowserHumanRequired, BrowserTemporaryFailure, BrowserAccessDenied):
             raise
         except PlaywrightError as error:
@@ -962,11 +976,16 @@ def _parse_dimension_text_structured(visible: str, *, url: str) -> dict[str, Any
             "height": r"(?:\bheight\b|\bh\b|高)\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>inches?|in|cm|mm|m|\")?",
         }
         for axis, pattern in label_patterns.items():
-            match = re.search(pattern, visible, re.I)
+            match = next((item for item in re.finditer(pattern, visible, re.I)
+                          if _dimension_unit_token(item.group("unit") or "") != "source_unit"), None)
             if not match:
                 continue
             raw_unit = (match.group("unit") or "").lower()
             axis_unit = _dimension_unit_token(raw_unit)
+            if axis_unit == "source_unit":
+                # CSS/URL numbers and unlabelled units are not physical
+                # product dimensions. Keep the lookup incomplete.
+                continue
             axes[axis] = {
                 "value": float(match.group("value")),
                 "unit": axis_unit or "source_unit",
@@ -1952,7 +1971,8 @@ class ProductAcquisitionEngine:
         if not source_product_id:
             source_product_id = page_tail_id or hashlib.sha256(url.encode()).hexdigest()[:20]
         brand = _brand_value(product_json.get("brand") or product_json.get("manufacturer"))
-        visible = html_lib.unescape(re.sub(r"<[^>]+>", " ", page_html))
+        dimension_html = re.sub(r"<(script|style)\b[^>]*>.*?</\1\s*>", " ", page_html, flags=re.I | re.S)
+        visible = html_lib.unescape(re.sub(r"<[^>]+>", " ", dimension_html))
         dimensions, unit = _parse_dimension_text(visible)
         dimension_source = "explicit_page_text" if dimensions else "missing"
         likely_product_detail = bool(product_nodes or PRODUCT_PATH.search(urlsplit(url).path))
