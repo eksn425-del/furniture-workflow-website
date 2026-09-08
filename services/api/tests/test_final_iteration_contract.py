@@ -230,7 +230,12 @@ def test_bridge_mode_is_explicitly_configured(tmp_path: Path, monkeypatch: pytes
     assert settings.model_mode == "CODEX_DEVELOPMENT_BRIDGE"
 
 
-def test_codex_bridge_receives_explicit_image_evidence(tmp_path: Path) -> None:
+def test_codex_bridge_receives_explicit_image_evidence(tmp_path: Path, monkeypatch) -> None:
+    from PIL import Image
+    import hashlib
+    monkeypatch.setenv("OUTPUT_ROOT", str(tmp_path))
+    image = tmp_path / "chair.jpg"
+    Image.new("RGB", (16, 16), "white").save(image)
     provider = WebsiteBrainProvider(settings=BrainSettings(
         model_mode="CODEX_DEVELOPMENT_BRIDGE",
         bridge_root=str(tmp_path),
@@ -240,10 +245,10 @@ def test_codex_bridge_receives_explicit_image_evidence(tmp_path: Path) -> None:
         {
             "evidence": {
                 "selected_media_url": "https://images.example/chair.jpg",
-                "media_sha256": "a" * 64,
+                "media_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
                 "media_path": str(tmp_path / "chair.jpg"),
             }
         },
     )
-    assert messages[-1]["content"][1]["type"] == "image_url"
-    assert messages[-1]["content"][1]["image_url"]["url"] == "https://images.example/chair.jpg"
+    part = next(p for p in messages[-1]["content"] if p["type"] == "image_url")
+    assert part["image_url"]["url"].startswith("data:image/jpeg;base64,")

@@ -1,0 +1,374 @@
+{
+  "date": "2026-09-08",
+  "testing": "PAUSED_BY_USER",
+  "fixed_denominator": 45,
+  "attempted_original_sites": 7,
+  "not_run": 38,
+  "extra_site": "IKEA：清单外历史扫描TEMPORARY_FAILURE；不计入45站分母",
+  "new_ready_sites": 1,
+  "historical_restored_downloads": 1,
+  "additional_paid_generation": 0,
+  "trial_level": "NOT_READY",
+  "sites": [
+    {
+      "index": 1,
+      "name": "Anthropologie",
+      "url": "https://www.anthropologie.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 2,
+      "name": "Arhaus",
+      "url": "https://www.arhaus.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 3,
+      "name": "Article",
+      "url": "https://www.article.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 4,
+      "name": "Castlery",
+      "url": "https://www.castlery.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 5,
+      "name": "Interior Define",
+      "url": "https://www.interiordefine.com/",
+      "status": "READY_ONLY",
+      "stage": "MODEL_INPUT_LOCKED",
+      "note": "Nina N=1 Ready，Provider OFF；0新下载"
+    },
+    {
+      "index": 6,
+      "name": "Ligne Roset",
+      "url": "https://www.ligne-roset.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 7,
+      "name": "MacKenzie-Childs",
+      "url": "https://www.mackenzie-childs.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 8,
+      "name": "Nathan James",
+      "url": "https://nathanjames.com/",
+      "status": "OPEN_CODE_DEFECT",
+      "stage": "CANCELLED_BY_USER",
+      "note": "扫描PARTIAL；Entertainment Centers N=1启动后按用户要求停止；0候选0交付"
+    },
+    {
+      "index": 9,
+      "name": "POLYWOOD",
+      "url": "https://www.polywood.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 10,
+      "name": "RH",
+      "url": "https://rh.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 11,
+      "name": "Room & Board",
+      "url": "https://www.roomandboard.com/",
+      "status": "END_TO_END_PASS",
+      "stage": "HISTORICAL_SAWYER_RESTORE_DOWNLOAD",
+      "note": "仅历史同Job Sawyer恢复下载，不等于新随机类目全链路通过"
+    },
+    {
+      "index": 12,
+      "name": "Rove Concepts",
+      "url": "https://www.roveconcepts.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 13,
+      "name": "Sixpenny",
+      "url": "https://sixpenny.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 14,
+      "name": "Walker Edison",
+      "url": "https://walkeredison.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 15,
+      "name": "IAAH / India Art n Design",
+      "url": "https://www.indiaartndesign.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 16,
+      "name": "Kayu",
+      "url": "https://kayu.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 17,
+      "name": "Fabuliv",
+      "url": "https://fabuliv.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 18,
+      "name": "Globally Indian",
+      "url": "https://globallyindian.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 19,
+      "name": "Indikasa",
+      "url": "https://indikasa.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 20,
+      "name": "Iris",
+      "url": "https://www.irisus.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 21,
+      "name": "Hometown",
+      "url": "https://www.hometown.in/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 22,
+      "name": "Featherlite",
+      "url": "https://featherlitefurniture.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 23,
+      "name": "Interio",
+      "url": "https://www.interio.in/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 24,
+      "name": "Durian",
+      "url": "https://www.durian.in/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 25,
+      "name": "Indian Nest",
+      "url": "https://indiannest.in/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 26,
+      "name": "Furnishka",
+      "url": "https://furnishka.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 27,
+      "name": "LoveNspire",
+      "url": "https://www.lovenspire.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 28,
+      "name": "Indian Hub",
+      "url": "https://indianhub.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 29,
+      "name": "DesignConnected",
+      "url": "https://www.designconnected.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 30,
+      "name": "Archive3D",
+      "url": "https://archive3d.net/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 31,
+      "name": "GrabCAD",
+      "url": "https://grabcad.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 32,
+      "name": "CGTrader",
+      "url": "https://www.cgtrader.com/",
+      "status": "OPEN_CODE_DEFECT",
+      "stage": "TEMPORARY_FAILURE",
+      "note": "历史60秒扫描超时；共享超时修复后未实站复测，不可判定源站永久阻断"
+    },
+    {
+      "index": 33,
+      "name": "Free3D",
+      "url": "https://free3d.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 34,
+      "name": "Archibase",
+      "url": "https://archibaseplanet.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 35,
+      "name": "3DExport",
+      "url": "https://3dexport.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 36,
+      "name": "3D Warehouse",
+      "url": "https://3dwarehouse.sketchup.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 37,
+      "name": "Sweet Home 3D",
+      "url": "https://www.sweethome3d.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 38,
+      "name": "NASA 3D",
+      "url": "https://nasa3d.arc.nasa.gov/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 39,
+      "name": "3DXO",
+      "url": "https://3dxo.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 40,
+      "name": "MyMiniFactory",
+      "url": "https://www.myminifactory.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 41,
+      "name": "Poly Haven",
+      "url": "https://polyhaven.com/",
+      "status": "OPEN_CODE_DEFECT",
+      "stage": "TEMPORARY_FAILURE",
+      "note": "历史60秒扫描超时；共享修复后未实站复测"
+    },
+    {
+      "index": 42,
+      "name": "Alessi",
+      "url": "https://www.alessi.com/",
+      "status": "OPEN_CODE_DEFECT",
+      "stage": "DIMENSION_PENDING",
+      "note": "3张产品图已审，尺寸取证未闭环；本次修复仅离线回归"
+    },
+    {
+      "index": 43,
+      "name": "Safavieh",
+      "url": "https://safavieh.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 44,
+      "name": "Driade",
+      "url": "https://www.driade.com/",
+      "status": "NOT_RUN",
+      "stage": "NOT_RUN",
+      "note": "本輪未實測，保留原45站分母"
+    },
+    {
+      "index": 45,
+      "name": "West Elm",
+      "url": "https://www.westelm.com/",
+      "status": "ACCESS_BLOCKED",
+      "stage": "ACCESS_CHANGE_REQUIRED",
+      "note": "真实L2页面403拒绝，无验证码控件；代码不能绕过"
+    }
+  ]
+}

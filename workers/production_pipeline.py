@@ -1011,7 +1011,7 @@ class WebsiteStageAdapter:
         anchor_policy = str(
             candidate.lineage.get("dimension_anchor_policy")
             or self.contract.get("dimension_anchor_policy")
-            or "FULL_ONLY"
+            or "ALLOW_PARTIAL_ANCHOR"
         ).strip().upper()
         allow_partial_anchor = anchor_policy in {"ALLOW_PARTIAL_ANCHOR", "SINGLE_AXIS_ANCHOR", "EXPLICIT_ANCHOR"}
         anchor_axis = str(
@@ -1087,12 +1087,20 @@ class WebsiteStageAdapter:
             except BrowserTemporaryFailure as error:
                 candidate.lineage["dimension_lookup_state"] = "OFFICIAL_LOOKUP_TEMPORARY"
                 candidate.lineage["dimension_lookup_contract_state"] = "LOOKUP_BLOCKED"
-                return StageOutcome(StageDecision.PENDING, error.reason_code, {
+                failure_evidence = {
                     "dimension_lookup_state": "OFFICIAL_LOOKUP_TEMPORARY",
                     "dimension_access_status": "TEMPORARY_FAILURE",
                     "dimension_access_reason": error.reason_code,
                     "dimension_access_url": error.url,
-                })
+                }
+                if not allow_partial_anchor:
+                    return StageOutcome(StageDecision.PENDING, error.reason_code, failure_evidence)
+                # The bounded Website lookup ran; a visual estimate is still
+                # not proof of official absence. Preserve the failed source.
+                candidate.lineage.update(failure_evidence)
+                lookup = {"axes": {}, "dimensions": {}, "completed": False,
+                          "checked_pages": [error.url], "checked_sources": [{"url": error.url, "reason_code": error.reason_code}],
+                          "blocking_reason": error.reason_code, "official_absent": False}
             except BrowserAccessDenied as error:
                 candidate.lineage["dimension_lookup_state"] = "OFFICIAL_LOOKUP_BLOCKED"
                 candidate.lineage["dimension_lookup_contract_state"] = "LOOKUP_BLOCKED"
@@ -1156,22 +1164,54 @@ class WebsiteStageAdapter:
                     })
 
         if not all(values.get(axis) for axis in axes):
+            # After a bounded lookup, request a visual scale anchor through
+            # the existing Brain transport when the first review had none.
+            # Do not overwrite eligibility/naming decisions or invent axes.
+            if allow_partial_anchor and not axis_evidence and lookup_state in {"OFFICIAL_LOOKUP_INCOMPLETE", "OFFICIAL_ABSENT_CONFIRMED"} and candidate.lineage.get("media_path"):
+                estimate = candidate.lineage.get("dimension_estimate_decision")
+                if not isinstance(estimate, dict) and est_source != "AI_ESTIMATED":
+                    try:
+                        answer, receipt = self.brain.reason_product(source_url=candidate.canonical_url, evidence={
+                            "purpose": "SCALE_ANCHOR_AFTER_BOUNDED_OFFICIAL_LOOKUP",
+                            "candidate_id": candidate.candidate_id,
+                            "source_name": candidate.lineage.get("source_name"),
+                            "category_group": candidate.category_group,
+                            "media_path": candidate.lineage.get("media_path"),
+                            "media_sha256": candidate.lineage.get("media_sha256"),
+                            "image_url": candidate.preview_url,
+                            "source_dimensions": {},
+                            "official_absent": lookup_state == "OFFICIAL_ABSENT_CONFIRMED",
+                            "dimension_lookup_state": lookup_state,
+                            "checked_sources": candidate.lineage.get("dimension_checked_sources") or [],
+                        })
+                        estimate = answer.model_dump(mode="json")
+                        saved = {"dimension_estimate_decision": estimate, "dimension_estimate_receipt": receipt}
+                        self.pool.enrich_candidate(candidate.candidate_id, lineage=saved)
+                        candidate.lineage.update(saved)
+                    except BrainError as error:
+                        return StageOutcome(StageDecision.PENDING, error.code, {"dimension_lookup_state": lookup_state})
+                if isinstance(estimate, dict):
+                    decision = estimate
+                    est_source = str(estimate.get("dimension_source") or "").upper()
             # AI height/full-axis values are accepted only after the official
             # lookup proved absence, or when the operator explicitly opted in.
-            ai_allowed = lookup_state == "OFFICIAL_ABSENT_CONFIRMED" or override
+            ai_allowed = lookup_state == "OFFICIAL_ABSENT_CONFIRMED" or override or (
+                allow_partial_anchor and lookup_state == "OFFICIAL_LOOKUP_INCOMPLETE"
+            )
             ai_values = {axis: decision.get(axis) for axis in axes}
-            if ai_allowed and est_source == "AI_ESTIMATED" and all(ai_values.get(axis) for axis in axes):
-                ai_unit = _normalized_dimension_unit(decision.get("dimension_unit") or "in")
+            usable_ai = {axis: value for axis, value in ai_values.items() if value is not None}
+            if ai_allowed and est_source == "AI_ESTIMATED" and not (allow_partial_anchor and axis_evidence) and (all(ai_values.get(axis) for axis in axes) or (allow_partial_anchor and usable_ai)):
+                ai_unit = _normalized_dimension_unit(decision.get("dimension_unit"))
                 for axis in axes:
-                    if axis not in axis_evidence:
+                    if axis not in axis_evidence and ai_values.get(axis) is not None:
                         axis_evidence[axis] = {
                             "value": ai_values[axis], "unit": ai_unit,
                             "source": "AI_ESTIMATED",
-                            "evidence": [{"role": "brain_estimate_after_explicit_official_absence"}],
+                            "evidence": [{"role": "brain_estimate_after_bounded_lookup", "lookup_state": lookup_state}],
                         }
-                values = {axis: axis_evidence[axis]["value"] for axis in axes}
+                values = {axis: axis_evidence[axis]["value"] for axis in axis_evidence}
                 source = "AI_ESTIMATED_OVERRIDE" if override else "AI_ESTIMATED"
-                candidate.lineage["dimension_source_detail"] = "AI_AFTER_EXPLICIT_OFFICIAL_ABSENCE"
+                candidate.lineage["dimension_source_detail"] = "AI_AFTER_BOUNDED_LOOKUP"
                 candidate.lineage["dimension_estimation"] = True
                 candidate.lineage["dimension_override_authorized"] = bool(override)
                 candidate.lineage["dimension_lookup_state"] = lookup_state or "OFFICIAL_ABSENT_CONFIRMED"
@@ -1182,9 +1222,9 @@ class WebsiteStageAdapter:
                 # Blender's normalization plan will use these axes as an
                 # explicit, audited uniform-scale anchor and preserve the
                 # missing axes from the model's measured ratio.
-                lookup_state = "PARTIAL_OFFICIAL"
+                lookup_state = "PARTIAL_OFFICIAL" if not source.startswith("AI_ESTIMATED") else lookup_state
                 source = source or "OFFICIAL_PAGE"
-                candidate.lineage["dimension_lookup_contract_state"] = "PARTIAL_OFFICIAL"
+                candidate.lineage["dimension_lookup_contract_state"] = "PARTIAL_OFFICIAL" if not source.startswith("AI_ESTIMATED") else "LOOKUP_INCOMPLETE"
             else:
                 # A partial official lookup is never a deliverable dimension set
                 # unless the order explicitly opts into the anchor policy.
@@ -1249,7 +1289,7 @@ class WebsiteStageAdapter:
             "dimension_lookup_state": lookup_state or ("OFFICIAL_FOUND" if source.startswith("OFFICIAL") else "UNKNOWN"),
             "dimension_lookup_contract_state": (
                 "OFFICIAL_FOUND" if len(axis_evidence) == len(axes) and source.startswith("OFFICIAL")
-                else "PARTIAL_OFFICIAL" if len(axis_evidence) < len(axes) and axis_evidence and allow_partial_anchor
+                else "PARTIAL_OFFICIAL" if len(axis_evidence) < len(axes) and axis_evidence and allow_partial_anchor and source.startswith("OFFICIAL")
                 else "NOT_FOUND_IN_CHECKED_SCOPE" if lookup_state == "OFFICIAL_ABSENT_CONFIRMED"
                 else "LOOKUP_INCOMPLETE"
             ),
@@ -1934,6 +1974,7 @@ class WebsiteStageAdapter:
 
         orientation_input = {
             "candidate_id": candidate.candidate_id,
+            "media_path": candidate.lineage.get("media_path"),
             "raw_glb_sha256": raw_sha256,
             "media_sha256": binding["media_sha256"],
             "orientation_views": view_evidence,

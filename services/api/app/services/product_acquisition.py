@@ -970,6 +970,12 @@ def _parse_dimension_text_structured(visible: str, *, url: str) -> dict[str, Any
     if ordered_match:
         axes = _ordered_dimension_axes(ordered_match, url=url, visible=visible)
     else:
+        # Normalize visible specification-table labels, not arbitrary HTML:
+        # "Height (cm): 18" -> "Height: 18 cm".
+        visible = re.sub(
+            r"\b(width|depth|height|diameter)\s*\((cm|mm|in|inches|inch|m)\)\s*[:=-]?\s*(\d+(?:\.\d+)?)",
+            r"\1: \3 \2", visible, flags=re.I,
+        )
         label_patterns = {
             "width": r"(?:\bwidth\b|\bw\b|宽)\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>inches?|in|cm|mm|m|\")?",
             "depth": r"(?:\bdepth\b|\bd\b|深)\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>inches?|in|cm|mm|m|\")?",
@@ -994,6 +1000,11 @@ def _parse_dimension_text_structured(visible: str, *, url: str) -> dict[str, Any
             }
         if axes:
             unit = next((str(item["unit"]) for item in axes.values() if item.get("unit") and item.get("unit") != "source_unit"), "")
+        diameter = re.search(r'\bdiameter\s*[:=-]?\s*(\d+(?:\.\d+)?)\s*(cm|mm|inches?|in|m)\b', visible, re.I)
+        if diameter and "width" not in axes and "depth" not in axes:
+            for axis in ("width", "depth"):
+                axes[axis] = {"value": float(diameter.group(1)), "unit": _dimension_unit_token(diameter.group(2)),
+                              "source": "OFFICIAL_PAGE", "evidence": [{"url": url, "role": "explicit_diameter", "text_match": diameter.group(0)}]}
     units = {str(item.get("unit") or "source_unit") for item in axes.values()}
     unit = next(iter(units)) if len(units) == 1 else (unit if "unit" in locals() else "")
     state = "OFFICIAL_FOUND" if len(axes) == 3 else "PARTIAL_OFFICIAL" if axes else "LOOKUP_INCOMPLETE"

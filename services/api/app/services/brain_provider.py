@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import io
 import json
 import os
 from pathlib import Path
@@ -37,6 +39,12 @@ def _safe_trace_value(value: object, *, key: str = "") -> object:
     if normalized in _TRACE_SECRET_PARTS or any(part in normalized for part in _TRACE_SECRET_PARTS):
         return "[REDACTED]"
     if isinstance(value, dict):
+        if value.get("type") == "image_url" and isinstance(value.get("image_url"), dict):
+            image_value = str(value["image_url"].get("url") or "")
+            if image_value.startswith("data:image/"):
+                # Bridge readers inspect the adjacent bound local file. Do not
+                # persist huge base64 blobs or silently truncate an image URL.
+                return {"type": "text", "text": "LOCAL_VISUAL_REFERENCE: inspect the adjacent website_visual_input path; remote channel receives its exact bytes."}
         return {str(k): _safe_trace_value(v, key=str(k)) for k, v in list(value.items())[:128]}
     if isinstance(value, (list, tuple)):
         return [_safe_trace_value(item, key=key) for item in list(value)[:128]]
@@ -274,10 +282,26 @@ class WebsiteBrainProvider:
             status = VisionProviderNotConfigured.code
         else:
             status = "READY"
+        bridge_last_response = None
+        if self.settings.codex_bridge_mode:
+            # Configuration is not an active model. Report only recent,
+            # actually accepted responses; a directory alone proves nothing.
+            root = Path(self.settings.bridge_root) / "sessions"
+            for path in root.glob("*.json"):
+                try:
+                    record = json.loads(path.read_text(encoding="utf-8"))
+                    stamp = float(record.get("updated_at") or 0)
+                    if record.get("status") == "RESPONDED" and record.get("response_sha256") and stamp <= time.time():
+                        bridge_last_response = max(bridge_last_response or 0, stamp)
+                except (OSError, ValueError, TypeError):
+                    continue
+            operational = bool(bridge_last_response and time.time() - bridge_last_response < 180)
+            status = "CODEX_BRIDGE_RECENT_RESPONSE" if operational else "CODEX_BRAIN_NOT_CONNECTED"
         return {
             "status": status,
             "configured": self.settings.configured,
             "operational": operational,
+            "bridge_last_response_at": bridge_last_response,
             "model": self.settings.model if self.settings.configured else None,
             "namespace": "WEBSITE_BRAIN_*",
             "model_mode": self.settings.model_mode,
@@ -1023,12 +1047,17 @@ class WebsiteBrainProvider:
                 if isinstance(value, str) and value.strip() and value.strip() not in image_urls:
                     image_urls.append(value.strip())
             local_view_paths: list[str] = []
+            media_path = evidence.get("media_path")
+            if isinstance(media_path, str) and media_path.strip():
+                local_view_paths.append(media_path.strip())
+                # Captured bytes, not a potentially changed CDN response.
+                image_urls = []
             views = evidence.get("orientation_views")
             if isinstance(views, list):
                 for item in views:
                     if not isinstance(item, dict):
                         continue
-                    value = str(item.get("url") or item.get("path") or "").strip()
+                    value = str(item.get("path") or item.get("url") or "").strip()
                     if not value:
                         continue
                     if value.startswith(("http://", "https://")) and value not in image_urls:
@@ -1037,9 +1066,14 @@ class WebsiteBrainProvider:
                         local_view_paths.append(value)
             if image_urls or local_view_paths:
                 text = user_text
-                if local_view_paths:
-                    text += "\nExplicit local Blender view paths (inspect these files; do not invent replacements):\n" + "\n".join(local_view_paths)
                 parts: list[dict[str, object]] = [{"type": "text", "text": text}]
+                for value in dict.fromkeys(local_view_paths):
+                    data_url, binding = self._local_visual_input(value)
+                    expected = evidence.get("media_sha256") if value == media_path else next((v.get("sha256") for v in views if isinstance(v, dict) and str(v.get("path") or "") == value), None) if isinstance(views, list) else None
+                    if expected and str(expected).lower() != binding["source_sha256"]:
+                        raise VisionInputRequired("Visual evidence hash changed; capture and review again")
+                    parts.append({"type": "text", "text": json.dumps(binding, ensure_ascii=False)})
+                    parts.append({"type": "image_url", "image_url": {"url": data_url}})
                 parts.extend({"type": "image_url", "image_url": {"url": value}} for value in image_urls)
                 return [
                     {"role": "system", "content": prompt},
@@ -1049,6 +1083,31 @@ class WebsiteBrainProvider:
             {"role": "system", "content": prompt},
             {"role": "user", "content": user_text},
         ]
+
+    @staticmethod
+    def _local_visual_input(value: str) -> tuple[str, dict[str, object]]:
+        from PIL import Image
+        path = Path(value).resolve()
+        # Only Website-owned evidence may cross the remote model boundary.
+        root = Path(os.getenv("OUTPUT_ROOT", "output")).resolve()
+        if not path.is_relative_to(root):
+            raise VisionInputRequired("Visual evidence is outside Website OUTPUT_ROOT")
+        try:
+            if path.stat().st_size > 12 * 1024 * 1024:
+                raise ValueError("image too large")
+            raw = path.read_bytes()
+            with Image.open(io.BytesIO(raw)) as picture:
+                picture.verify()
+                mime = Image.MIME.get(picture.format or "")
+            if mime not in {"image/png", "image/jpeg", "image/webp"}:
+                raise ValueError("unsupported image format")
+        except (OSError, ValueError, Image.DecompressionBombError) as error:
+            raise VisionInputRequired("Visual evidence missing, invalid or oversized") from error
+        digest = hashlib.sha256(raw).hexdigest()
+        return "data:" + mime + ";base64," + base64.b64encode(raw).decode("ascii"), {
+            "role": "website_visual_input", "path": str(path), "source_sha256": digest,
+            "transport_sha256": digest, "transformation": "NONE", "mime_type": mime,
+        }
 
     def _respect_rate_limit(self) -> None:
         spacing = 60.0 / max(1, self.settings.rpm_limit)

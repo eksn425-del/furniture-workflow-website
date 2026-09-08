@@ -190,6 +190,9 @@ def test_dimensions_use_official_before_ai_and_block_on_challenge(tmp_path: Path
         assert blocked.lineage["dimension_lookup_state"] == "OFFICIAL_LOOKUP_BLOCKED"
 
         partial = _candidate(dimensions={"width": 30}, decision={"height": 99, "dimension_source": "AI_ESTIMATED"})
+        # Legacy strict orders remain strict; default trial orders may use
+        # one observed official anchor without inventing the other axes.
+        partial.lineage["dimension_anchor_policy"] = "FULL_ONLY"
         monkeypatch.setattr(adapter, "_extract_dimensions_bounded", lambda *_: ({}, "in"))
         partial_outcome = adapter._stage_dimension(partial)
         assert partial_outcome.decision.value == "pending"

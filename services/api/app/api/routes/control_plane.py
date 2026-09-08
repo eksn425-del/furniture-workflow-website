@@ -1253,6 +1253,8 @@ def list_control_sites(request: Request) -> dict:
                 "domain": site.domain,
                 "display_name": site.display_name,
                 "source_kind": site.source_kind,
+                "is_brand_library": any(job.is_brand_library for job in jobs),
+                "brand_name": next((job.brand_name for job in jobs if job.is_brand_library and job.brand_name), ""),
                 "status": site.status,
                 "profile_version": site.profile_version,
                 "category_count": len(categories) if taxonomy["taxonomy_available"] else None,

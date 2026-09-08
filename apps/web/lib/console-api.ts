@@ -379,6 +379,8 @@ export interface ControlSiteCategory {
 }
 
 export interface ControlSite {
+  is_brand_library?: boolean;
+  brand_name?: string;
   site_key: string;
   domain: string;
   display_name: string;

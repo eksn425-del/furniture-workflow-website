@@ -1983,6 +1983,9 @@ class NativeSiteAnalyzer:
             if category.level == 2 and category.parent_path and _has_brain_parent(category):
                 # Brain 明确输出的父子关系被尊重，父路径做前缀剥离与规范化后的父类目对齐。
                 category.parent_path = _normalize_parent_path(category.parent_path)
+            elif any(e.get("role") == "brain_department" for e in category.evidence):
+                category.level = 1
+                category.parent_path = None
             elif (nav := _nav_tree_evidence(category)) is not None:
                 # 导航 DOM 嵌套：大标签(有子项)=一级；其下小标签=二级，父指向大标签。
                 category.level = int(nav.get("level") or (2 if nav.get("parent_path") else 1))
@@ -2132,9 +2135,12 @@ class NativeSiteAnalyzer:
             elif item.level == 1:
                 item.evidence = list(item.evidence) + [{"role": "brain_department"}]
             merged_by_url[item.source_url.rstrip("/").casefold()] = item
-        # 大脑未覆盖的规则类目补上，避免遗漏。
+        # A complete two-level review must not silently resurrect excluded
+        # marketing/room/style navigation. Partial child-only answers still
+        # retain rule evidence so a bounded answer cannot erase departments.
+        reviewed_tree = any(c.level == 1 for c in brain.categories) and any(c.level == 2 and c.parent_path for c in brain.categories)
         for url, rule in rules_by_url.items():
-            if url not in merged_by_url:
+            if url not in merged_by_url and not reviewed_tree:
                 merged_by_url[url] = rule
         return NativeSiteAnalyzer._dedupe_categories(NativeSiteAnalyzer._hierarchize(list(merged_by_url.values())))
 

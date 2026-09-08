@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import inspect
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -96,6 +97,8 @@ class SiteScanRuntimeService:
         return self.status(scan_id) or {"scan_id": scan_id, "status": "QUEUED"}
 
     def _schedule(self, scan_id: str) -> None:
+        if os.getenv("WEBSITE_BACKGROUND_WORK_PAUSED", "").lower() in {"1", "true", "yes"}:
+            return
         with self._lock:
             if scan_id in self._scheduled:
                 return
@@ -103,6 +106,8 @@ class SiteScanRuntimeService:
         self.executor.submit(self._execute_guarded, scan_id)
 
     def reconcile_all(self) -> None:
+        if os.getenv("WEBSITE_BACKGROUND_WORK_PAUSED", "").lower() in {"1", "true", "yes"}:
+            return
         session = self.database.session_factory()
         try:
             ids = [row.scan_id for row in session.scalars(select(SiteScanRun).where(SiteScanRun.status.in_({"QUEUED", "ANALYZING", "L2_BROWSER"})))]
@@ -270,8 +275,39 @@ class SiteScanRuntimeService:
                 # Its HTTP, browser, agent-step and bridge waits have their own
                 # budgets. A detached-thread timer must not expire the scan
                 # while an operator is answering its pending brain request.
+                l1_receipt = receipt
                 receipt = self.analyzer.analyze_browser(source_url, output_dir=output_dir, session_dir=Path(browser.user_data_dir))
+                receipt = self._merge_enrichment(l1_receipt, receipt)
         self._persist(scan_id, receipt, output_dir)
+
+    @staticmethod
+    def _merge_enrichment(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+        """L2 enriches the same scan, never erases successful L1 evidence.
+
+        Only matching public URLs inherit counts; real access blockers keep
+        their status. No summing, guessed zero or promotion to READY.
+        """
+        import copy
+        result = copy.deepcopy(current)
+        by_url = {str(c.get("source_url") or "").rstrip("/"): c
+                  for c in previous.get("categories", []) if isinstance(c, dict)}
+        for item in result.get("categories", []):
+            old = by_url.get(str(item.get("source_url") or "").rstrip("/"))
+            if old and item.get("count_kind", "UNKNOWN") == "UNKNOWN" and old.get("count_kind") in {"EXACT", "ESTIMATED"} and old.get("count_value") is not None:
+                item["count_value"], item["count_kind"] = old["count_value"], old["count_kind"]
+                item["evidence"] = list(item.get("evidence") or []) + list(old.get("evidence") or []) + [{"role": "same_scan_l1_count_preserved"}]
+        if result.get("source_type", "UNKNOWN") == "UNKNOWN" and previous.get("source_type"):
+            result["source_type"] = previous["source_type"]
+        result.setdefault("evidence", {})["l1_enrichment_summary"] = {
+            "status": previous.get("status"), "source_type": previous.get("source_type"),
+            "category_count": len(previous.get("categories") or []),
+        }
+        old_profile, profile = previous.get("site_profile"), result.get("site_profile")
+        if isinstance(old_profile, dict) and isinstance(profile, dict):
+            for key in ("platform", "source_type"):
+                if profile.get(key, "UNKNOWN") == "UNKNOWN" and old_profile.get(key):
+                    profile[key] = old_profile[key]
+        return result
 
     def _persist(self, scan_id: str, receipt: dict[str, Any], output_dir: Path) -> None:
         session = self.database.session_factory()

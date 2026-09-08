@@ -797,6 +797,8 @@ class ProductionRuntimeService:
             session.close()
 
     def reconcile_all(self) -> None:
+        if os.getenv("WEBSITE_BACKGROUND_WORK_PAUSED", "").lower() in {"1", "true", "yes"}:
+            return
         now = time.monotonic()
         # ingest 节流：距上次执行不足间隔秒数时，跳过对 worker 文件的重复读取，
         # 只保留队列提升（保证并发空槽能及时填充）。
@@ -812,6 +814,8 @@ class ProductionRuntimeService:
         self._promote_next()
 
     def _promote_next(self) -> None:
+        if os.getenv("WEBSITE_BACKGROUND_WORK_PAUSED", "").lower() in {"1", "true", "yes"}:
+            return
         session = self.database.session_factory()
         try:
             # 并发提升：只要还有空槽就持续 promote 队列里的 QUEUED 运行。
