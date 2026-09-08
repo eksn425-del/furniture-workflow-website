@@ -11,6 +11,8 @@
 
 ## 快速启动
 
+公司电脑首次部署请先看 [公司电脑部署与测试说明](docs/COMPANY_COMPUTER_SETUP.md)。目前是开发验收版，并非已通过45站完整验收的正式生产版。
+
 ```powershell
 Copy-Item .env.example .env.local
 python -m pip install -r services/api/requirements.txt

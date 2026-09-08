@@ -15,6 +15,7 @@ def test_launcher_loads_allowlisted_private_runtime_values_without_arbitrary_key
                 "BLENDER_WORKER_ENABLED=true",
                 "BLENDER_EXECUTABLE=blender.exe",
                 "OUTPUT_ROOT=./private-output",
+                "WEBSITE_BACKGROUND_WORK_PAUSED=true",
                 "UNSAFE_SHELL_SWITCH=should-not-pass",
                 "EMPTY_VALUE=",
             )
@@ -32,5 +33,6 @@ def test_launcher_loads_allowlisted_private_runtime_values_without_arbitrary_key
     assert values["BLENDER_WORKER_ENABLED"] == "true"
     assert values["BLENDER_EXECUTABLE"] == "blender.exe"
     assert values["OUTPUT_ROOT"] == "./private-output"
+    assert values["WEBSITE_BACKGROUND_WORK_PAUSED"] == "true"
     assert "UNSAFE_SHELL_SWITCH" not in values
     assert "EMPTY_VALUE" not in values
