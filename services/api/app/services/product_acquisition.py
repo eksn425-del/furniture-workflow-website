@@ -607,7 +607,7 @@ class NativeBrowserCollector:
         同一持久会话的可见窗口重开后再等待人工处理。
         """
         evidence = self._visible_access_evidence(page)
-        if evidence["temporary_failure"]:
+        if self._is_temporary_page_failure(evidence):
             # 临时技术故障：自动重载重试（有界），减少无谓的人工介入；仅持续失败才需人工。
             from playwright.sync_api import Error as PlaywrightError
             navigation_timeout = max(8_000, min(45_000, int(os.getenv("WEBSITE_L2_NAVIGATION_TIMEOUT_MS", "15000"))))
@@ -620,9 +620,9 @@ class NativeBrowserCollector:
                     pass
                 page.wait_for_timeout(1500)
                 evidence = self._visible_access_evidence(page)
-                if not evidence["temporary_failure"]:
+                if not self._is_temporary_page_failure(evidence):
                     break
-            if evidence["temporary_failure"]:
+            if self._is_temporary_page_failure(evidence):
                 raise BrowserTemporaryFailure(
                     "页面显示临时技术故障；已自动重试仍失败，保留同一浏览器会话可稍后恢复重试",
                     url=url, session_dir=self.session_dir, reason_code="TEMPORARY_PAGE_FAILURE", evidence=evidence,
@@ -672,6 +672,20 @@ class NativeBrowserCollector:
             context, page = self._open_page(playwright, url, visible=True)
             released = self._resolve_challenge(page, url, headless=False)
             return context, page, released
+
+    @staticmethod
+    def _is_temporary_page_failure(evidence: dict[str, Any]) -> bool:
+        """A definitive access-control statement outranks retry boilerplate.
+
+        WAF/CDN block pages (CloudFront, Akamai, ...) routinely say both
+        "Request blocked" and "Try again later" in the same body.  Treating
+        that as a temporary failure tells the operator to retry something that
+        can never succeed and invites repeated pointless resumes.  When the
+        page also states access was denied/forbidden, classify it as access
+        denied instead.  A genuine 5xx maintenance page has no such statement,
+        so the bounded auto-reload path is preserved for real temporary faults.
+        """
+        return bool(evidence.get("temporary_failure")) and not bool(evidence.get("access_denied"))
 
     @staticmethod
     def _visible_access_evidence(page) -> dict[str, Any]:
