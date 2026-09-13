@@ -500,3 +500,49 @@ def test_nav_parser_magento_div_submenu_parent_edge() -> None:
     living = next(n for n in tree if n["label"] == "Living")
     assert [c["label"] for c in living["children"]] == ["Sofas"]
 
+
+
+# --- verified taxonomy must never be empty -------------------------------
+# Regression for the 45-site run (Arhaus): the L2 access decision resolved to
+# ACCESSIBLE while the page was actually a Cloudflare 430/denial, so the scan
+# produced zero categories yet still reported status READY + verified, and the
+# operator was shown TAXONOMY_READY over an empty taxonomy.  An empty taxonomy
+# is not a verified taxonomy.
+
+
+def _receipt_with_categories(analyzer: NativeSiteAnalyzer, categories: list) -> dict:
+    return analyzer._receipt(
+        "https://example-shop.test/",
+        "example-shop.test",
+        live=True,
+        status="READY",
+        categories=categories,
+        evidence={},
+        brain={},
+        site_profile=None,
+        agent_trace={},
+        blocker=None,
+        source_type="UNKNOWN",
+    )
+
+
+def test_ready_scan_without_categories_is_not_verified(tmp_path: Path) -> None:
+    analyzer = NativeSiteAnalyzer(
+        tmp_path,
+        client_factory=FakeSiteClient,
+        brain=WebsiteBrainProvider(BrainSettings(model_mode="LOCAL_AGENT")),
+    )
+
+    empty = _receipt_with_categories(analyzer, [])
+    assert empty["status"] == "READY"
+    assert empty["verified"] is False, "an empty taxonomy must never be reported as verified"
+    assert empty["categories"] == []
+
+    populated = _receipt_with_categories(analyzer, [
+        TaxonomyCategoryContract(
+            native_name="Chairs", canonical_name="Chairs", path="/chairs",
+            count_value=3, count_kind="EXACT", level=2, parent_path="Seating",
+        )
+    ])
+    assert populated["status"] == "READY"
+    assert populated["verified"] is True, "a real category still verifies normally"

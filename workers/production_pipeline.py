@@ -995,6 +995,27 @@ class WebsiteStageAdapter:
 
     def _stage_dimension(self, candidate: CandidateRecord) -> StageOutcome:
         axes = ("width", "depth", "height")
+        # A definitive access denial during the official-dimension lookup is not
+        # retryable. Without this guard every engine tick re-launches the bounded
+        # browser lookup against a page the site has already denied, burning time
+        # and requests without ever changing the outcome (a 45-site run observed
+        # 195 identical re-attempts of the same denied lookup). The candidate
+        # stays pending so the operator sees and can act on the blocked state.
+        if str(candidate.lineage.get("dimension_access_status") or "").upper() in {
+            "ACCESS_CHANGE_REQUIRED", "HUMAN_REQUIRED",
+        } and not candidate.lineage.get("dimension_lookup_reset"):
+            return StageOutcome(
+                StageDecision.PENDING,
+                str(candidate.lineage.get("dimension_access_reason") or "ACCESS_CHANGE_REQUIRED"),
+                {
+                    "dimension_lookup_state": candidate.lineage.get("dimension_lookup_state") or "OFFICIAL_LOOKUP_BLOCKED",
+                    "dimension_lookup_contract_state": "LOOKUP_BLOCKED",
+                    "dimension_access_status": candidate.lineage.get("dimension_access_status"),
+                    "dimension_access_reason": candidate.lineage.get("dimension_access_reason"),
+                    "dimension_access_url": candidate.lineage.get("dimension_access_url"),
+                    "dimension_lookup_already_blocked": True,
+                },
+            )
         raw_values = candidate.lineage.get("source_dimensions") or {}
         values = {axis: raw_values.get(axis) for axis in axes}
         raw_unit_value = candidate.lineage.get("dimension_unit")

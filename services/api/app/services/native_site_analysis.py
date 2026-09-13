@@ -2225,7 +2225,14 @@ class NativeSiteAnalyzer:
             source_url=source_url,
             live=live,
             status=status,
-            verified=bool(live and status == "READY"),
+            # A verified taxonomy requires at least one verified category.
+            # Without this, a scan whose page never yielded any category (for
+            # example an access decision that resolved to ACCESSIBLE while the
+            # page was actually blocked) still reported READY + verified and the
+            # operator saw TAXONOMY_READY over an empty taxonomy: a wrong
+            # success.  An empty taxonomy is never "verified"; it stays
+            # PARTIAL/BROWSER_REQUIRED so the operator is told to act.
+            verified=bool(live and status == "READY" and categories),
             fixture_only=fixture_only,
             taxonomy_level=taxonomy_level,
             source_type=source_type,
