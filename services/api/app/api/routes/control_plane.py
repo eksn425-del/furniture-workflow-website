@@ -1149,6 +1149,26 @@ def act_on_review(review_id: str, payload: HumanReviewAction, request: Request) 
         item = session.get(ReviewQueueItem, review_id)
         if item is None:
             raise HTTPException(status_code=404, detail="review item not found")
+        if item.status != "OPEN":
+            raise HTTPException(status_code=409, detail="review item is no longer open")
+        evidence = _safe_payload(item.evidence_json)
+        candidate_id = evidence.get("candidate_id")
+        if payload.action in {"ACCEPT", "CONFIRM", "EDIT", "REQUEST_RESCAN"} and (item.record_id or candidate_id):
+            job = session.get(ProductionJob, item.job_id) if item.job_id else None
+            if job is None or not job.candidate_pool_path:
+                raise HTTPException(status_code=409, detail="review candidate evidence is unavailable")
+            pool = CandidatePoolStore(Path(job.candidate_pool_path), order_id=job.job_id, job_id=job.job_id)
+            matches = [record for record in pool.records() if (not item.record_id or record.record_id == item.record_id) and (not candidate_id or record.candidate_id == candidate_id)]
+            if len(matches) != 1:
+                raise HTTPException(status_code=409, detail="review candidate identity is ambiguous or missing")
+            record = matches[0]
+            current_sha = str(record.lineage.get("media_sha256") or record.image_sha256 or "")
+            snapshot_sha = str(evidence.get("reviewed_media_sha256") or evidence.get("media_sha256") or "")
+            if not snapshot_sha or snapshot_sha != current_sha or payload.reviewed_media_sha256 != current_sha:
+                raise HTTPException(status_code=409, detail="stale or missing reviewed_media_sha256; obtain a new review for the current image")
+            media_path = record.lineage.get("media_path")
+            if media_path and (not Path(str(media_path)).is_file() or hashlib.sha256(Path(str(media_path)).read_bytes()).hexdigest() != current_sha):
+                raise HTTPException(status_code=409, detail="captured image bytes changed; obtain new evidence")
         item.status = "RESOLVED" if payload.action != "STOP" else "STOPPED"
         item.updated_at = utc_now()
         if item.job_id:
@@ -1156,7 +1176,7 @@ def act_on_review(review_id: str, payload: HumanReviewAction, request: Request) 
             if job:
                 job.status = "STOPPED" if payload.action == "STOP" else "REVIEW_RESOLVED"
                 job.last_reason = payload.reason or f"人工动作：{payload.action}"
-                _event(session, job, "HUMAN_REVIEW", job.status, job.last_reason, {"review_id": review_id, "action": payload.action, "actor": payload.actor})
+                _event(session, job, "HUMAN_REVIEW", job.status, job.last_reason, {"review_id": review_id, "action": payload.action, "actor": payload.actor, "reviewed_media_sha256": payload.reviewed_media_sha256})
         _audit(session, "REVIEW_ACTION", "review_queue_item", review_id, actor=payload.actor, payload={"action": payload.action, "reason": payload.reason})
         session.commit()
         return {"status": item.status, "review_id": item.review_id, "action": payload.action}

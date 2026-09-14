@@ -40,6 +40,7 @@ from app.services.product_acquisition import (
 from app.services.site_scan_runtime import SiteScanRuntimeService
 from app.services.native_site_analysis import site_key_for
 from workers.production_pipeline import ProductionPipeline
+from scripts.acceptance_qualification import locked_record, qualify
 
 
 SITES = [
@@ -551,10 +552,10 @@ def _run_one(
             "layer_c": {"status": "NOT_RUN", "reason": "C not requested; run with --layers-bc."},
             "layer_d": {"status": "NOT_RUN", "reason": "D not requested; run with --layers-d."},
             "target_count": 3,
-            "found_count": 0,
-            "dedup_count": 0,
-            "image_pass_count": 0,
-            "ready_count": 0,
+            "found_count": "UNKNOWN",
+            "dedup_count": "UNKNOWN",
+            "image_pass_count": "UNKNOWN",
+            "ready_count": "UNKNOWN",
             "manual_intervention_count": 0,
             "developer_rescue": False,
             "evidence_paths": [],
@@ -582,12 +583,17 @@ def _run_one(
             row["layer_b"] = {
                 "status": _status_bucket(b_status, layer="B"),
                 "raw_status": b_status,
-                "category_count": len(taxonomy.get("categories") or []),
+                "verified": taxonomy.get("verified"),
+                "live": taxonomy.get("live"),
+                "fixture_only": taxonomy.get("fixture_only"),
+                "categories": taxonomy.get("categories"),
+                "category_count": len(taxonomy["categories"]) if isinstance(taxonomy.get("categories"), list) else "UNKNOWN",
                 "taxonomy_level": taxonomy.get("taxonomy_level"),
                 "brain": taxonomy.get("brain") or {},
                 "evidence": taxonomy.get("evidence") or {},
                 "formal_runtime": taxonomy.get("formal_runtime") or {},
                 "reason": (taxonomy.get("blocker") or {}).get("message") if isinstance(taxonomy.get("blocker"), dict) else "",
+                "blocker": taxonomy.get("blocker") or {},
             }
             row["evidence_paths"].append(str(b_root))
         except TimeoutError as error:
@@ -639,12 +645,12 @@ def _run_one(
             except (OSError, ValueError, json.JSONDecodeError):
                 checkpoint = {}
             row["found_count"] = len(products)
-            row["dedup_count"] = len(checkpoint.get("products") or {})
+            row["dedup_count"] = len(checkpoint["products"]) if isinstance(checkpoint.get("products"), (dict, list)) else "UNKNOWN"
             row["layer_c"] = {
                 "status": "PASS" if len(products) >= 3 else "PARTIAL",
                 "raw_status": checkpoint.get("discovery_status") or "DISCOVERED",
                 "found_count": len(products),
-                "dedup_count": len(checkpoint.get("products") or {}),
+                "dedup_count": row["dedup_count"],
                 "products": [
                     {
                         "identity_key": item.identity_key,
@@ -729,9 +735,10 @@ def _run_one(
                     pool_payload = {}
             records = pool_payload.get("records") if isinstance(pool_payload, dict) else []
             records = records if isinstance(records, list) else []
-            ready_count = sum(1 for item in records if str(item.get("state") or "") in {"CATALOG_READY", "MODEL_INPUT_LOCKED", "COMPLETED"})
-            row["ready_count"] = ready_count
-            row["image_pass_count"] = sum(1 for item in records if bool((item.get("lineage") or {}).get("image_decodable")))
+            pool_observed = isinstance(pool_payload.get("records"), list)
+            ready_count = len({item["candidate_id"] for item in records if locked_record(item)})
+            row["ready_count"] = ready_count if pool_observed else "UNKNOWN"
+            row["image_pass_count"] = sum(1 for item in records if bool((item.get("lineage") or {}).get("image_decodable"))) if pool_observed else "UNKNOWN"
             # D is a fixed three-item Ready Pool gate.  A site that exposes
             # only one or two candidates is a truthful PARTIAL/shortage, not
             # a smaller target silently re-labelled PASS.
@@ -740,7 +747,7 @@ def _run_one(
                 "exit_code": exit_code,
                 "provider": "OFF",
                 "target_count": 3,
-                "ready_count": ready_count,
+                "ready_count": row["ready_count"],
                 "records": records,
                 "events": events[-40:],
             }
@@ -758,7 +765,7 @@ def _run_one(
             "site": name, "url": url, "run_id": run_id,
             "attempt_id": f"{run_id}:{name}", "time_utc": started.isoformat(),
             "environment": {"python": sys.version.split()[0], "hostname": socket.gethostname()},
-            "layer_a": "ENVIRONMENT_BLOCKED", "preflight_status": type(error).__name__.upper(),
+            "layer_a": "ENVIRONMENT_BLOCKED" if _is_network_block_message(str(error)) or isinstance(error, BrowserRuntimeMissing) else "FAILED", "preflight_status": type(error).__name__.upper(),
             "reason": str(error)[:500], "evidence": {"error": type(error).__name__, "message": str(error)},
             "source_type": "UNKNOWN",
             "scope_applicability": "UNKNOWN",
@@ -767,10 +774,10 @@ def _run_one(
             "layer_c": {"status": "NOT_RUN", "reason": "Layer A raised before products."},
             "layer_d": {"status": "NOT_RUN", "reason": "Layer A raised before Ready Pool."},
             "target_count": 3,
-            "found_count": 0,
-            "dedup_count": 0,
-            "image_pass_count": 0,
-            "ready_count": 0,
+            "found_count": "UNKNOWN",
+            "dedup_count": "UNKNOWN",
+            "image_pass_count": "UNKNOWN",
+            "ready_count": "UNKNOWN",
             "manual_intervention_count": 0,
             "developer_rescue": False,
             "evidence_paths": [str(output_root / "preflight" / name.replace("/", "_"))],
@@ -779,12 +786,14 @@ def _run_one(
 
 def _write(rows: list[dict[str, Any]], output_root: Path, run_id: str) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
+    for row in rows:
+        row["qualification"] = qualify(row)
     payload = {"schema_version": "website-45-site-acceptance.v1", "run_id": run_id, "site_count": len(rows), "rows": rows}
     (output_root / f"acceptance_{run_id}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     fields = [
         "site", "url", "run_id", "attempt_id", "time_utc", "layer_a", "preflight_status", "source_type",
         "scope_applicability", "brain_mode", "target_count", "found_count", "dedup_count", "image_pass_count",
-        "ready_count", "manual_intervention_count", "developer_rescue", "reason",
+        "ready_count", "manual_intervention_count", "developer_rescue", "qualification", "reason",
     ]
     with (output_root / f"acceptance_{run_id}.csv").open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)

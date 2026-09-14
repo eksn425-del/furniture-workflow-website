@@ -646,5 +646,6 @@ class HumanReviewAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: Literal["CONFIRM", "EDIT", "REJECT", "REQUEST_RESCAN", "ACCEPT", "STOP"]
+    reviewed_media_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     reason: str = Field(default="", max_length=1000)
     actor: str = Field(default="operator", min_length=1, max_length=128)

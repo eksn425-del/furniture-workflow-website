@@ -512,7 +512,7 @@ export function deleteControlJob(jobId: string): Promise<{ deleted: boolean; job
   return request(`/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
 }
 
-export function updateControlJob(jobId: string, input: { title?: string; goal?: string; target_value?: number; provider?: string; category_allocation?: "PER_CATEGORY" | "TOTAL_ACROSS_SELECTED"; allocation_strategy?: "SEQUENTIAL" | "EVEN" | "PROPORTIONAL" | "CUSTOM"; spillover?: "ASK" | "AUTO_IF_EXPLICIT" | "STOP"; category_quotas?: Record<string, number> }): Promise<{ job: ControlJob }> {
+export function updateControlJob(jobId: string, input: { title?: string; goal?: string; target_value?: number; provider?: string; category_allocation?: "PER_CATEGORY" | "TOTAL_ACROSS_SELECTED"; allocation_strategy?: "SEQUENTIAL" | "EVEN" | "PROPORTIONAL" | "CUSTOM"; spillover?: "ASK" | "AUTO_IF_EXPLICIT" | "STOP"; category_quotas?: Record<string, number>; dimension_anchor_policy?: "FULL_ONLY" | "ALLOW_PARTIAL_ANCHOR" }): Promise<{ job: ControlJob }> {
   return request(`/jobs/${encodeURIComponent(jobId)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },

@@ -1278,7 +1278,12 @@ class NativeSiteAnalyzer:
         browser_session_dir: Path | None = None,
         browser_output_dir: Path | None = None,
     ) -> Callable[[str, dict[str, object]], dict[str, object]]:
+        terminal_error: AgentToolError | None = None
+
         def execute(name: str, args: dict[str, object]) -> dict[str, object]:
+            nonlocal terminal_error
+            if terminal_error is not None:
+                raise terminal_error
             try:
                 return self._agent_dispatch(
                     name,
@@ -1292,9 +1297,16 @@ class NativeSiteAnalyzer:
                     browser_output_dir=browser_output_dir,
                 )
             except RequestBudgetExceeded as error:
-                raise AgentToolError("REQUEST_BUDGET_EXCEEDED", str(error)) from error
+                terminal_error = AgentToolError("REQUEST_BUDGET_EXCEEDED", str(error))
+                raise terminal_error from error
             except (RobotsDenied, AccessControlDetected, HttpStatusError, NetworkPolicyError) as error:
-                raise AgentToolError(type(error).__name__, str(error)[:300]) from error
+                # These exceptions expose neither the failed URL (which may
+                # be robots.txt or a redirect) nor a verified path-only scope.
+                # Even a previously successful alternative cannot establish
+                # that a new denial is local. Keep it terminal, never turn it
+                # into SKIPPED_BY_POLICY, and latch it against further calls.
+                terminal_error = AgentToolError(type(error).__name__, str(error)[:300])
+                raise terminal_error from error
         return execute
 
     def _agent_dispatch(
@@ -1336,8 +1348,9 @@ class NativeSiteAnalyzer:
             parser.feed(html)
             visible = _visible_html_text(html)
             nav = [
-                {"href": urljoin(url, anchor["href"]), "label": anchor["text"]}
+                {"href": href, "label": anchor["text"]}
                 for anchor in parser.anchors[:40]
+                if (href := _safe_urljoin(url, anchor["href"]))
             ]
             return {
                 "url": url,
