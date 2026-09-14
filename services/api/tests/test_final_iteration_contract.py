@@ -252,3 +252,78 @@ def test_codex_bridge_receives_explicit_image_evidence(tmp_path: Path, monkeypat
     )
     part = next(p for p in messages[-1]["content"] if p["type"] == "image_url")
     assert part["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+# --- L1 agent evidence must survive an L2 enrichment pass -----------------
+# Regression for the 45-site run: when a scan escalated from L1 to the L2
+# browser pass, _merge_enrichment deep-copied the L2 receipt and only carried
+# over per-category counts, silently discarding the L1 Brain agent trace. The
+# result was that 158 real tool calls and every stop_code became invisible on
+# exactly the hard sites that needed the agent most.
+
+
+def test_merge_enrichment_preserves_l1_agent_trace() -> None:
+    from app.services.site_scan_runtime import SiteScanRuntimeService
+
+    l1_receipt = {
+        "status": "PARTIAL",
+        "source_type": "DIRECT_BRAND",
+        "categories": [{"source_url": "https://x.test/chairs", "count_kind": "EXACT", "count_value": 7}],
+        "brain": {"status": "CODEX_BRIDGE_RESPONSE", "task": "taxonomy_oneshot"},
+        "agent_trace": {
+            "status": "AGENT_READY",
+            "stopped_reason": "TERMINAL_TOOL",
+            "stop_code": "ROBOTS_DENIED",
+            "turns": 2,
+            "tool_calls": [{"name": "get_count", "result_status": "TERMINAL", "error_code": "ROBOTS_DENIED"}],
+        },
+    }
+    l2_receipt = {
+        "status": "PARTIAL",
+        "source_type": "UNKNOWN",
+        "categories": [{"source_url": "https://x.test/chairs", "count_kind": "UNKNOWN", "count_value": None}],
+        "brain": {"status": "CODEX_BRIDGE_RESPONSE", "task": "access"},
+        "agent_trace": {},
+    }
+
+    merged = SiteScanRuntimeService._merge_enrichment(l1_receipt, l2_receipt)
+
+    # L2's own brain record still wins, but the L1 record stays reachable.
+    assert merged["brain"]["task"] == "access"
+    assert merged["brain"]["l1_brain"]["task"] == "taxonomy_oneshot"
+    # The agent trace is restored rather than dropped.
+    assert merged["agent_trace"]["stop_code"] == "ROBOTS_DENIED"
+    assert merged["agent_trace"]["turns"] == 2
+    assert merged["brain"]["agent_loop"]["tool_calls"][0]["name"] == "get_count"
+    # The pre-existing count-preservation behaviour is unchanged.
+    assert merged["categories"][0]["count_value"] == 7
+
+
+def test_merge_enrichment_keeps_l2_agent_trace_when_present() -> None:
+    from app.services.site_scan_runtime import SiteScanRuntimeService
+
+    l1_receipt = {"categories": [], "agent_trace": {"stop_code": "MAX_STEPS"}, "brain": {"task": "taxonomy_oneshot"}}
+    l2_agent = {"stop_code": "FINISH", "turns": 3}
+    l2_receipt = {"categories": [], "agent_trace": l2_agent, "brain": {"task": "taxonomy_and_site_profile"}}
+
+    merged = SiteScanRuntimeService._merge_enrichment(l1_receipt, l2_receipt)
+
+    # A richer L2 agent run is never overwritten by the L1 one.
+    assert merged["agent_trace"] == l2_agent
+
+
+def test_runtime_failure_is_classified_for_the_operator() -> None:
+    from workers.native_runtime import _classify_runtime_failure
+
+    class FakeSSLError(Exception):
+        pass
+
+    reason, guidance = _classify_runtime_failure(FakeSSLError("SSL: UNEXPECTED_EOF_WHILE_READING"))
+    assert reason == "TEMPORARY_FAILURE"
+    assert "重试" in guidance
+
+    reason, _ = _classify_runtime_failure(RuntimeError("robots.txt disallows URL"))
+    assert reason == "ACCESS_CHANGE_REQUIRED"
+
+    reason, _ = _classify_runtime_failure(KeyError("unexpected"))
+    assert reason == "SOFTWARE_ERROR"

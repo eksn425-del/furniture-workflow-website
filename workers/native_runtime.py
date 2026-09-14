@@ -111,6 +111,26 @@ def _env_dotlocal() -> dict[str, str]:
     return values
 
 
+def _classify_runtime_failure(error: BaseException) -> tuple[str, str]:
+    """Map a production-runtime exception to an actionable reason + guidance.
+
+    Previously the operator was shown the bare Python exception class
+    (``SSLError``), which says nothing about what to do next. Network/TLS
+    faults are temporary and the same job is safe to resume; compliance gates
+    need an access change; everything else is a software error that should be
+    escalated as a defect rather than retried.
+    """
+    text = f"{type(error).__name__}: {error}".casefold()
+    if isinstance(error, (TimeoutError, ConnectionError)) or any(
+        marker in text
+        for marker in ("ssl", "timeout", "timed out", "connection", "network", "unreachable", "temporarily")
+    ):
+        return "TEMPORARY_FAILURE", "网络或 TLS 故障，可恢复同一 Job 重试"
+    if any(marker in text for marker in ("robots", "access denied", "forbidden", "captcha", "challenge", "403", "429")):
+        return "ACCESS_CHANGE_REQUIRED", "站点拒绝访问且无人机验证控件，需变更访问条件"
+    return "SOFTWARE_ERROR", "软件错误，请按缺陷上报而不是重试"
+
+
 def _event_status(event_type: str) -> str:
     if event_type == "JOB_COMPLETED":
         return "SUCCEEDED"
@@ -181,14 +201,24 @@ def run_job(contract_path: Path, events_path: Path, workspace: Path, *, resume: 
     try:
         return ProductionPipeline(contract=contract, workspace=workspace, emit=emit, **pipeline_kwargs).run()
     except Exception as error:
+        # An operator must be told what to do, not shown a bare Python class
+        # name. A TLS/network fault is temporary and the same job can be
+        # resumed; a compliance gate needs an access change; anything else is a
+        # software error. The raw type is kept as a secondary detail.
+        reason_code, action = _classify_runtime_failure(error)
         _emit(
             events_path,
             contract,
             "JOB_FAILED",
             status="FAILED",
             stage="RUNTIME",
-            message=f"Website Production Engine 失败：{type(error).__name__}",
-            payload={"reason_code": type(error).__name__.upper(), "provider_calls": 0},
+            message=f"Website Production Engine 失败：{action}（{type(error).__name__}）",
+            payload={
+                "reason_code": reason_code,
+                "error_type": type(error).__name__,
+                "resume_safe": reason_code == "TEMPORARY_FAILURE",
+                "provider_calls": 0,
+            },
         )
         return 1
 

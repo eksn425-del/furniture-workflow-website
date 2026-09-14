@@ -307,6 +307,23 @@ class SiteScanRuntimeService:
             for key in ("platform", "source_type"):
                 if profile.get(key, "UNKNOWN") == "UNKNOWN" and old_profile.get(key):
                     profile[key] = old_profile[key]
+        # The L2 pass replaces the receipt wholesale, but the L1 pass may have
+        # run the Brain agent loop. Its tool-call trace and stop reason are the
+        # only audit of what the AI actually did for this site, so discarding
+        # them made the agent's work invisible on exactly the hard sites that
+        # needed it (a 45-site run lost 158 tool calls and every stop_code this
+        # way). Preserve the L1 brain evidence; the L2 record still wins where
+        # it exists, and the L1 record stays reachable for audit.
+        l1_brain = previous.get("brain") if isinstance(previous.get("brain"), dict) else {}
+        l1_agent = previous.get("agent_trace") if isinstance(previous.get("agent_trace"), dict) else {}
+        if l1_brain:
+            merged_brain = dict(result.get("brain") or {})
+            merged_brain["l1_brain"] = l1_brain
+            result["brain"] = merged_brain
+        if l1_agent and not (result.get("agent_trace") or {}):
+            result["agent_trace"] = l1_agent
+            if isinstance(result.get("brain"), dict):
+                result["brain"].setdefault("agent_loop", l1_agent)
         return result
 
     def _persist(self, scan_id: str, receipt: dict[str, Any], output_dir: Path) -> None:
