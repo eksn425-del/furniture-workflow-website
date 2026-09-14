@@ -1054,7 +1054,30 @@ class NativeSiteAnalyzer:
                         "evidence": error.evidence,
                     }
             brain_metadata: dict[str, object] = {"status": "NOT_NEEDED", "provider_posts": 0}
-            if not categories or any(item.confidence < 0.65 for item in categories):
+            # Escalating to the L2 browser pass is exactly what the hard sites do,
+            # so this pass must get the same agent reasoning as L1 instead of always
+            # settling for one one-shot answer. _brain_agent_taxonomy falls back to
+            # the one-shot path by itself when the agent does not converge, so no
+            # second call is needed here.
+            ambiguous = (not categories
+                         or any(item.confidence < 0.65 or item.count_kind == "UNKNOWN" for item in categories)
+                         or (bool(categories) and not any(item.level == 2 for item in categories)))
+            if ambiguous and not self.brain.settings.local_agent_mode:
+                try:
+                    agent_client = self.client_factory(
+                        source_url=normalized, request_budget=24, timeout=20, request_delay=0.1,
+                    )
+                    brain_result, brain_metadata = self._brain_agent_taxonomy(
+                        normalized, signals, categories, agent_client, output_dir=root,
+                    )
+                    if brain_result is not None:
+                        brain_metadata["output"] = brain_result.model_dump(mode="json")
+                        categories = self._merge_brain(categories, brain_result)
+                except BrainNotConfigured:
+                    brain_metadata = {"status": "BRAIN_NOT_CONFIGURED", "provider_posts": self.brain.post_count}
+                except BrainError as error:
+                    brain_metadata = {"status": error.code, "provider_posts": self.brain.post_count}
+            if not ambiguous and (not categories or any(item.confidence < 0.65 for item in categories)):
                 try:
                     response, brain_metadata = self.brain.reason_taxonomy(
                         source_url=normalized,

@@ -209,3 +209,55 @@ def test_terminal_compliance_error_still_stops_the_loop() -> None:
     assert result.stopped_reason == "TERMINAL_TOOL"
     assert result.stop_code == "ROBOTS_DENIED"
     assert len(calls) == 1, "a compliance gate must not be retried"
+
+
+def test_l2_browser_pass_uses_the_agent_when_ambiguous(tmp_path, monkeypatch) -> None:
+    """Hard sites escalate to the L2 browser pass; that pass must get the agent.
+
+    P2-C: analyze_browser only ever called the one-shot reason_taxonomy, so the
+    sites that needed AI reasoning most (they escalated precisely because the
+    rules were inconclusive) never received any.
+    """
+    import app.services.native_site_analysis as nsa
+    from app.services.brain_provider import WebsiteBrainProvider
+
+    html = (
+        '<html><head><title>Shop</title></head><body>'
+        '<nav><ul><li><a href="/chairs">Chairs</a></li>'
+        '<li><a href="/tables">Tables</a></li></ul></nav></body></html>'
+    )
+
+    class FakeCollector:
+        def __init__(self, session_dir: object) -> None:
+            pass
+
+        def get_html(self, url: str) -> str:
+            return html
+
+        def get_html_batch(self, urls: list[str]) -> dict[str, str]:
+            return {url: html for url in urls}
+
+    monkeypatch.setattr(nsa, "NativeBrowserCollector", FakeCollector)
+
+    agent_calls: list[int] = []
+
+    def spy_agent(self, source_url, signals, categories, client, output_dir=None):
+        agent_calls.append(len(categories))
+        return None, {"status": "AGENT_READY", "provider_posts": 0}
+
+    monkeypatch.setattr(nsa.NativeSiteAnalyzer, "_brain_agent_taxonomy", spy_agent)
+
+    class NoBrain(WebsiteBrainProvider):
+        def reason_taxonomy(self, **kwargs):
+            raise AssertionError("one-shot should not run when the agent handles it")
+
+    analyzer = nsa.NativeSiteAnalyzer(
+        tmp_path,
+        client_factory=lambda **_: None,
+        brain=NoBrain(_settings()),
+    )
+    analyzer.analyze_browser(
+        "https://example.test/", output_dir=tmp_path / "out", session_dir=tmp_path
+    )
+
+    assert agent_calls, "the L2 pass must run the Brain agent when the taxonomy is ambiguous"
