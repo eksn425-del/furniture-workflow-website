@@ -148,3 +148,64 @@ def test_order_policy_lock_raises_quota_validation() -> None:
             dimension_policy="d", registry_identity="ri", registry_version="v",
             authorization_mode="a", quality_policy="q", category_quota_mode="REQUIRED",
         )
+
+
+# --- recoverable tool-argument errors must not end the agent run ----------
+# Regression for the 45-site run: the simulated Brain called get_count with
+# {"category": ...} instead of the required {"url": ...}. The executor raised
+# AgentToolError("BAD_ARGS"), which killed the whole agent loop on turn 1 —
+# 39 runs, 158 tool calls, never a second turn. A model-side argument mistake
+# should be returned as an observation so the Brain can correct itself, while
+# compliance gates (robots/access/budget) must stay terminal.
+
+
+def test_bad_args_is_returned_to_the_brain_and_loop_continues() -> None:
+    from app.services.brain_provider import AgentToolError
+
+    brain = ScriptedBrain([_browse_msg("c0"), _finish_msg()], _settings())
+    seen: list[str] = []
+
+    def executor(name: str, args: dict) -> dict:
+        seen.append(name)
+        if len(seen) == 1:
+            raise AgentToolError("BAD_ARGS", "browse requires a same-site 'url' argument", terminal=False)
+        return {"ok": True}
+
+    result = brain.run_agent_loop(
+        system_prompt="s",
+        input_payload={"source_url": "https://example.test"},
+        tools=[{"type": "function", "function": {"name": "browse"}}],
+        tool_executor=executor,
+        options=AgentLoopOptions(response_schema=BrainTaxonomyResponse, finish_tool_name="finish", max_steps=6),
+    )
+
+    # The loop survived the rejected call and reached a validated finish.
+    assert result.stopped_reason == "FINISH"
+    assert result.validated is not None
+    # Reaching FINISH required a second Brain turn, i.e. the rejected call did
+    # not end the run.
+    assert result.turns == 2
+    assert result.tool_calls[0]["result_status"] == "TOOL_ARGS_REJECTED"
+
+
+def test_terminal_compliance_error_still_stops_the_loop() -> None:
+    from app.services.brain_provider import AgentToolError
+
+    brain = ScriptedBrain([_browse_msg("c0"), _finish_msg()], _settings())
+    calls: list[str] = []
+
+    def executor(name: str, args: dict) -> dict:
+        calls.append(name)
+        raise AgentToolError("ROBOTS_DENIED", "robots.txt disallows this URL")
+
+    result = brain.run_agent_loop(
+        system_prompt="s",
+        input_payload={"source_url": "https://example.test"},
+        tools=[{"type": "function", "function": {"name": "browse"}}],
+        tool_executor=executor,
+        options=AgentLoopOptions(response_schema=BrainTaxonomyResponse, finish_tool_name="finish", max_steps=6),
+    )
+
+    assert result.stopped_reason == "TERMINAL_TOOL"
+    assert result.stop_code == "ROBOTS_DENIED"
+    assert len(calls) == 1, "a compliance gate must not be retried"

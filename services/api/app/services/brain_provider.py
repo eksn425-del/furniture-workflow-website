@@ -223,12 +223,19 @@ class AgentToolError(RuntimeError):
 
     Terminating on this error is intentional: the loop must not keep spending
     Brain turns after a compliance gate (robots/access/budget) is tripped.
+
+    ``terminal=False`` marks a *recoverable* model-side mistake (missing or
+    malformed tool arguments). Those are returned to the Brain as an
+    observation so it can correct the call, instead of ending the run: a model
+    that passes the wrong parameter name should get one chance to fix it, while
+    a robots/access denial must never be retried.
     """
 
-    def __init__(self, code: str, message: str = "") -> None:
+    def __init__(self, code: str, message: str = "", *, terminal: bool = True) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.terminal = terminal
 
 
 @dataclass(frozen=True, slots=True)
@@ -933,8 +940,17 @@ class WebsiteBrainProvider:
                             "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                         }
                     except AgentToolError as err:
-                        tool_calls_log.append({"name": name, "arguments": args, "result_status": "TERMINAL", "error_code": err.code})
-                        return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "TERMINAL_TOOL", err.code)
+                        if err.terminal:
+                            tool_calls_log.append({"name": name, "arguments": args, "result_status": "TERMINAL", "error_code": err.code})
+                            return AgentLoopResult(None, turns, tool_calls_log, self.post_count, "TERMINAL_TOOL", err.code)
+                        # A model-side mistake (bad/missing arguments) is
+                        # recoverable: feed it back as an observation so the
+                        # Brain can correct the call, instead of ending the
+                        # whole run. Compliance gates stay terminal because
+                        # retrying them would violate robots/access policy.
+                        result_status = "TOOL_ARGS_REJECTED"
+                        content = json.dumps({"error": err.code, "message": err.message}, ensure_ascii=False, default=str)
+                        result_summary = {"keys": ["error", "message"], "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
                     except Exception as exc:  # noqa: BLE001 - executor bugs must not kill the scan
                         result_status = "EXEC_ERROR"
                         content = json.dumps({"error": "EXEC_ERROR", "message": str(exc)[:300]}, ensure_ascii=False, default=str)

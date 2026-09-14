@@ -1290,11 +1290,17 @@ class NativeSiteAnalyzer:
         if name not in {"validate_strategy", "finish_site_profile"}:
             raw_url = str(args.get("url") or (source_url if name == "list_categories" else "")).strip()
             if not raw_url:
-                raise AgentToolError("BAD_ARGS", f"{name} requires url")
+                # Recoverable: tell the Brain the exact accepted argument so it
+                # can correct the call, instead of ending the whole agent run.
+                raise AgentToolError(
+                    "BAD_ARGS",
+                    f"{name} requires a same-site 'url' argument (an absolute URL or a path such as /chairs)",
+                    terminal=False,
+                )
             try:
                 target_url = normalize_site_url(urljoin(source_url, raw_url))
             except ValueError as error:
-                raise AgentToolError("BAD_ARGS", str(error)) from error
+                raise AgentToolError("BAD_ARGS", f"{name} received an unusable url: {error}", terminal=False) from error
             if site_key_for(target_url) != site_key_for(source_url):
                 raise AgentToolError("OUT_OF_SCOPE_URL", "agent tools may only access the requested same-site host")
             args = {**args, "url": target_url}
