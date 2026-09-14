@@ -297,9 +297,10 @@ class _NavigationParser(HTMLParser):
                     children.setdefault(id(parent), []).append(n)
 
         def emit(n: _NavNode) -> dict:
+            parsed_href = _safe_urlsplit(n.href)
             return {
                 "label": " ".join(n.label.split()),
-                "path": urlsplit(n.href).path,
+                "path": parsed_href.path if parsed_href is not None else "",
                 "count": _count_from_nav_text(n.label + " " + n.count_raw),
                 "children": [emit(child) for child in children.get(id(n), [])],
             }
@@ -368,9 +369,39 @@ def _canonical_name(native: str, path: str) -> str:
     return (value[:255] or path.strip("/").replace("-", " ").replace("_", " ").title() or "Uncategorized")[:255]
 
 
+def _safe_urlsplit(value: str):
+    """urlsplit that tolerates malformed public hrefs.
+
+    Public pages carry broken links. A real example (kayu.com) is the WordPress
+    Download Manager placeholder ``http://[wpdm_asset id='1']``: a bare ``[``
+    makes ``urlsplit`` raise ``ValueError("Invalid IPv6 URL")``. One malformed
+    anchor must be skipped, never abort the whole site scan. Returns ``None``
+    when the value cannot be parsed.
+    """
+    try:
+        return urlsplit(str(value or "").strip())
+    except ValueError:
+        return None
+
+
+def _safe_urljoin(base: str, href: str) -> str:
+    """urljoin that tolerates malformed hrefs (see ``_safe_urlsplit``).
+
+    ``urljoin`` runs the same netloc validation and raises the same
+    ``ValueError`` for a bare ``[``. Returns ``""`` so callers treat the anchor
+    as unusable instead of crashing the scan.
+    """
+    try:
+        return urljoin(base, str(href or "").strip())
+    except ValueError:
+        return ""
+
+
 def _looks_like_category(url: str, text: str, source_url: str) -> bool:
-    parsed = urlsplit(url)
-    source = urlsplit(source_url)
+    parsed = _safe_urlsplit(url)
+    source = _safe_urlsplit(source_url)
+    if parsed is None or source is None:
+        return False
     if parsed.hostname and parsed.hostname.casefold() != (source.hostname or "").casefold():
         return False
     path = parsed.path.casefold()
@@ -394,8 +425,10 @@ def _looks_like_category(url: str, text: str, source_url: str) -> bool:
 def _taxonomy_segments(url: str, source_url: str) -> list[str]:
     """Return safe one/two-level taxonomy segments for a same-site URL."""
 
-    parsed = urlsplit(url)
-    source = urlsplit(source_url)
+    parsed = _safe_urlsplit(url)
+    source = _safe_urlsplit(source_url)
+    if parsed is None or source is None:
+        return []
     if parsed.hostname and parsed.hostname.casefold() != (source.hostname or "").casefold():
         return []
     if ASSET_RE.search(parsed.path):
@@ -1125,16 +1158,16 @@ class NativeSiteAnalyzer:
         for node in parser.nav_nodes:
             if node.excluded or node.rel_depth < 1 or not node.href:
                 continue
-            abs_nodes.setdefault(_href_key(urljoin(source_url, node.href)), node)
+            abs_nodes.setdefault(_href_key(_safe_urljoin(source_url, node.href)), node)
             if node.parent_href:
-                p_abs = urljoin(source_url, node.parent_href)
+                p_abs = _safe_urljoin(source_url, node.parent_href)
                 parent_abs[id(node)] = p_abs
                 parent_hrefs.add(_href_key(p_abs))
         categories: list[TaxonomyCategoryContract] = []
         nav_items: list[dict[str, object]] = []
         for anchor in parser.anchors:
-            href = urljoin(source_url, anchor["href"])
-            if not _looks_like_category(href, anchor["text"], source_url):
+            href = _safe_urljoin(source_url, anchor["href"])
+            if not href or not _looks_like_category(href, anchor["text"], source_url):
                 continue
             count = _count_from_nav_text(anchor["text"] + " " + anchor["count"])
             evidence = [{"role": "navigation", "source_url": href, "label": anchor["text"]}]
@@ -1149,11 +1182,13 @@ class NativeSiteAnalyzer:
                 if p_href is not None and _href_key(p_href) in abs_nodes:
                     nav_level = 2
                     nav_parent_href = p_href
-                    nav_parent_path = urlsplit(p_href).path
+                    parsed_parent = _safe_urlsplit(p_href)
+                    nav_parent_path = parsed_parent.path if parsed_parent is not None else None
                 elif _href_key(href) in parent_hrefs:
                     nav_level = 1
             categories.append(self._category(href, anchor["text"], count, evidence, 0.78 if count is not None else 0.62, nav_level=nav_level, nav_parent_path=nav_parent_path, nav_parent_href=nav_parent_href))
-            nav_items.append({"path": urlsplit(href).path, "label": anchor["text"], "count": count})
+            parsed_href = _safe_urlsplit(href)
+            nav_items.append({"path": parsed_href.path if parsed_href is not None else "", "label": anchor["text"], "count": count})
         for item in _json_ld_values(page_html):
             if str(item.get("@type", "")).casefold() in {"itemlist", "collectionpage"}:
                 count = item.get("numberOfItems")

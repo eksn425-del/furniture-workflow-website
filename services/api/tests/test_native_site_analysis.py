@@ -546,3 +546,50 @@ def test_ready_scan_without_categories_is_not_verified(tmp_path: Path) -> None:
     ])
     assert populated["status"] == "READY"
     assert populated["verified"] is True, "a real category still verifies normally"
+
+
+# --- malformed public hrefs must not abort a scan -------------------------
+# Regression for the 45-site run (kayu.com): the homepage contains a broken
+# WordPress Download Manager placeholder href "http://[wpdm_asset id='1']".
+# urlsplit() raises ValueError("Invalid IPv6 URL") on a bare "[", which escaped
+# the scan and marked the whole site FAILED. One malformed anchor must be
+# skipped, never crash the scan.
+
+
+def test_malformed_ipv6_like_href_is_skipped_not_fatal() -> None:
+    from app.services.native_site_analysis import (
+        _looks_like_category,
+        _safe_urlsplit,
+        _taxonomy_segments,
+    )
+
+    bad = "http://[wpdm_asset%20id=&#039;1&#039;%5D"
+
+    # The defensive parser returns None instead of raising.
+    assert _safe_urlsplit(bad) is None
+    # Callers treat it as "not a category" / "no segments".
+    assert _looks_like_category(bad, "download", "https://kayu.com/") is False
+    assert _taxonomy_segments(bad, "https://kayu.com/") == []
+    # A well-formed URL still parses normally.
+    assert _safe_urlsplit("https://kayu.com/bedroom").path == "/bedroom"
+
+
+def test_navigation_parse_survives_malformed_href(tmp_path: Path) -> None:
+    """A real page with one broken anchor still yields the good categories."""
+    html = """
+    <html><head><title>Kayu</title></head><body>
+      <nav>
+        <ul>
+          <li><a href="/bedroom">Bedroom</a>
+            <ul><li><a href="/bedroom/beds">Beds</a></li></ul>
+          </li>
+          <li><a href="http://[wpdm_asset%20id=&#039;1&#039;%5D">Download</a></li>
+        </ul>
+      </nav>
+    </body></html>
+    """
+    client = FakeSiteClient()
+    client.get_html = lambda url: html  # type: ignore[method-assign]
+    analyzer = NativeSiteAnalyzer(tmp_path, client_factory=lambda **_: client)
+    receipt = analyzer.analyze("https://kayu.com/", live=True)
+    assert receipt["status"] != "FAILED", "one malformed href must not fail the scan"
